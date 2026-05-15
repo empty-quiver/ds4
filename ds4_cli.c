@@ -112,6 +112,16 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
+        "  --cpu-moe\n"
+        "      Compute routed MoE experts on the CPU and keep their weights out of the Metal\n"
+        "      residency set. Lets very large GGUFs (e.g. q4 on 128 GB) run by leaving routed\n"
+        "      expert pages to the OS page cache. Metal backend only.\n"
+        "      Equivalent to --n-cpu-moe with all layers on CPU.\n"
+        "  --n-cpu-moe N\n"
+        "      Compute the routed MoE on the CPU only for the first N layers; the\n"
+        "      remaining layers stay on the GPU. Matches llama.cpp's --n-cpu-moe\n"
+        "      semantics. Tune N to trade VRAM for speed: N=10..20 is a typical\n"
+        "      sweet spot for q4 on 128 GB. N=0 disables CPU MoE entirely.\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -1269,6 +1279,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--cpu-moe")) {
+            c.engine.cpu_moe = true;
+        } else if (!strcmp(arg, "--n-cpu-moe")) {
+            c.engine.n_cpu_moe_layers = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {

@@ -187,8 +187,22 @@ static void ds4_gpu_print_device_summary(void) {
     }
 }
 
-#define DS4_METAL_MAX_MODEL_VIEWS 16
-#define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
+/*
+ * --cpu-moe lets a ~150 GiB Q4 GGUF load on a
+ * 128 GiB Mac (routed experts stay in the page cache), and covering the full
+ * file with mmap views at that machine's modest maxBufferLength needs far
+ * more windows than the 2-bit model ever did.
+ */
+#define DS4_METAL_MAX_MODEL_VIEWS 256
+/*
+ * Adjacent no-copy mmap views overlap by more than the largest tensor we pass
+ * to a Metal kernel.  The 2-bit model fit under the old ~672 MiB value, but
+ * the high-memory Q4_K expert file has routed expert tensors of about 1.125
+ * GiB.  Machines whose Metal maxBufferLength is smaller than the whole Q4
+ * GGUF therefore need a larger overlap so every tensor is wholly contained in
+ * at least one view.
+ */
+#define DS4_METAL_MODEL_MAX_TENSOR_BYTES (2ull * 1024ull * 1024ull * 1024ull)
 
 typedef struct {
     __strong id<MTLBuffer> buffer;
@@ -316,6 +330,55 @@ static uint64_t round_up_u64(uint64_t v, uint64_t align) {
 
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
 static int ds4_gpu_warm_model_views(void);
+static double ds4_gpu_now_ms(void);
+static void ds4_gpu_progress_begin(const char *what);
+static void ds4_gpu_progress_done(void);
+static void ds4_gpu_progress_failed(void);
+static int ds4_gpu_model_residency_request_views(void);
+
+static int ds4_gpu_model_views_cover_range(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    map_offset,
+        uint64_t    map_size) {
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (g_model_views[i].model_map == model_map &&
+            g_model_views[i].model_size == model_size &&
+            map_offset >= g_model_views[i].model_offset &&
+            map_offset + map_size <= g_model_views[i].model_offset + g_model_views[i].bytes) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ds4_gpu_finalize_model_views(void) {
+    const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
+    const double t0 = ds4_gpu_now_ms();
+    if (request_residency) ds4_gpu_progress_begin("requesting Metal residency (may take tens of seconds)");
+    if (!ds4_gpu_model_residency_request_views()) {
+        if (request_residency) ds4_gpu_progress_failed();
+        return 0;
+    }
+    if (request_residency) ds4_gpu_progress_done();
+    const double t_resident = ds4_gpu_now_ms();
+
+    int warmed = 1;
+    const int warm_model_views = getenv("DS4_METAL_NO_RESIDENCY") == NULL &&
+                                 getenv("DS4_METAL_NO_MODEL_WARMUP") == NULL;
+    if (warm_model_views) {
+        ds4_gpu_progress_begin("warming Metal model views");
+        warmed = ds4_gpu_warm_model_views();
+        if (warmed) ds4_gpu_progress_done();
+        else ds4_gpu_progress_failed();
+    }
+    const double t_warm = ds4_gpu_now_ms();
+    fprintf(stderr,
+            "ds4: Metal residency requested in %.3f ms, warmup %.3f ms\n",
+            t_resident - t0,
+            t_warm - t_resident);
+    return warmed;
+}
 
 static double ds4_gpu_now_ms(void) {
     struct timespec ts;
@@ -492,42 +555,11 @@ static int ds4_gpu_map_model_views(
     }
 
     const double t_mapped = ds4_gpu_now_ms();
-    const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
-    if (request_residency) ds4_gpu_progress_begin("requesting Metal residency (may take tens of seconds)");
-    if (!ds4_gpu_model_residency_request_views()) {
-        if (request_residency) ds4_gpu_progress_failed();
-        return 0;
-    }
-    if (request_residency) ds4_gpu_progress_done();
-    const double t_resident = ds4_gpu_now_ms();
-    int warmed = 1;
-    const double t_warm0 = ds4_gpu_now_ms();
-    const int warm_model_views = getenv("DS4_METAL_NO_RESIDENCY") == NULL &&
-                                 getenv("DS4_METAL_NO_MODEL_WARMUP") == NULL;
-    if (warm_model_views) {
-        /*
-         * The first GPU command touching no-copy mmap storage can pay command
-         * queue setup, page-table validation, and shared-allocation residency
-         * costs. Sample each model view here so timed graph execution starts
-         * after that one-time work. The stride is intentionally coarse: this is
-         * a validation touch over the VM ranges, not a full model prefetch. A
-         * dense prefetch would create exactly the kind of memory pressure and
-         * startup stalls this path is designed to avoid.
-         */
-        ds4_gpu_progress_begin("warming Metal model views");
-        warmed = ds4_gpu_warm_model_views();
-        if (warmed) ds4_gpu_progress_done();
-        else ds4_gpu_progress_failed();
-    }
-    const double t_warm = ds4_gpu_now_ms();
     fprintf(stderr,
-            "ds4: Metal model views created in %.3f ms, residency requested in %.3f ms, warmup %.3f ms (mapped %.2f MiB from offset %.2f MiB)\n",
+            "ds4: Metal model views created in %.3f ms (mapped %.2f MiB from offset %.2f MiB)\n",
             t_mapped - t0,
-            t_resident - t_mapped,
-            t_warm - t_warm0,
             mapped_model_size / 1024.0 / 1024.0,
             page_model_offset / 1024.0 / 1024.0);
-    if (!warmed) return 0;
     return 1;
 }
 
@@ -4405,21 +4437,61 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
     if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) return 0;
 
     @autoreleasepool {
-        for (uint32_t i = 0; i < g_model_view_count; i++) {
-            if (g_model_views[i].model_map == model_map &&
-                g_model_views[i].model_size == model_size &&
-                map_offset >= g_model_views[i].model_offset &&
-                map_offset + map_size <= g_model_views[i].model_offset + g_model_views[i].bytes) {
-                return 1;
-            }
-        }
-
         ds4_gpu_model_residency_clear();
         g_model_map_ptr = model_map;
         g_model_map_size = model_size;
         g_model_mapped_offset = map_offset;
         g_model_mapped_size = map_size;
-        if (!ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size)) {
+        if (!ds4_gpu_model_views_cover_range(model_map, model_size, map_offset, map_size) &&
+            !ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size)) {
+            ds4_gpu_model_residency_clear();
+            return 0;
+        }
+        if (!ds4_gpu_finalize_model_views()) {
+            ds4_gpu_model_residency_clear();
+            return 0;
+        }
+        fprintf(stderr,
+                "ds4: Metal mapped mmaped model as %u overlapping shared buffers\n",
+                g_model_view_count);
+        return 1;
+    }
+}
+
+int ds4_gpu_set_model_map_ranges(
+        const void *model_map,
+        uint64_t    model_size,
+        const uint64_t *map_offsets,
+        const uint64_t *map_sizes,
+        uint32_t    n_ranges) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || model_size == 0 || !map_offsets || !map_sizes || n_ranges == 0) return 0;
+
+    @autoreleasepool {
+        ds4_gpu_model_residency_clear();
+        g_model_map_ptr = model_map;
+        g_model_map_size = model_size;
+
+        uint64_t lo = UINT64_MAX;
+        uint64_t hi = 0;
+        for (uint32_t i = 0; i < n_ranges; i++) {
+            const uint64_t map_offset = map_offsets[i];
+            const uint64_t map_size = map_sizes[i];
+            if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) {
+                return 0;
+            }
+            if (!ds4_gpu_model_views_cover_range(model_map, model_size, map_offset, map_size) &&
+                !ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size)) {
+                ds4_gpu_model_residency_clear();
+                return 0;
+            }
+            if (map_offset < lo) lo = map_offset;
+            if (map_offset + map_size > hi) hi = map_offset + map_size;
+        }
+
+        g_model_mapped_offset = lo == UINT64_MAX ? 0 : lo;
+        g_model_mapped_size = lo == UINT64_MAX ? 0 : hi - lo;
+        if (!ds4_gpu_finalize_model_views()) {
             ds4_gpu_model_residency_clear();
             return 0;
         }

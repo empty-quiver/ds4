@@ -36,6 +36,8 @@ typedef struct {
     double step_mul;
     bool warm_weights;
     bool quality;
+    bool cpu_moe;
+    int  n_cpu_moe_layers;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -68,6 +70,9 @@ static void usage(FILE *fp) {
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
+        "  --cpu-moe              Run routed MoE experts on the CPU for all layers.\n"
+        "                         Metal backend only.\n"
+        "  --n-cpu-moe N          Run routed MoE on the CPU only for the first N layers.\n"
         "\n"
         "Sweep:\n"
         "  --ctx-start N          First measured frontier. Default: 2048\n"
@@ -221,6 +226,17 @@ static bench_config parse_options(int argc, char **argv) {
             c.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--cpu-moe")) {
+            c.cpu_moe = true;
+        } else if (!strcmp(arg, "--n-cpu-moe")) {
+            const char *s = need_arg(&i, argc, argv, arg);
+            char *end = NULL;
+            long v = strtol(s, &end, 10);
+            if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT_MAX) {
+                fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", arg, s);
+                exit(2);
+            }
+            c.n_cpu_moe_layers = (int)v;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr);
@@ -293,6 +309,8 @@ int main(int argc, char **argv) {
         .n_threads = cfg.threads,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .cpu_moe = cfg.cpu_moe,
+        .n_cpu_moe_layers = cfg.n_cpu_moe_layers,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;

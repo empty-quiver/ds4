@@ -71,6 +71,8 @@ typedef struct {
     float directional_steering_ffn;
     bool warm_weights;
     bool quality;
+    bool cpu_moe;
+    int  n_cpu_moe_layers;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
