@@ -806,6 +806,21 @@ To profile which routed experts are selected while using CPU-MoE, set
 with `layer`, `expert`, `prefill`, `decode`, and `total` columns. Setting the
 value to `1` writes `ds4-route-profile.tsv` in the current directory.
 
+To keep selected hot experts on the GPU while leaving cold experts on the CPU,
+set `DS4_CUDA_HOT_EXPERTS_FILE=/path/to/hot-experts.txt`. The file contains
+one `layer expert` pair per line, with `#` comments allowed:
+
+```text
+0 252
+0 28
+1 61
+```
+
+Hot experts are added to the partial cache as exact gate/up/down expert byte
+ranges. During single-token decode, selected hot slots run from the resident
+CUDA ranges and selected cold slots still use the CPU-MoE path. Batched prefill
+still uses CPU-MoE for routed experts.
+
 For 4090-class hybrid runs, add `DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1` to fail
 startup if any non-routed dense candidate cannot be cached in VRAM. This still
 allows optional routed expert candidates to be skipped when the VRAM budget is
@@ -817,6 +832,7 @@ Useful controls:
 * `DS4_CUDA_WEIGHT_CACHE_RESERVE_MB`
 * `DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1`
 * `DS4_CUDA_ROUTE_PROFILE=/path/to/profile.tsv`
+* `DS4_CUDA_HOT_EXPERTS_FILE=/path/to/hot-experts.txt`
 * `DS4_CUDA_WEIGHT_CACHE_VERBOSE=1`
 * `DS4_CUDA_STRICT_WEIGHT_CACHE=1`
 

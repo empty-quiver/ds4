@@ -4506,6 +4506,13 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size);
 }
 
+int ds4_gpu_model_range_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
+    (void)model_map;
+    (void)offset;
+    (void)bytes;
+    return 0;
+}
+
 int ds4_gpu_set_model_fd(int fd) {
     (void)fd;
     return 1;
@@ -13183,6 +13190,58 @@ int ds4_gpu_routed_moe_one_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_routed_moe_one_cached_experts_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const int32_t          *selected_host,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x) {
+    (void)out;
+    (void)gate;
+    (void)up;
+    (void)mid;
+    (void)experts;
+    (void)model_map;
+    (void)model_size;
+    (void)gate_offset;
+    (void)up_offset;
+    (void)down_offset;
+    (void)gate_type;
+    (void)down_type;
+    (void)gate_expert_bytes;
+    (void)gate_row_bytes;
+    (void)down_expert_bytes;
+    (void)down_row_bytes;
+    (void)expert_in_dim;
+    (void)expert_mid_dim;
+    (void)out_dim;
+    (void)selected_host;
+    (void)weights;
+    (void)n_expert;
+    (void)clamp;
+    (void)x;
+    return 0;
 }
 
 int ds4_gpu_routed_moe_batch_tensor(

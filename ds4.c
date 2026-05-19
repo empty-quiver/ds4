@@ -1452,6 +1452,8 @@ enum {
     ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS = 40,
 };
 
+static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t);
+
 /* Lower priorities are cached first: cover small global/layer state and dense
  * per-token paths before spending the partial VRAM budget on large embeddings
  * and routed expert matrices. */
@@ -1527,13 +1529,44 @@ static bool accelerator_partial_cache_add(
     return true;
 }
 
+static bool accelerator_partial_cache_add_range(
+        accelerator_weight_cache_candidate *cands,
+        uint32_t *count,
+        uint32_t cap,
+        const ds4_model *m,
+        uint64_t off,
+        uint64_t bytes,
+        uint32_t priority,
+        uint32_t layer,
+        uint32_t group) {
+    if (bytes == 0) return true;
+    if (off > m->size || bytes > m->size - off) {
+        fprintf(stderr, "ds4: invalid CUDA cache candidate byte range\n");
+        return false;
+    }
+    if (*count >= cap) {
+        fprintf(stderr, "ds4: too many CUDA partial weight cache candidates\n");
+        return false;
+    }
+    accelerator_weight_cache_candidate *c = &cands[*count];
+    c->off = off;
+    c->bytes = bytes;
+    c->end = off + bytes;
+    c->priority = priority;
+    c->layer = layer;
+    c->group = group;
+    (*count)++;
+    return true;
+}
+
 static bool accelerator_partial_cache_collect(
         accelerator_weight_cache_candidate *cands,
         uint32_t *count,
         uint32_t cap,
         const ds4_model *m,
         const ds4_weights *w,
-        const bool *cpu_moe_layer) {
+        const bool *cpu_moe_layer,
+        const bool hot_expert[DS4_N_LAYER][DS4_N_EXPERT]) {
 #define ADD_GLOBAL(t_, p_) \
     do { \
         if (!accelerator_partial_cache_add(cands, count, cap, m, (t_), (p_), UINT32_MAX, 0)) return false; \
@@ -1545,6 +1578,12 @@ static bool accelerator_partial_cache_collect(
 #define ADD_LAYER_GROUP(t_, p_, group_) \
     do { \
         if (!accelerator_partial_cache_add(cands, count, cap, m, (t_), (p_), il, (group_))) return false; \
+    } while (0)
+#define ADD_EXPERT(t_, p_, group_, expert_, expert_bytes_) \
+    do { \
+        if (!accelerator_partial_cache_add_range(cands, count, cap, m, \
+                (t_)->abs_offset + (uint64_t)(expert_) * (expert_bytes_), \
+                (expert_bytes_), (p_), il, (group_))) return false; \
     } while (0)
 
     ADD_GLOBAL(w->output_hc_base, ACCELERATOR_WEIGHT_CACHE_GLOBAL_STATE);
@@ -1597,12 +1636,30 @@ static bool accelerator_partial_cache_collect(
             ADD_LAYER_GROUP(l->ffn_gate_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
             ADD_LAYER_GROUP(l->ffn_up_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
             ADD_LAYER_GROUP(l->ffn_down_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
+        } else if (hot_expert) {
+            const uint64_t gate_expert_bytes =
+                l->ffn_gate_exps->dim[1] * routed_expert_row_bytes(l->ffn_gate_exps);
+            const uint64_t up_expert_bytes =
+                l->ffn_up_exps->dim[1] * routed_expert_row_bytes(l->ffn_up_exps);
+            const uint64_t down_expert_bytes =
+                l->ffn_down_exps->dim[1] * routed_expert_row_bytes(l->ffn_down_exps);
+            const uint32_t routed_group = 1000u + il;
+            for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+                if (!hot_expert[il][expert]) continue;
+                ADD_EXPERT(l->ffn_gate_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS,
+                           routed_group, expert, gate_expert_bytes);
+                ADD_EXPERT(l->ffn_up_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS,
+                           routed_group, expert, up_expert_bytes);
+                ADD_EXPERT(l->ffn_down_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS,
+                           routed_group, expert, down_expert_bytes);
+            }
         }
     }
 
 #undef ADD_GLOBAL
 #undef ADD_LAYER
 #undef ADD_LAYER_GROUP
+#undef ADD_EXPERT
     return true;
 }
 
@@ -1628,15 +1685,17 @@ static bool accelerator_cache_model_partial(
         const ds4_model *m,
         const ds4_weights *w,
         const bool *cpu_moe_layer,
+        const bool hot_expert[DS4_N_LAYER][DS4_N_EXPERT],
         uint64_t *cached_out,
         uint32_t *ranges_out) {
-    enum { CAND_CAP = 2048 };
+    enum { CAND_CAP = 8192 };
     accelerator_weight_cache_candidate *cands = xmalloc((size_t)CAND_CAP * sizeof(cands[0]));
     uint32_t count = 0;
     uint64_t cached = 0;
     uint32_t ranges = 0;
 
-    if (!accelerator_partial_cache_collect(cands, &count, CAND_CAP, m, w, cpu_moe_layer)) {
+    if (!accelerator_partial_cache_collect(cands, &count, CAND_CAP, m, w,
+                                           cpu_moe_layer, hot_expert)) {
         free(cands);
         return false;
     }
@@ -1801,13 +1860,18 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     return true;
 }
 
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m, const ds4_weights *w, const bool *cpu_moe_layer) {
+static bool accelerator_cache_model_tensors(
+        ds4_backend backend,
+        const ds4_model *m,
+        const ds4_weights *w,
+        const bool *cpu_moe_layer,
+        const bool hot_expert[DS4_N_LAYER][DS4_N_EXPERT]) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0 || !w) return false;
     if (accelerator_cuda_partial_weight_cache_enabled()) {
         uint64_t cached = 0;
         uint32_t ranges = 0;
-        return accelerator_cache_model_partial(m, w, cpu_moe_layer, &cached, &ranges);
+        return accelerator_cache_model_partial(m, w, cpu_moe_layer, hot_expert, &cached, &ranges);
     }
     if (accelerator_cuda_env_enabled("DS4_CUDA_DIRECT_MODEL")) {
         return true;
@@ -1843,11 +1907,17 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
     return true;
 }
 #else
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m, const ds4_weights *w, const bool *cpu_moe_layer) {
+static bool accelerator_cache_model_tensors(
+        ds4_backend backend,
+        const ds4_model *m,
+        const ds4_weights *w,
+        const bool *cpu_moe_layer,
+        const bool hot_expert[DS4_N_LAYER][DS4_N_EXPERT]) {
     (void)backend;
     (void)m;
     (void)w;
     (void)cpu_moe_layer;
+    (void)hot_expert;
     return true;
 }
 #endif
@@ -6431,13 +6501,14 @@ static void layer_routed_moe_one_prealloc(
 /* Single-token CPU-MoE handoff when GPU already produced the routed expert
  * selection and weights. This keeps decode on the existing fast shape while
  * still reusing the persistent scratch arena. */
-static void layer_routed_moe_selected_one_prealloc(
+static void layer_routed_moe_selected_one_n_prealloc(
         float             *out,
         const ds4_model   *model,
         const ds4_layer_weights *layer,
         const float       *x,
         const int32_t     *selected_rows,
         const float       *weight_rows,
+        uint32_t           n_selected,
         float              clamp,
         float             *mid_all,
         block_q8_K        *xq,
@@ -6453,6 +6524,9 @@ static void layer_routed_moe_selected_one_prealloc(
     if (expert_out_dim != down_in_dim || down_out_dim != DS4_N_EMBD) {
         ds4_die("CPU-MoE selected one tensor layout is unexpected");
     }
+    if (n_selected > DS4_N_EXPERT_USED) {
+        ds4_die("CPU-MoE selected one has too many experts");
+    }
 
     const bool is_q4 = layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K;
     if (is_q4) {
@@ -6466,13 +6540,14 @@ static void layer_routed_moe_selected_one_prealloc(
         ds4_die("CPU-MoE selected one unsupported routed expert quantization");
     }
 
-    for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
+    for (uint32_t i = 0; i < n_selected; i++) {
         const int32_t expert = selected_rows[i];
         if (expert < 0 || expert >= DS4_N_EXPERT) ds4_die("CPU-MoE selected expert is outside range");
         selected[i] = (int)expert;
     }
 
     memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
+    if (n_selected == 0) return;
     ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
 
     if (is_q4) {
@@ -6482,7 +6557,7 @@ static void layer_routed_moe_selected_one_prealloc(
                                          xq,
                                          selected,
                                          weight_rows,
-                                         DS4_N_EXPERT_USED,
+                                         (int)n_selected,
                                          clamp);
     } else {
         matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
@@ -6491,21 +6566,38 @@ static void layer_routed_moe_selected_one_prealloc(
                                             xq,
                                             selected,
                                             weight_rows,
-                                            DS4_N_EXPERT_USED,
+                                            (int)n_selected,
                                             clamp);
     }
 
-    for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
+    for (uint32_t i = 0; i < n_selected; i++) {
         ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
                               midq + (uint64_t)i * (down_in_dim / QK_K),
                               (int64_t)down_in_dim);
     }
 
     if (is_q4) {
-        matvec_q4_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
+        matvec_q4_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, (int)n_selected);
     } else {
-        matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
+        matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, (int)n_selected);
     }
+}
+
+static void layer_routed_moe_selected_one_prealloc(
+        float             *out,
+        const ds4_model   *model,
+        const ds4_layer_weights *layer,
+        const float       *x,
+        const int32_t     *selected_rows,
+        const float       *weight_rows,
+        float              clamp,
+        float             *mid_all,
+        block_q8_K        *xq,
+        block_q8_K        *midq) {
+    layer_routed_moe_selected_one_n_prealloc(out, model, layer, x,
+                                             selected_rows, weight_rows,
+                                             DS4_N_EXPERT_USED,
+                                             clamp, mid_all, xq, midq);
 }
 
 /* Compute routed MoE on the CPU for a batch of tokens whose router selection
@@ -9272,11 +9364,13 @@ typedef struct {
     ds4_gpu_tensor *router_probs;
     ds4_gpu_tensor *router_selected;
     ds4_gpu_tensor *router_weights;
+    ds4_gpu_tensor *hot_router_weights;
     ds4_gpu_tensor *routed_gate;
     ds4_gpu_tensor *routed_up;
     ds4_gpu_tensor *routed_mid;
     ds4_gpu_tensor *routed_down;
     ds4_gpu_tensor *routed_out;
+    ds4_gpu_tensor *cpu_moe_cold_out;
     ds4_gpu_tensor *ffn_out;
     ds4_gpu_tensor *after_ffn_hc;
     ds4_gpu_tensor *output_pre;
@@ -9355,6 +9449,11 @@ typedef struct {
     ds4_backend backend;
     bool cpu_moe;
     bool cpu_moe_layer[DS4_N_LAYER];
+    bool hot_experts_enabled;
+    bool hot_expert[DS4_N_LAYER][DS4_N_EXPERT];
+    uint64_t hot_expert_decode_layers;
+    uint64_t hot_expert_decode_slots;
+    uint64_t cold_expert_decode_slots;
     const ds4_model *cpu_model;
     uint32_t cpu_moe_tok_cap;
     float *cpu_moe_mid;
@@ -9514,8 +9613,137 @@ static bool metal_graph_ensure_cpu_moe_scratch(ds4_gpu_graph *g, uint32_t n_toke
     return true;
 }
 
+static bool metal_graph_cuda_hot_expert_cached(
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        uint32_t                 expert) {
+    if (!model || !layer || expert >= DS4_N_EXPERT) return false;
+    const uint64_t gate_expert_bytes =
+        layer->ffn_gate_exps->dim[1] * routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t up_expert_bytes =
+        layer->ffn_up_exps->dim[1] * routed_expert_row_bytes(layer->ffn_up_exps);
+    const uint64_t down_expert_bytes =
+        layer->ffn_down_exps->dim[1] * routed_expert_row_bytes(layer->ffn_down_exps);
+    return ds4_gpu_model_range_cached(model->map,
+                                      layer->ffn_gate_exps->abs_offset + (uint64_t)expert * gate_expert_bytes,
+                                      gate_expert_bytes) &&
+           ds4_gpu_model_range_cached(model->map,
+                                      layer->ffn_up_exps->abs_offset + (uint64_t)expert * up_expert_bytes,
+                                      up_expert_bytes) &&
+           ds4_gpu_model_range_cached(model->map,
+                                      layer->ffn_down_exps->abs_offset + (uint64_t)expert * down_expert_bytes,
+                                      down_expert_bytes);
+}
+
+static bool metal_graph_cuda_cpu_moe_hot_decode(
+        ds4_gpu_graph          *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        ds4_gpu_tensor         *ffn_norm,
+        ds4_gpu_tensor         *routed_out,
+        const float            *xs,
+        const int32_t          *sel,
+        const float            *w) {
+    if (!g || !model || !layer || !ffn_norm || !routed_out || !xs || !sel || !w) return false;
+    if (g->backend != DS4_BACKEND_CUDA || !g->hot_experts_enabled || il >= DS4_N_LAYER) return false;
+    if (!(layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+          layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+          layer->ffn_down_exps->type == DS4_TENSOR_Q2_K)) {
+        return false;
+    }
+
+    int32_t hot_sel[DS4_N_EXPERT_USED];
+    int32_t cold_sel[DS4_N_EXPERT_USED];
+    float hot_w[DS4_N_EXPERT_USED];
+    float cold_w[DS4_N_EXPERT_USED];
+    uint32_t n_hot = 0;
+    uint32_t n_cold = 0;
+    for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+        const int32_t expert = sel[slot];
+        if (expert < 0 || expert >= DS4_N_EXPERT) return false;
+        const uint32_t e = (uint32_t)expert;
+        if (g->hot_expert[il][e] && metal_graph_cuda_hot_expert_cached(model, layer, e)) {
+            hot_sel[n_hot] = expert;
+            hot_w[n_hot] = w[slot];
+            n_hot++;
+        } else {
+            cold_sel[n_cold] = expert;
+            cold_w[n_cold] = w[slot];
+            n_cold++;
+        }
+    }
+    if (n_hot == 0) return false;
+
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
+    const uint32_t expert_in_dim = (uint32_t)layer->ffn_gate_exps->dim[0];
+    const uint32_t expert_mid_dim = (uint32_t)layer->ffn_gate_exps->dim[1];
+    const uint32_t out_dim = (uint32_t)layer->ffn_down_exps->dim[1];
+
+    if (n_cold != 0) {
+        layer_routed_moe_selected_one_n_prealloc(g->cpu_moe_out_host,
+                                                 g->cpu_model,
+                                                 layer,
+                                                 xs,
+                                                 cold_sel,
+                                                 cold_w,
+                                                 n_cold,
+                                                 DS4_SWIGLU_CLAMP_EXP,
+                                                 g->cpu_moe_mid,
+                                                 g->cpu_moe_xq,
+                                                 g->cpu_moe_midq);
+        if (ds4_gpu_tensor_write(g->cpu_moe_cold_out, 0, g->cpu_moe_out_host,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
+            return false;
+        }
+    }
+
+    if (ds4_gpu_tensor_write(g->hot_router_weights, 0, hot_w,
+                             (uint64_t)n_hot * sizeof(float)) == 0) {
+        return false;
+    }
+    if (ds4_gpu_routed_moe_one_cached_experts_tensor(routed_out,
+                                                     g->routed_gate,
+                                                     g->routed_up,
+                                                     g->routed_mid,
+                                                     g->routed_down,
+                                                     model->map,
+                                                     model->size,
+                                                     layer->ffn_gate_exps->abs_offset,
+                                                     layer->ffn_up_exps->abs_offset,
+                                                     layer->ffn_down_exps->abs_offset,
+                                                     layer->ffn_gate_exps->type,
+                                                     layer->ffn_down_exps->type,
+                                                     gate_expert_bytes,
+                                                     gate_row_bytes,
+                                                     down_expert_bytes,
+                                                     down_row_bytes,
+                                                     expert_in_dim,
+                                                     expert_mid_dim,
+                                                     out_dim,
+                                                     hot_sel,
+                                                     g->hot_router_weights,
+                                                     n_hot,
+                                                     DS4_SWIGLU_CLAMP_EXP,
+                                                     ffn_norm) == 0) {
+        return false;
+    }
+    if (n_cold != 0 &&
+        ds4_gpu_add_tensor(routed_out, routed_out, g->cpu_moe_cold_out, DS4_N_EMBD) == 0) {
+        return false;
+    }
+    g->hot_expert_decode_layers++;
+    g->hot_expert_decode_slots += n_hot;
+    g->cold_expert_decode_slots += n_cold;
+    return true;
+}
+
 static bool metal_graph_cpu_moe_handoff(
         ds4_gpu_graph          *g,
+        const ds4_model         *model,
         const ds4_layer_weights *layer,
         uint32_t                il,
         bool                    decode,
@@ -9524,7 +9752,7 @@ static bool metal_graph_cpu_moe_handoff(
         ds4_gpu_tensor         *router_weights,
         ds4_gpu_tensor         *routed_out,
         uint32_t                n_tokens) {
-    if (!g || !layer || n_tokens == 0) return false;
+    if (!g || !model || !layer || n_tokens == 0) return false;
     if (!metal_graph_ensure_cpu_moe_scratch(g, n_tokens) ||
         ds4_gpu_end_commands() == 0) {
         return false;
@@ -9565,6 +9793,12 @@ static bool metal_graph_cpu_moe_handoff(
 
     metal_graph_record_route_profile(g, il, sel, n_tokens, decode);
 
+    if (decode && n_tokens == 1 &&
+        metal_graph_cuda_cpu_moe_hot_decode(g, model, layer, il, ffn_norm,
+                                            routed_out, xs, sel, w)) {
+        return ds4_gpu_begin_commands() != 0;
+    }
+
     cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer,
                                           xs, sel, w, out,
                                           n_tokens, DS4_SWIGLU_CLAMP_EXP,
@@ -9594,6 +9828,13 @@ static void metal_graph_shrink_cpu_moe_scratch(ds4_gpu_graph *g) {
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    if (g && g->hot_experts_enabled) {
+        fprintf(stderr,
+                "ds4: CUDA hot experts decode: layers=%llu hot_slots=%llu cold_slots=%llu\n",
+                (unsigned long long)g->hot_expert_decode_layers,
+                (unsigned long long)g->hot_expert_decode_slots,
+                (unsigned long long)g->cold_expert_decode_slots);
+    }
     metal_graph_write_route_profile(g);
     metal_graph_free_route_profile(g);
     metal_graph_free_cpu_moe_scratch(g);
@@ -9655,11 +9896,13 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->output_pre);
     ds4_gpu_tensor_free(g->after_ffn_hc);
     ds4_gpu_tensor_free(g->ffn_out);
+    ds4_gpu_tensor_free(g->cpu_moe_cold_out);
     ds4_gpu_tensor_free(g->routed_out);
     ds4_gpu_tensor_free(g->routed_down);
     ds4_gpu_tensor_free(g->routed_mid);
     ds4_gpu_tensor_free(g->routed_up);
     ds4_gpu_tensor_free(g->routed_gate);
+    ds4_gpu_tensor_free(g->hot_router_weights);
     ds4_gpu_tensor_free(g->router_weights);
     ds4_gpu_tensor_free(g->router_selected);
     ds4_gpu_tensor_free(g->router_probs);
@@ -10147,11 +10390,13 @@ static bool metal_graph_alloc_raw_cap(
     g->router_probs = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
     g->router_selected = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int));
     g->router_weights = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
+    g->hot_router_weights = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
     g->routed_gate = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_up = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_mid = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_down = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->routed_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->cpu_moe_cold_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->after_ffn_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
     g->output_pre = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
     g->output_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
@@ -10258,9 +10503,10 @@ static bool metal_graph_alloc_raw_cap(
                     g->after_attn_hc && g->ffn_cur && g->ffn_norm &&
                     g->shared_gate && g->shared_up && g->shared_mid &&
                     g->shared_out &&
-                    g->router_logits && g->router_probs && g->router_selected && g->router_weights &&
+                    g->router_logits && g->router_probs && g->router_selected &&
+                    g->router_weights && g->hot_router_weights &&
                     g->routed_gate && g->routed_up && g->routed_mid &&
-                    g->routed_down && g->routed_out &&
+                    g->routed_down && g->routed_out && g->cpu_moe_cold_out &&
                     g->after_ffn_hc &&
                     g->output_pre && g->output_weights && g->output_embd &&
                     g->output_norm && g->logits &&
@@ -11146,7 +11392,8 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
     if (ok && !force_metal_moe && g->cpu_moe_layer[il]) {
-        ok = metal_graph_cpu_moe_handoff(g, layer,
+        ok = metal_graph_cpu_moe_handoff(g, model,
+                                         layer,
                                          il,
                                          true,
                                          g->ffn_norm,
@@ -13938,7 +14185,8 @@ static bool metal_graph_encode_layer_ffn_batch(
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
     if (ok && g->cpu_moe_layer[il]) {
-        ok = metal_graph_cpu_moe_handoff(g, layer,
+        ok = metal_graph_cpu_moe_handoff(g, model,
+                                         layer,
                                          il,
                                          false,
                                          g->batch_ffn_norm,
@@ -15555,6 +15803,8 @@ struct ds4_engine {
     bool cpu_moe;
     bool cpu_model_ready;
     bool cpu_moe_layer[DS4_N_LAYER];
+    bool hot_experts_enabled;
+    bool hot_expert[DS4_N_LAYER][DS4_N_EXPERT];
 };
 
 #ifndef DS4_NO_GPU
@@ -15563,9 +15813,11 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
     g->backend = e->backend;
     g->cpu_moe = e->cpu_moe;
     g->cpu_model = e->cpu_moe ? &e->cpu_model : NULL;
+    g->hot_experts_enabled = e->hot_experts_enabled;
     metal_graph_init_route_profile(g);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->cpu_moe_layer[il] = e->cpu_moe_layer[il];
+        memcpy(g->hot_expert[il], e->hot_expert[il], sizeof(g->hot_expert[il]));
     }
 }
 
@@ -18630,6 +18882,73 @@ static bool engine_map_metal_views_with_routed_holes(ds4_engine *e) {
 }
 #endif
 
+static bool ds4_engine_load_hot_experts_file(ds4_engine *e) {
+    const char *path = getenv("DS4_CUDA_HOT_EXPERTS_FILE");
+    if (!path || !path[0]) return true;
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to open hot experts file %s: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+
+    char line[256];
+    uint32_t count = 0;
+    uint32_t lineno = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        lineno++;
+        char *comment = strchr(line, '#');
+        if (comment) *comment = '\0';
+
+        char *p = line;
+        while (isspace((unsigned char)*p)) p++;
+        if (!*p) continue;
+
+        char *end = NULL;
+        unsigned long layer = strtoul(p, &end, 10);
+        if (end == p) {
+            fprintf(stderr, "ds4: hot experts file %s:%u expected: layer expert\n",
+                    path, lineno);
+            fclose(fp);
+            return false;
+        }
+        p = end;
+        while (isspace((unsigned char)*p)) p++;
+        unsigned long expert = strtoul(p, &end, 10);
+        if (end == p) {
+            fprintf(stderr, "ds4: hot experts file %s:%u expected: layer expert\n",
+                    path, lineno);
+            fclose(fp);
+            return false;
+        }
+        p = end;
+        while (isspace((unsigned char)*p)) p++;
+        if (*p) {
+            fprintf(stderr, "ds4: hot experts file %s:%u has trailing text\n",
+                    path, lineno);
+            fclose(fp);
+            return false;
+        }
+        if (layer >= DS4_N_LAYER || expert >= DS4_N_EXPERT) {
+            fprintf(stderr, "ds4: hot experts file %s:%u entry is out of range\n",
+                    path, lineno);
+            fclose(fp);
+            return false;
+        }
+        if (!e->hot_expert[layer][expert]) {
+            e->hot_expert[layer][expert] = true;
+            count++;
+        }
+    }
+    fclose(fp);
+
+    e->hot_experts_enabled = count != 0;
+    fprintf(stderr, "ds4: CUDA hot experts: loaded %u entries from %s\n",
+            count, path);
+    return true;
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->n_cpu_moe_layers < 0 || opt->n_cpu_moe_layers > DS4_N_LAYER) {
         fprintf(stderr, "ds4: n_cpu_moe_layers must be between 0 and %d\n", DS4_N_LAYER);
@@ -18685,6 +19004,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->cpu_moe = (n_cpu > 0) && ds4_backend_uses_graph(opt->backend);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         e->cpu_moe_layer[il] = e->cpu_moe && (il < (uint32_t)n_cpu);
+    }
+    if (!ds4_engine_load_hot_experts_file(e)) {
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
     }
     if (e->cpu_moe) {
         /* Routed expert weights are read from a second, MAP_PRIVATE mapping to
@@ -18799,7 +19123,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         if ((!e->mtp_ready || partial_cuda_cache) &&
             !accelerator_cache_model_tensors(e->backend, &e->model, &e->weights,
-                                             e->cpu_moe ? e->cpu_moe_layer : NULL)) {
+                                             e->cpu_moe ? e->cpu_moe_layer : NULL,
+                                             e->hot_experts_enabled ? e->hot_expert : NULL)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
