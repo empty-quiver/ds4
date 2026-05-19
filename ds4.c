@@ -9365,7 +9365,91 @@ typedef struct {
     int32_t *cpu_moe_selected_host;
     float *cpu_moe_weight_host;
     float *cpu_moe_out_host;
+    uint64_t *route_profile_prefill;
+    uint64_t *route_profile_decode;
+    uint64_t route_profile_prefill_tokens;
+    uint64_t route_profile_decode_tokens;
 } ds4_gpu_graph;
+
+static const char *metal_graph_route_profile_path(void) {
+    const char *path = getenv("DS4_CUDA_ROUTE_PROFILE");
+    if (!path || !path[0]) path = getenv("DS4_ROUTE_PROFILE");
+    if (!path || !path[0]) return NULL;
+    return strcmp(path, "1") == 0 ? "ds4-route-profile.tsv" : path;
+}
+
+static void metal_graph_init_route_profile(ds4_gpu_graph *g) {
+    if (!g || !metal_graph_route_profile_path()) return;
+    if (g->route_profile_prefill || g->route_profile_decode) return;
+    const size_t n = (size_t)DS4_N_LAYER * DS4_N_EXPERT;
+    g->route_profile_prefill = xcalloc(n, sizeof(g->route_profile_prefill[0]));
+    g->route_profile_decode = xcalloc(n, sizeof(g->route_profile_decode[0]));
+}
+
+static void metal_graph_record_route_profile(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        const int32_t *selected,
+        uint32_t       n_tokens,
+        bool           decode) {
+    if (!g || !selected || il >= DS4_N_LAYER || n_tokens == 0) return;
+    uint64_t *counts = decode ? g->route_profile_decode : g->route_profile_prefill;
+    if (!counts) return;
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+            const int32_t expert = selected[(uint64_t)t * DS4_N_EXPERT_USED + slot];
+            if (expert >= 0 && expert < DS4_N_EXPERT) {
+                counts[(uint64_t)il * DS4_N_EXPERT + (uint32_t)expert]++;
+            }
+        }
+    }
+    if (decode) g->route_profile_decode_tokens += n_tokens;
+    else g->route_profile_prefill_tokens += n_tokens;
+}
+
+static void metal_graph_write_route_profile(ds4_gpu_graph *g) {
+    if (!g || (!g->route_profile_prefill && !g->route_profile_decode)) return;
+    const char *path = metal_graph_route_profile_path();
+    if (!path) return;
+
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to write route profile %s: %s\n", path, strerror(errno));
+        return;
+    }
+    fprintf(fp, "layer\texpert\tprefill\tdecode\ttotal\n");
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+            const uint64_t idx = (uint64_t)il * DS4_N_EXPERT + expert;
+            const uint64_t prefill = g->route_profile_prefill ? g->route_profile_prefill[idx] : 0;
+            const uint64_t decode = g->route_profile_decode ? g->route_profile_decode[idx] : 0;
+            const uint64_t total = prefill + decode;
+            if (total == 0) continue;
+            fprintf(fp, "%u\t%u\t%llu\t%llu\t%llu\n",
+                    il, expert,
+                    (unsigned long long)prefill,
+                    (unsigned long long)decode,
+                    (unsigned long long)total);
+        }
+    }
+    fclose(fp);
+    fprintf(stderr,
+            "ds4: wrote route profile %s (prefill_tokens=%llu decode_tokens=%llu)\n",
+            path,
+            (unsigned long long)g->route_profile_prefill_tokens,
+            (unsigned long long)g->route_profile_decode_tokens);
+}
+
+static void metal_graph_free_route_profile(ds4_gpu_graph *g) {
+    if (!g) return;
+    free(g->route_profile_decode);
+    free(g->route_profile_prefill);
+    g->route_profile_decode = NULL;
+    g->route_profile_prefill = NULL;
+    g->route_profile_decode_tokens = 0;
+    g->route_profile_prefill_tokens = 0;
+}
 
 static void metal_graph_free_cpu_moe_scratch(ds4_gpu_graph *g) {
     free(g->cpu_moe_out_host);
@@ -9433,6 +9517,8 @@ static bool metal_graph_ensure_cpu_moe_scratch(ds4_gpu_graph *g, uint32_t n_toke
 static bool metal_graph_cpu_moe_handoff(
         ds4_gpu_graph          *g,
         const ds4_layer_weights *layer,
+        uint32_t                il,
+        bool                    decode,
         ds4_gpu_tensor         *ffn_norm,
         ds4_gpu_tensor         *router_selected,
         ds4_gpu_tensor         *router_weights,
@@ -9477,6 +9563,8 @@ static bool metal_graph_cpu_moe_handoff(
 
     if (!xs || !sel || !w || !out) return false;
 
+    metal_graph_record_route_profile(g, il, sel, n_tokens, decode);
+
     cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer,
                                           xs, sel, w, out,
                                           n_tokens, DS4_SWIGLU_CLAMP_EXP,
@@ -9506,6 +9594,8 @@ static void metal_graph_shrink_cpu_moe_scratch(ds4_gpu_graph *g) {
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    metal_graph_write_route_profile(g);
+    metal_graph_free_route_profile(g);
     metal_graph_free_cpu_moe_scratch(g);
     ds4_gpu_tensor_free(g->directional_steering_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
@@ -11057,6 +11147,8 @@ static bool metal_graph_encode_decode_layer(
     }
     if (ok && !force_metal_moe && g->cpu_moe_layer[il]) {
         ok = metal_graph_cpu_moe_handoff(g, layer,
+                                         il,
+                                         true,
                                          g->ffn_norm,
                                          g->router_selected,
                                          g->router_weights,
@@ -13847,6 +13939,8 @@ static bool metal_graph_encode_layer_ffn_batch(
 
     if (ok && g->cpu_moe_layer[il]) {
         ok = metal_graph_cpu_moe_handoff(g, layer,
+                                         il,
+                                         false,
                                          g->batch_ffn_norm,
                                          g->batch_router_selected,
                                          g->batch_router_weights,
@@ -15469,6 +15563,7 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
     g->backend = e->backend;
     g->cpu_moe = e->cpu_moe;
     g->cpu_model = e->cpu_moe ? &e->cpu_model : NULL;
+    metal_graph_init_route_profile(g);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->cpu_moe_layer[il] = e->cpu_moe_layer[il];
     }

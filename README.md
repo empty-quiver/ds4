@@ -801,6 +801,11 @@ When CUDA CPU-MoE is enabled, the partial cache skips routed-expert weights for
 CPU-MoE layers so the VRAM budget is spent on attention, compressor, router,
 shared FFN, embeddings, and output weights.
 
+To profile which routed experts are selected while using CPU-MoE, set
+`DS4_CUDA_ROUTE_PROFILE=/path/to/profile.tsv`. The file is written at shutdown
+with `layer`, `expert`, `prefill`, `decode`, and `total` columns. Setting the
+value to `1` writes `ds4-route-profile.tsv` in the current directory.
+
 For 4090-class hybrid runs, add `DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1` to fail
 startup if any non-routed dense candidate cannot be cached in VRAM. This still
 allows optional routed expert candidates to be skipped when the VRAM budget is
@@ -811,6 +816,7 @@ Useful controls:
 * `DS4_CUDA_WEIGHT_CACHE_LIMIT_GB` or `DS4_CUDA_WEIGHT_CACHE_LIMIT_MB`
 * `DS4_CUDA_WEIGHT_CACHE_RESERVE_MB`
 * `DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1`
+* `DS4_CUDA_ROUTE_PROFILE=/path/to/profile.tsv`
 * `DS4_CUDA_WEIGHT_CACHE_VERBOSE=1`
 * `DS4_CUDA_STRICT_WEIGHT_CACHE=1`
 
