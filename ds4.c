@@ -1528,7 +1528,8 @@ static bool accelerator_partial_cache_collect(
         uint32_t *count,
         uint32_t cap,
         const ds4_model *m,
-        const ds4_weights *w) {
+        const ds4_weights *w,
+        const bool *cpu_moe_layer) {
 #define ADD_GLOBAL(t_, p_) \
     do { \
         if (!accelerator_partial_cache_add(cands, count, cap, m, (t_), (p_), UINT32_MAX, 0)) return false; \
@@ -1587,10 +1588,12 @@ static bool accelerator_partial_cache_collect(
         ADD_LAYER(l->ffn_up_shexp, ACCELERATOR_WEIGHT_CACHE_FFN_SHARED);
         ADD_LAYER(l->ffn_down_shexp, ACCELERATOR_WEIGHT_CACHE_FFN_SHARED);
 
-        const uint32_t routed_group = 1000u + il;
-        ADD_LAYER_GROUP(l->ffn_gate_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
-        ADD_LAYER_GROUP(l->ffn_up_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
-        ADD_LAYER_GROUP(l->ffn_down_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
+        if (!cpu_moe_layer || !cpu_moe_layer[il]) {
+            const uint32_t routed_group = 1000u + il;
+            ADD_LAYER_GROUP(l->ffn_gate_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
+            ADD_LAYER_GROUP(l->ffn_up_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
+            ADD_LAYER_GROUP(l->ffn_down_exps, ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS, routed_group);
+        }
     }
 
 #undef ADD_GLOBAL
@@ -1620,6 +1623,7 @@ static uint32_t accelerator_partial_cache_dedup(
 static bool accelerator_cache_model_partial(
         const ds4_model *m,
         const ds4_weights *w,
+        const bool *cpu_moe_layer,
         uint64_t *cached_out,
         uint32_t *ranges_out) {
     enum { CAND_CAP = 2048 };
@@ -1628,7 +1632,7 @@ static bool accelerator_cache_model_partial(
     uint64_t cached = 0;
     uint32_t ranges = 0;
 
-    if (!accelerator_partial_cache_collect(cands, &count, CAND_CAP, m, w)) {
+    if (!accelerator_partial_cache_collect(cands, &count, CAND_CAP, m, w, cpu_moe_layer)) {
         free(cands);
         return false;
     }
@@ -1766,13 +1770,13 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     return true;
 }
 
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m, const ds4_weights *w) {
+static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m, const ds4_weights *w, const bool *cpu_moe_layer) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0 || !w) return false;
     if (accelerator_cuda_partial_weight_cache_enabled()) {
         uint64_t cached = 0;
         uint32_t ranges = 0;
-        return accelerator_cache_model_partial(m, w, &cached, &ranges);
+        return accelerator_cache_model_partial(m, w, cpu_moe_layer, &cached, &ranges);
     }
     if (accelerator_cuda_env_enabled("DS4_CUDA_DIRECT_MODEL")) {
         return true;
@@ -1808,10 +1812,11 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
     return true;
 }
 #else
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m, const ds4_weights *w) {
+static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m, const ds4_weights *w, const bool *cpu_moe_layer) {
     (void)backend;
     (void)m;
     (void)w;
+    (void)cpu_moe_layer;
     return true;
 }
 #endif
@@ -9316,6 +9321,7 @@ typedef struct {
     float directional_steering_ffn_scale;
     bool quality;
     bool mtp_enabled;
+    ds4_backend backend;
     bool cpu_moe;
     bool cpu_moe_layer[DS4_N_LAYER];
     const ds4_model *cpu_model;
@@ -9324,13 +9330,25 @@ typedef struct {
     block_q8_K *cpu_moe_xq;
     block_q8_K *cpu_moe_midq;
     uint32_t *cpu_moe_pair_ids;
+    float *cpu_moe_ffn_norm_host;
+    int32_t *cpu_moe_selected_host;
+    float *cpu_moe_weight_host;
+    float *cpu_moe_out_host;
 } ds4_gpu_graph;
 
 static void metal_graph_free_cpu_moe_scratch(ds4_gpu_graph *g) {
+    free(g->cpu_moe_out_host);
+    free(g->cpu_moe_weight_host);
+    free(g->cpu_moe_selected_host);
+    free(g->cpu_moe_ffn_norm_host);
     free(g->cpu_moe_pair_ids);
     free(g->cpu_moe_midq);
     free(g->cpu_moe_xq);
     free(g->cpu_moe_mid);
+    g->cpu_moe_out_host = NULL;
+    g->cpu_moe_weight_host = NULL;
+    g->cpu_moe_selected_host = NULL;
+    g->cpu_moe_ffn_norm_host = NULL;
     g->cpu_moe_pair_ids = NULL;
     g->cpu_moe_midq = NULL;
     g->cpu_moe_xq = NULL;
@@ -9363,8 +9381,85 @@ static bool metal_graph_ensure_cpu_moe_scratch(ds4_gpu_graph *g, uint32_t n_toke
                                (size_t)(total_pairs * (DS4_N_FF_EXP / QK_K)) * sizeof(*g->cpu_moe_midq));
     g->cpu_moe_pair_ids = xrealloc(g->cpu_moe_pair_ids,
                                    (size_t)total_pairs * sizeof(*g->cpu_moe_pair_ids));
+    if (g->backend == DS4_BACKEND_CUDA) {
+        g->cpu_moe_ffn_norm_host = xrealloc(g->cpu_moe_ffn_norm_host,
+                                            (size_t)((uint64_t)cap * DS4_N_EMBD) *
+                                            sizeof(*g->cpu_moe_ffn_norm_host));
+        g->cpu_moe_selected_host = xrealloc(g->cpu_moe_selected_host,
+                                            (size_t)total_pairs *
+                                            sizeof(*g->cpu_moe_selected_host));
+        g->cpu_moe_weight_host = xrealloc(g->cpu_moe_weight_host,
+                                          (size_t)total_pairs *
+                                          sizeof(*g->cpu_moe_weight_host));
+        g->cpu_moe_out_host = xrealloc(g->cpu_moe_out_host,
+                                       (size_t)((uint64_t)cap * DS4_N_EMBD) *
+                                       sizeof(*g->cpu_moe_out_host));
+    }
     g->cpu_moe_tok_cap = cap;
     return true;
+}
+
+static bool metal_graph_cpu_moe_handoff(
+        ds4_gpu_graph          *g,
+        const ds4_layer_weights *layer,
+        ds4_gpu_tensor         *ffn_norm,
+        ds4_gpu_tensor         *router_selected,
+        ds4_gpu_tensor         *router_weights,
+        ds4_gpu_tensor         *routed_out,
+        uint32_t                n_tokens) {
+    if (!g || !layer || n_tokens == 0) return false;
+    if (!metal_graph_ensure_cpu_moe_scratch(g, n_tokens) ||
+        ds4_gpu_end_commands() == 0) {
+        return false;
+    }
+
+    const float   *xs = NULL;
+    const int32_t *sel = NULL;
+    const float   *w = NULL;
+    float         *out = NULL;
+
+    const uint64_t x_bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
+    const uint64_t pair_count = (uint64_t)n_tokens * DS4_N_EXPERT_USED;
+    const uint64_t sel_bytes = pair_count * sizeof(int32_t);
+    const uint64_t weight_bytes = pair_count * sizeof(float);
+
+    if (g->backend == DS4_BACKEND_CUDA) {
+        if (!g->cpu_moe_ffn_norm_host || !g->cpu_moe_selected_host ||
+            !g->cpu_moe_weight_host || !g->cpu_moe_out_host) {
+            return false;
+        }
+        if (ds4_gpu_tensor_read(ffn_norm, 0, g->cpu_moe_ffn_norm_host, x_bytes) == 0 ||
+            ds4_gpu_tensor_read(router_selected, 0, g->cpu_moe_selected_host, sel_bytes) == 0 ||
+            ds4_gpu_tensor_read(router_weights, 0, g->cpu_moe_weight_host, weight_bytes) == 0) {
+            return false;
+        }
+        xs = g->cpu_moe_ffn_norm_host;
+        sel = g->cpu_moe_selected_host;
+        w = g->cpu_moe_weight_host;
+        out = g->cpu_moe_out_host;
+    } else {
+        xs  = (const float *)  ds4_gpu_tensor_contents(ffn_norm);
+        sel = (const int32_t *)ds4_gpu_tensor_contents(router_selected);
+        w   = (const float *)  ds4_gpu_tensor_contents(router_weights);
+        out = (float *)        ds4_gpu_tensor_contents(routed_out);
+    }
+
+    if (!xs || !sel || !w || !out) return false;
+
+    cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer,
+                                          xs, sel, w, out,
+                                          n_tokens, DS4_SWIGLU_CLAMP_EXP,
+                                          g->cpu_moe_mid,
+                                          g->cpu_moe_xq,
+                                          g->cpu_moe_midq,
+                                          g->cpu_moe_pair_ids);
+
+    if (g->backend == DS4_BACKEND_CUDA &&
+        ds4_gpu_tensor_write(routed_out, 0, out, x_bytes) == 0) {
+        return false;
+    }
+
+    return ds4_gpu_begin_commands() != 0;
 }
 
 /* Release the prefill-sized CPU-MoE scratch so it stops competing with the OS
@@ -10930,24 +11025,12 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
     if (ok && !force_metal_moe && g->cpu_moe_layer[il]) {
-        ok = metal_graph_ensure_cpu_moe_scratch(g, 1) && (ds4_gpu_end_commands() != 0);
-        if (ok) {
-            const float   *xs  = (const float *)  ds4_gpu_tensor_contents(g->ffn_norm);
-            const int32_t *sel = (const int32_t *)ds4_gpu_tensor_contents(g->router_selected);
-            const float   *w   = (const float *)  ds4_gpu_tensor_contents(g->router_weights);
-            float         *out = (float *)        ds4_gpu_tensor_contents(g->routed_out);
-            ok = xs && sel && w && out;
-            if (ok) {
-                cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer,
-                                                      xs, sel, w, out,
-                                                      1, DS4_SWIGLU_CLAMP_EXP,
-                                                      g->cpu_moe_mid,
-                                                      g->cpu_moe_xq,
-                                                      g->cpu_moe_midq,
-                                                      g->cpu_moe_pair_ids);
-            }
-        }
-        if (ok) ok = (ds4_gpu_begin_commands() != 0);
+        ok = metal_graph_cpu_moe_handoff(g, layer,
+                                         g->ffn_norm,
+                                         g->router_selected,
+                                         g->router_weights,
+                                         g->routed_out,
+                                         1);
     } else if (ok) {
         ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
@@ -13732,28 +13815,12 @@ static bool metal_graph_encode_layer_ffn_batch(
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
     if (ok && g->cpu_moe_layer[il]) {
-        /* Drain GPU work so the router selection in storageModeShared buffers
-         * is visible to the CPU MoE handoff. The next GPU command buffer is
-         * issued only after the CPU finishes writing batch_routed_out, so the
-         * subsequent encode acts as the implicit reverse barrier. */
-        ok = metal_graph_ensure_cpu_moe_scratch(g, n_tokens) && (ds4_gpu_end_commands() != 0);
-        if (ok) {
-            const float   *xs  = (const float *)  ds4_gpu_tensor_contents(g->batch_ffn_norm);
-            const int32_t *sel = (const int32_t *)ds4_gpu_tensor_contents(g->batch_router_selected);
-            const float   *w   = (const float *)  ds4_gpu_tensor_contents(g->batch_router_weights);
-            float         *out = (float *)        ds4_gpu_tensor_contents(g->batch_routed_out);
-            ok = xs && sel && w && out;
-            if (ok) {
-                cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer,
-                                                      xs, sel, w, out,
-                                                      n_tokens, DS4_SWIGLU_CLAMP_EXP,
-                                                      g->cpu_moe_mid,
-                                                      g->cpu_moe_xq,
-                                                      g->cpu_moe_midq,
-                                                      g->cpu_moe_pair_ids);
-            }
-        }
-        if (ok) ok = (ds4_gpu_begin_commands() != 0);
+        ok = metal_graph_cpu_moe_handoff(g, layer,
+                                         g->batch_ffn_norm,
+                                         g->batch_router_selected,
+                                         g->batch_router_weights,
+                                         g->batch_routed_out,
+                                         n_tokens);
     } else if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                                    g->batch_routed_gate,
@@ -15365,8 +15432,10 @@ struct ds4_engine {
     bool cpu_moe_layer[DS4_N_LAYER];
 };
 
+#ifndef DS4_NO_GPU
 static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine *e) {
     g->quality = e->quality;
+    g->backend = e->backend;
     g->cpu_moe = e->cpu_moe;
     g->cpu_model = e->cpu_moe ? &e->cpu_model : NULL;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -15539,6 +15608,7 @@ static int metal_graph_prompt_logits_test(
     metal_graph_free(&g);
     return ok ? 0 : 1;
 }
+#endif
 
 static bool cpu_directional_steering_enabled(
         const float *dirs,
@@ -18440,8 +18510,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = NULL;
         return 1;
     }
-    if ((opt->cpu_moe || opt->n_cpu_moe_layers > 0) && opt->backend != DS4_BACKEND_METAL) {
-        fprintf(stderr, "ds4: CPU MoE is only supported on the Metal backend\n");
+    if ((opt->cpu_moe || opt->n_cpu_moe_layers > 0) && !ds4_backend_uses_graph(opt->backend)) {
+        fprintf(stderr, "ds4: CPU MoE is only supported on graph backends (Metal or CUDA)\n");
         *out = NULL;
         return 1;
     }
@@ -18486,16 +18556,18 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     int n_cpu = opt->n_cpu_moe_layers;
     if (opt->cpu_moe && n_cpu == 0) n_cpu = DS4_N_LAYER;
 
-    e->cpu_moe = (n_cpu > 0) && (opt->backend == DS4_BACKEND_METAL);
+    e->cpu_moe = (n_cpu > 0) && ds4_backend_uses_graph(opt->backend);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         e->cpu_moe_layer[il] = e->cpu_moe && (il < (uint32_t)n_cpu);
     }
     if (e->cpu_moe) {
         /* Routed expert weights are read from a second, MAP_PRIVATE mapping to
          * dodge the Darwin VM bug that crashes the kernel when the CPU streams
-         * a large MAP_SHARED mmap (see model_open() comment). The OS still uses
-         * the same file-backed pages underneath, so this does not double the
-         * resident memory cost — it only gives the CPU its own VM policy. */
+         * a large MAP_SHARED mmap (see model_open() comment). On CUDA this
+         * separate private mapping also keeps CPU expert reads independent from
+         * the accelerator model residency path. The OS still uses the same
+         * file-backed pages underneath, so this does not double the resident
+         * memory cost. */
         model_open(&e->cpu_model, opt->model_path, /*metal_mapping=*/false,
                    /*prefetch_cpu=*/false);
         e->cpu_model_ready = true;
@@ -18557,7 +18629,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         ds4_gpu_set_quality(e->quality);
         (void)ds4_gpu_set_model_fd(e->model.fd);
         bool mapped_ok = false;
-        if (e->cpu_moe) {
+        if (e->cpu_moe && e->backend == DS4_BACKEND_METAL) {
             mapped_ok = engine_map_metal_views_with_routed_holes(e);
         } else {
             mapped_ok = (ds4_gpu_set_model_map_range(e->model.map,
@@ -18600,7 +18672,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     "MTP weights remain on the direct path\n");
         }
         if ((!e->mtp_ready || partial_cuda_cache) &&
-            !accelerator_cache_model_tensors(e->backend, &e->model, &e->weights)) {
+            !accelerator_cache_model_tensors(e->backend, &e->model, &e->weights,
+                                             e->cpu_moe ? e->cpu_moe_layer : NULL)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);

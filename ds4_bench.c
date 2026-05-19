@@ -71,7 +71,7 @@ static void usage(FILE *fp) {
         "  --quality              Prefer exact kernels where applicable.\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
         "  --cpu-moe              Run routed MoE experts on the CPU for all layers.\n"
-        "                         Metal backend only.\n"
+        "                         Supported on Metal and CUDA graph backends.\n"
         "  --n-cpu-moe N          Run routed MoE on the CPU only for the first N layers.\n"
         "\n"
         "Sweep:\n"

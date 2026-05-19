@@ -787,6 +787,20 @@ The partial cache selects high-benefit DS4 weights at startup and keeps
 uncached weights on the direct-model path. This is intended for cards such as
 24 GB RTX 4090-class GPUs where full model copy/cache would exceed VRAM.
 
+`--cpu-moe` and `--n-cpu-moe N` can be combined with this mode to run routed
+experts on the CPU while keeping dense/repeated graph work on CUDA:
+
+```sh
+DS4_CUDA_DIRECT_MODEL=1 \
+DS4_CUDA_PARTIAL_WEIGHT_CACHE=1 \
+DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=10 \
+./ds4 --cuda --cpu-moe -p "Hello"
+```
+
+When CUDA CPU-MoE is enabled, the partial cache skips routed-expert weights for
+CPU-MoE layers so the VRAM budget is spent on attention, compressor, router,
+shared FFN, embeddings, and output weights.
+
 Useful controls:
 
 * `DS4_CUDA_WEIGHT_CACHE_LIMIT_GB` or `DS4_CUDA_WEIGHT_CACHE_LIMIT_MB`
