@@ -1465,6 +1465,10 @@ static bool accelerator_cuda_partial_weight_cache_enabled(void) {
     return accelerator_cuda_env_enabled("DS4_CUDA_PARTIAL_WEIGHT_CACHE");
 }
 
+static bool accelerator_cuda_require_dense_weight_cache_enabled(void) {
+    return accelerator_cuda_env_enabled("DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE");
+}
+
 static int accelerator_weight_cache_candidate_cmp(const void *a, const void *b) {
     const accelerator_weight_cache_candidate *ca = a;
     const accelerator_weight_cache_candidate *cb = b;
@@ -1649,7 +1653,19 @@ static bool accelerator_cache_model_partial(
     bool ok = true;
     bool stopped = false;
     bool fallback_printed = false;
+    uint64_t dense_candidate = 0;
+    uint64_t routed_candidate = 0;
+    uint64_t dense_cached = 0;
+    uint64_t routed_cached = 0;
     uint32_t span_id = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (cands[i].priority < ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS) {
+            dense_candidate += cands[i].bytes;
+        } else {
+            routed_candidate += cands[i].bytes;
+        }
+    }
 
     for (uint32_t i = 0; i < count && ok && !stopped;) {
         uint32_t j = i + 1;
@@ -1674,11 +1690,16 @@ static bool accelerator_cache_model_partial(
                 snprintf(label, sizeof(label), "partial:p%u:span%u", cands[i].priority, span_id);
                 const uint64_t bytes = chunk_end - off;
                 if (ds4_gpu_cache_model_range(m->map, m->size, off, bytes, label) == 0) {
-                    if (accelerator_cuda_env_enabled("DS4_CUDA_STRICT_WEIGHT_CACHE")) {
+                    const bool dense_required =
+                        cands[i].priority < ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS &&
+                        accelerator_cuda_require_dense_weight_cache_enabled();
+                    if (accelerator_cuda_env_enabled("DS4_CUDA_STRICT_WEIGHT_CACHE") ||
+                        dense_required) {
                         fprintf(stderr,
                                 "ds4: CUDA partial weight cache failed for %s at offset %" PRIu64
-                                " bytes %" PRIu64 "\n",
-                                label, off, bytes);
+                                " bytes %" PRIu64 "%s\n",
+                                label, off, bytes,
+                                dense_required ? " (dense cache is required)" : "");
                         ok = false;
                     } else {
                         if (!fallback_printed) {
@@ -1692,6 +1713,11 @@ static bool accelerator_cache_model_partial(
                     }
                 } else {
                     cached += bytes;
+                    if (cands[i].priority < ACCELERATOR_WEIGHT_CACHE_ROUTED_EXPERTS) {
+                        dense_cached += bytes;
+                    } else {
+                        routed_cached += bytes;
+                    }
                     ranges++;
                 }
                 span_id++;
@@ -1706,11 +1732,16 @@ static bool accelerator_cache_model_partial(
         if (ds4_log_is_tty(stderr)) fputc('\n', stderr);
         fprintf(stderr,
                 "ds4: CUDA partial weight cache prepared %.2f GiB in %u ranges "
-                "from %u candidates in %.3fs\n",
+                "from %u candidates in %.3fs "
+                "(dense %.2f/%.2f GiB, routed %.2f/%.2f GiB)\n",
                 (double)cached / 1073741824.0,
                 ranges,
                 count,
-                t1 - t0);
+                t1 - t0,
+                (double)dense_cached / 1073741824.0,
+                (double)dense_candidate / 1073741824.0,
+                (double)routed_cached / 1073741824.0,
+                (double)routed_candidate / 1073741824.0);
     }
 
     free(cands);
