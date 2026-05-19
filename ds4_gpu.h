@@ -678,6 +678,34 @@ int ds4_gpu_routed_moe_one_cached_experts_tensor(
         float                   clamp,
         const ds4_gpu_tensor *x);
 
+int ds4_gpu_routed_moe_batch_cached_experts_add_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *down,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const int32_t          *selected_host,
+        const float            *weights_host,
+        const uint32_t         *pair_ids_host,
+        uint32_t                n_pairs,
+        uint32_t                n_tokens,
+        float                   clamp,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,

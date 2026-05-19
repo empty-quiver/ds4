@@ -10182,6 +10182,85 @@ __global__ static void moe_down_ptrs_qwarp32_kernel(
     }
 }
 
+__global__ static void moe_gate_up_mid_pairs_ptrs_qwarp32_kernel(
+        float *mid_out,
+        const char *const *gate_ptrs,
+        const char *const *up_ptrs,
+        const cuda_block_q8_K *xq,
+        const uint32_t *pair_ids,
+        const float *weights,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_pairs,
+        float clamp) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row_lane = threadIdx.x >> 3u;
+    uint32_t pair = blockIdx.y;
+    if (pair >= n_pairs) return;
+    const uint32_t token = pair_ids[pair] / 6u;
+    const char *gate_base = gate_ptrs[pair];
+    const char *up_base = up_ptrs[pair];
+    const cuda_block_q8_K *xqb = xq + (uint64_t)token * xq_blocks;
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
+    for (uint32_t rr = 0; rr < 4u; rr++) {
+        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+        if (row >= expert_mid_dim) continue;
+        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)row * gate_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
+            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
+        }
+        gate = quarter_warp_sum_f32(gate, lane);
+        up = quarter_warp_sum_f32(up, lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[pair];
+        }
+    }
+}
+
+__global__ static void moe_down_pairs_ptrs_atomic_qwarp32_kernel(
+        float *out,
+        const char *const *down_ptrs,
+        const cuda_block_q8_K *midq,
+        const uint32_t *pair_ids,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_pairs) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row_lane = threadIdx.x >> 3u;
+    uint32_t pair = blockIdx.y;
+    if (pair >= n_pairs) return;
+    const uint32_t token = pair_ids[pair] / 6u;
+    const char *down_base = down_ptrs[pair];
+    const cuda_block_q8_K *xqb = midq + (uint64_t)pair * midq_blocks;
+    for (uint32_t rr = 0; rr < 4u; rr++) {
+        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+        if (row >= out_dim) continue;
+        const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)row * down_row_bytes);
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+            acc += dev_dot_q2_K_q8_K_block(wr + b, xqb + b);
+        }
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) atomicAdd(out + (uint64_t)token * out_dim + row, acc);
+    }
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -10870,7 +10949,141 @@ extern "C" int ds4_gpu_routed_moe_one_cached_experts_tensor(
     return ok;
 }
 
-extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t n_tokens) {
+extern "C" int ds4_gpu_routed_moe_batch_cached_experts_add_tensor(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint32_t gate_type,
+        uint32_t down_type,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const int32_t *selected_host,
+        const float *weights_host,
+        const uint32_t *pair_ids_host,
+        uint32_t n_pairs,
+        uint32_t n_tokens,
+        float clamp,
+        const ds4_gpu_tensor *x) {
+    if (!out || !gate || !up || !mid || !down || !model_map || !selected_host ||
+        !weights_host || !pair_ids_host || !x ||
+        n_pairs == 0 || n_tokens == 0 ||
+        gate_type != 16u || down_type != 10u ||
+        expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
+        gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
+        x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
+        mid->bytes < (uint64_t)n_pairs * expert_mid_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
+        return 0;
+    }
+
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    const uint64_t xq_bytes = (uint64_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K);
+    const uint64_t midq_bytes = (uint64_t)n_pairs * midq_blocks * sizeof(cuda_block_q8_K);
+    if (down->bytes < xq_bytes || gate->bytes < midq_bytes) return 0;
+
+    std::vector<const char *> host_ptrs((size_t)n_pairs * 3u);
+    std::vector<float> host_weights(n_pairs);
+    for (uint32_t i = 0; i < n_pairs; i++) {
+        const uint32_t pair_id = pair_ids_host[i];
+        if (pair_id >= n_tokens * 6u) return 0;
+        const int32_t expert_i = selected_host[pair_id];
+        if (expert_i < 0 || expert_i >= 256) return 0;
+        const uint64_t expert = (uint64_t)(uint32_t)expert_i;
+        const uint64_t gate_expert_offset = gate_offset + expert * gate_expert_bytes;
+        const uint64_t up_expert_offset = up_offset + expert * gate_expert_bytes;
+        const uint64_t down_expert_offset = down_offset + expert * down_expert_bytes;
+        if (gate_expert_offset > model_size || gate_expert_bytes > model_size - gate_expert_offset ||
+            up_expert_offset > model_size || gate_expert_bytes > model_size - up_expert_offset ||
+            down_expert_offset > model_size || down_expert_bytes > model_size - down_expert_offset) {
+            return 0;
+        }
+        const char *gate_w = cuda_model_range_lookup_device_cached(model_map, gate_expert_offset, gate_expert_bytes);
+        const char *up_w = cuda_model_range_lookup_device_cached(model_map, up_expert_offset, gate_expert_bytes);
+        const char *down_w = cuda_model_range_lookup_device_cached(model_map, down_expert_offset, down_expert_bytes);
+        if (!gate_w || !up_w || !down_w) return 0;
+        host_ptrs[i] = gate_w;
+        host_ptrs[(size_t)n_pairs + i] = up_w;
+        host_ptrs[(size_t)n_pairs * 2u + i] = down_w;
+        host_weights[i] = weights_host[pair_id];
+    }
+
+    const uint64_t ptr_bytes = (uint64_t)host_ptrs.size() * sizeof(host_ptrs[0]);
+    const uint64_t pair_bytes = (uint64_t)n_pairs * sizeof(uint32_t);
+    const uint64_t weight_bytes = (uint64_t)n_pairs * sizeof(float);
+    const uint64_t pair_off = (ptr_bytes + 7ull) & ~7ull;
+    const uint64_t weight_off = (pair_off + pair_bytes + 7ull) & ~7ull;
+    const uint64_t scratch_bytes = weight_off + weight_bytes;
+    uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(scratch_bytes, "cached routed expert batch tables");
+    if (!scratch) return 0;
+    const char **dev_ptrs = (const char **)scratch;
+    uint32_t *dev_pair_ids = (uint32_t *)(scratch + pair_off);
+    float *dev_weights = (float *)(scratch + weight_off);
+    if (!cuda_ok(cudaMemcpy(dev_ptrs, host_ptrs.data(), (size_t)ptr_bytes, cudaMemcpyHostToDevice),
+                 "cached routed expert batch pointer upload") ||
+        !cuda_ok(cudaMemcpy(dev_pair_ids, pair_ids_host, (size_t)pair_bytes, cudaMemcpyHostToDevice),
+                 "cached routed expert batch pair upload") ||
+        !cuda_ok(cudaMemcpy(dev_weights, host_weights.data(), (size_t)weight_bytes, cudaMemcpyHostToDevice),
+                 "cached routed expert batch weight upload")) {
+        return 0;
+    }
+
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
+    cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
+    dim3 xq_grid(xq_blocks, n_tokens, 1);
+    q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
+    int ok = cuda_ok(cudaGetLastError(), "cached routed_moe batch x quantize launch");
+    if (ok) {
+        dim3 qgrid((expert_mid_dim + 127u) / 128u, n_pairs, 1);
+        moe_gate_up_mid_pairs_ptrs_qwarp32_kernel<<<qgrid, 256>>>(
+            (float *)mid->ptr,
+            dev_ptrs,
+            dev_ptrs + n_pairs,
+            xq,
+            dev_pair_ids,
+            dev_weights,
+            gate_row_bytes,
+            xq_blocks,
+            expert_mid_dim,
+            n_pairs,
+            clamp);
+        ok = cuda_ok(cudaGetLastError(), "cached routed_moe batch gate/up launch");
+    }
+    if (ok) {
+        dim3 midq_grid(midq_blocks, n_pairs, 1);
+        q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_pairs);
+        ok = cuda_ok(cudaGetLastError(), "cached routed_moe batch mid quantize launch");
+    }
+    if (ok) {
+        dim3 dgrid((out_dim + 127u) / 128u, n_pairs, 1);
+        moe_down_pairs_ptrs_atomic_qwarp32_kernel<<<dgrid, 256>>>(
+            (float *)out->ptr,
+            dev_ptrs + (uint64_t)n_pairs * 2u,
+            midq,
+            dev_pair_ids,
+            down_row_bytes,
+            midq_blocks,
+            out_dim,
+            n_pairs);
+        ok = cuda_ok(cudaGetLastError(), "cached routed_moe batch down add launch");
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t n_tokens, bool *mid_is_f16) {
+    if (mid_is_f16) *mid_is_f16 = false;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,

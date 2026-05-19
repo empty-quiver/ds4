@@ -4856,6 +4856,24 @@ static void quantize_mid_pairs_worker(void *vctx, uint64_t p0, uint64_t p1) {
 }
 
 typedef struct {
+    const float *mid;
+    block_q8_K *midq;
+    const uint32_t *pair_ids;
+    uint64_t down_in_dim;
+    uint64_t down_blocks;
+} quantize_selected_mid_pairs_ctx;
+
+static void quantize_selected_mid_pairs_worker(void *vctx, uint64_t p0, uint64_t p1) {
+    quantize_selected_mid_pairs_ctx *ctx = vctx;
+    for (uint64_t i = p0; i < p1; i++) {
+        const uint32_t pair_id = ctx->pair_ids[i];
+        ds4_quantize_row_q8_K(ctx->mid + (uint64_t)pair_id * ctx->down_in_dim,
+                              ctx->midq + (uint64_t)pair_id * ctx->down_blocks,
+                              (int64_t)ctx->down_in_dim);
+    }
+}
+
+typedef struct {
     float *down_pair;
     const uint8_t *base[DS4_N_EXPERT];
     const block_q8_K *midq;
@@ -5230,6 +5248,202 @@ static void layer_routed_moe_selected_batch_prealloc(
                                                         &in_dim, &out_dim, &down_ctx.row_bytes[expert]);
             if (in_dim != down_in_dim || out_dim != down_out_dim) {
                 ds4_die("Q2 selected batch down tensor layout mismatch");
+            }
+        }
+
+        ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
+    }
+}
+
+static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
+        float             *moe,
+        const ds4_model   *model,
+        const ds4_layer_weights *layer,
+        const float       *norm,
+        const int32_t     *selected_rows,
+        const float       *weight_rows,
+        const uint32_t    *active_pair_ids,
+        uint32_t           n_pairs,
+        uint32_t           n_tok,
+        float              clamp,
+        float             *mid,
+        block_q8_K        *xq,
+        block_q8_K        *midq,
+        uint32_t          *pair_ids) {
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_out_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    const uint64_t down_out_dim = layer->ffn_down_exps->dim[1];
+    if (expert_in_dim % QK_K != 0) ds4_die("CPU-MoE selected pair expert input is not QK_K aligned");
+    if (down_in_dim % QK_K != 0) ds4_die("CPU-MoE selected pair down input is not QK_K aligned");
+    if (expert_out_dim != down_in_dim || down_out_dim != DS4_N_EMBD) {
+        ds4_die("CPU-MoE selected pair tensor layout is unexpected");
+    }
+
+    const bool is_q4 = layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K;
+    if (is_q4) {
+        if (layer->ffn_up_exps->type != DS4_TENSOR_Q4_K ||
+            layer->ffn_down_exps->type != DS4_TENSOR_Q4_K) {
+            ds4_die("CPU-MoE selected pair expected all routed expert tensors to be Q4_K");
+        }
+    } else if (!(layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+                 layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+                 layer->ffn_down_exps->type == DS4_TENSOR_Q2_K)) {
+        ds4_die("CPU-MoE selected pair unsupported routed expert quantization");
+    }
+
+    memset(moe, 0, (size_t)((uint64_t)n_tok * down_out_dim) * sizeof(moe[0]));
+    if (n_pairs == 0) return;
+
+    const uint32_t total_pairs = n_tok * DS4_N_EXPERT_USED;
+    uint32_t counts[DS4_N_EXPERT + 1] = {0};
+    uint32_t cursor[DS4_N_EXPERT] = {0};
+    uint32_t active_expert[DS4_N_EXPERT];
+    uint32_t n_active = 0;
+
+    const uint64_t xq_blocks = expert_in_dim / QK_K;
+    for (uint32_t t = 0; t < n_tok; t++) {
+        ds4_quantize_row_q8_K(norm + (uint64_t)t * expert_in_dim,
+                              xq + (uint64_t)t * xq_blocks,
+                              (int64_t)expert_in_dim);
+    }
+
+    for (uint32_t i = 0; i < n_pairs; i++) {
+        const uint32_t pair_id = active_pair_ids[i];
+        if (pair_id >= total_pairs) ds4_die("CPU-MoE selected pair id is outside range");
+        const int32_t expert = selected_rows[pair_id];
+        if (expert < 0 || expert >= DS4_N_EXPERT) ds4_die("CPU-MoE selected pair expert is outside range");
+        counts[(uint32_t)expert + 1]++;
+    }
+
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        counts[e + 1] += counts[e];
+        cursor[e] = counts[e];
+        if (counts[e + 1] != counts[e]) active_expert[n_active++] = e;
+    }
+
+    for (uint32_t i = 0; i < n_pairs; i++) {
+        const uint32_t pair_id = active_pair_ids[i];
+        const uint32_t expert = (uint32_t)selected_rows[pair_id];
+        pair_ids[cursor[expert]++] = pair_id;
+    }
+
+    if (is_q4) {
+        matvec_q4_k_batch_mid_ctx mid_ctx = {
+            .mid = mid,
+            .xq = xq,
+            .pair_ids = pair_ids,
+            .expert_offset = counts,
+            .active_expert = active_expert,
+            .pair_weight = weight_rows,
+            .clamp = clamp,
+            .in_dim = expert_in_dim,
+            .out_dim = expert_out_dim,
+            .xq_blocks = xq_blocks,
+        };
+
+        for (uint32_t ai = 0; ai < n_active; ai++) {
+            const uint32_t expert = active_expert[ai];
+            uint64_t gate_in_dim, gate_out_dim;
+            uint64_t up_in_dim, up_out_dim;
+            mid_ctx.gate_base[expert] = tensor_expert_bytes(model, layer->ffn_gate_exps, expert,
+                                                            &gate_in_dim, &gate_out_dim, &mid_ctx.gate_row_bytes[expert]);
+            mid_ctx.up_base[expert] = tensor_expert_bytes(model, layer->ffn_up_exps, expert,
+                                                          &up_in_dim, &up_out_dim, &mid_ctx.up_row_bytes[expert]);
+            if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
+                gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
+                ds4_die("Q4 selected pair expert tensor layout mismatch");
+            }
+        }
+
+        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q4_k_batch_mid_worker, &mid_ctx);
+    } else {
+        matvec_iq2_xxs_batch_mid_ctx mid_ctx = {
+            .mid = mid,
+            .xq = xq,
+            .pair_ids = pair_ids,
+            .expert_offset = counts,
+            .active_expert = active_expert,
+            .pair_weight = weight_rows,
+            .clamp = clamp,
+            .in_dim = expert_in_dim,
+            .out_dim = expert_out_dim,
+            .xq_blocks = xq_blocks,
+        };
+
+        for (uint32_t ai = 0; ai < n_active; ai++) {
+            const uint32_t expert = active_expert[ai];
+            uint64_t gate_in_dim, gate_out_dim;
+            uint64_t up_in_dim, up_out_dim;
+            mid_ctx.gate_base[expert] = tensor_expert_bytes(model, layer->ffn_gate_exps, expert,
+                                                            &gate_in_dim, &gate_out_dim, &mid_ctx.gate_row_bytes[expert]);
+            mid_ctx.up_base[expert] = tensor_expert_bytes(model, layer->ffn_up_exps, expert,
+                                                          &up_in_dim, &up_out_dim, &mid_ctx.up_row_bytes[expert]);
+            if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
+                gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
+                ds4_die("IQ2_XXS selected pair expert tensor layout mismatch");
+            }
+        }
+
+        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
+    }
+
+    const uint64_t midq_blocks = down_in_dim / QK_K;
+    quantize_selected_mid_pairs_ctx quant_ctx = {
+        .mid = mid,
+        .midq = midq,
+        .pair_ids = pair_ids,
+        .down_in_dim = down_in_dim,
+        .down_blocks = midq_blocks,
+    };
+    ds4_parallel_for(n_pairs, quantize_selected_mid_pairs_worker, &quant_ctx);
+
+    if (is_q4) {
+        matvec_q4_k_batch_accum_rows_ctx down_ctx = {
+            .moe = moe,
+            .midq = midq,
+            .pair_ids = pair_ids,
+            .expert_offset = counts,
+            .active_expert = active_expert,
+            .n_active = n_active,
+            .n_tok = n_tok,
+            .in_dim = down_in_dim,
+            .out_dim = down_out_dim,
+            .midq_blocks = midq_blocks,
+        };
+
+        for (uint32_t ai = 0; ai < n_active; ai++) {
+            const uint32_t expert = active_expert[ai];
+            uint64_t in_dim, out_dim;
+            down_ctx.base[expert] = tensor_expert_bytes(model, layer->ffn_down_exps, expert,
+                                                        &in_dim, &out_dim, &down_ctx.row_bytes[expert]);
+            if (in_dim != down_in_dim || out_dim != down_out_dim) {
+                ds4_die("Q4 selected pair down tensor layout mismatch");
+            }
+        }
+
+        ds4_parallel_for(down_out_dim, matvec_q4_k_batch_accum_rows_worker, &down_ctx);
+    } else {
+        matvec_q2_k_batch_accum_rows_ctx down_ctx = {
+            .moe = moe,
+            .midq = midq,
+            .pair_ids = pair_ids,
+            .expert_offset = counts,
+            .active_expert = active_expert,
+            .n_active = n_active,
+            .n_tok = n_tok,
+            .in_dim = down_in_dim,
+            .out_dim = down_out_dim,
+            .midq_blocks = midq_blocks,
+        };
+
+        for (uint32_t ai = 0; ai < n_active; ai++) {
+            const uint32_t expert = active_expert[ai];
+            uint64_t in_dim, out_dim;
+            down_ctx.base[expert] = tensor_expert_bytes(model, layer->ffn_down_exps, expert,
+                                                        &in_dim, &out_dim, &down_ctx.row_bytes[expert]);
+            if (in_dim != down_in_dim || out_dim != down_out_dim) {
+                ds4_die("Q2 selected pair down tensor layout mismatch");
             }
         }
 
@@ -9451,6 +9665,9 @@ typedef struct {
     bool cpu_moe_layer[DS4_N_LAYER];
     bool hot_experts_enabled;
     bool hot_expert[DS4_N_LAYER][DS4_N_EXPERT];
+    uint64_t hot_expert_prefill_batches;
+    uint64_t hot_expert_prefill_slots;
+    uint64_t cold_expert_prefill_slots;
     uint64_t hot_expert_decode_layers;
     uint64_t hot_expert_decode_slots;
     uint64_t cold_expert_decode_slots;
@@ -9460,6 +9677,8 @@ typedef struct {
     block_q8_K *cpu_moe_xq;
     block_q8_K *cpu_moe_midq;
     uint32_t *cpu_moe_pair_ids;
+    uint32_t *cpu_moe_hot_pair_ids;
+    uint32_t *cpu_moe_cold_pair_ids;
     float *cpu_moe_ffn_norm_host;
     int32_t *cpu_moe_selected_host;
     float *cpu_moe_weight_host;
@@ -9556,6 +9775,8 @@ static void metal_graph_free_cpu_moe_scratch(ds4_gpu_graph *g) {
     free(g->cpu_moe_selected_host);
     free(g->cpu_moe_ffn_norm_host);
     free(g->cpu_moe_pair_ids);
+    free(g->cpu_moe_hot_pair_ids);
+    free(g->cpu_moe_cold_pair_ids);
     free(g->cpu_moe_midq);
     free(g->cpu_moe_xq);
     free(g->cpu_moe_mid);
@@ -9564,6 +9785,8 @@ static void metal_graph_free_cpu_moe_scratch(ds4_gpu_graph *g) {
     g->cpu_moe_selected_host = NULL;
     g->cpu_moe_ffn_norm_host = NULL;
     g->cpu_moe_pair_ids = NULL;
+    g->cpu_moe_hot_pair_ids = NULL;
+    g->cpu_moe_cold_pair_ids = NULL;
     g->cpu_moe_midq = NULL;
     g->cpu_moe_xq = NULL;
     g->cpu_moe_mid = NULL;
@@ -9573,7 +9796,8 @@ static void metal_graph_free_cpu_moe_scratch(ds4_gpu_graph *g) {
 static bool metal_graph_ensure_cpu_moe_scratch(ds4_gpu_graph *g, uint32_t n_tokens) {
     if (!g || n_tokens == 0) return true;
     if (n_tokens <= g->cpu_moe_tok_cap &&
-        g->cpu_moe_mid && g->cpu_moe_xq && g->cpu_moe_midq && g->cpu_moe_pair_ids) {
+        g->cpu_moe_mid && g->cpu_moe_xq && g->cpu_moe_midq &&
+        g->cpu_moe_pair_ids && g->cpu_moe_hot_pair_ids && g->cpu_moe_cold_pair_ids) {
         return true;
     }
 
@@ -9595,6 +9819,10 @@ static bool metal_graph_ensure_cpu_moe_scratch(ds4_gpu_graph *g, uint32_t n_toke
                                (size_t)(total_pairs * (DS4_N_FF_EXP / QK_K)) * sizeof(*g->cpu_moe_midq));
     g->cpu_moe_pair_ids = xrealloc(g->cpu_moe_pair_ids,
                                    (size_t)total_pairs * sizeof(*g->cpu_moe_pair_ids));
+    g->cpu_moe_hot_pair_ids = xrealloc(g->cpu_moe_hot_pair_ids,
+                                       (size_t)total_pairs * sizeof(*g->cpu_moe_hot_pair_ids));
+    g->cpu_moe_cold_pair_ids = xrealloc(g->cpu_moe_cold_pair_ids,
+                                        (size_t)total_pairs * sizeof(*g->cpu_moe_cold_pair_ids));
     if (g->backend == DS4_BACKEND_CUDA) {
         g->cpu_moe_ffn_norm_host = xrealloc(g->cpu_moe_ffn_norm_host,
                                             (size_t)((uint64_t)cap * DS4_N_EMBD) *
@@ -9741,6 +9969,108 @@ static bool metal_graph_cuda_cpu_moe_hot_decode(
     return true;
 }
 
+static bool metal_graph_cuda_cpu_moe_hot_prefill(
+        ds4_gpu_graph          *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        ds4_gpu_tensor         *ffn_norm,
+        ds4_gpu_tensor         *routed_out,
+        const float            *xs,
+        const int32_t          *sel,
+        const float            *w,
+        uint32_t                n_tokens) {
+    if (!g || !model || !layer || !ffn_norm || !routed_out || !xs || !sel || !w) return false;
+    if (g->backend != DS4_BACKEND_CUDA || !g->hot_experts_enabled || il >= DS4_N_LAYER) return false;
+    if (!g->cpu_moe_hot_pair_ids || !g->cpu_moe_cold_pair_ids) return false;
+    if (!(layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+          layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+          layer->ffn_down_exps->type == DS4_TENSOR_Q2_K)) {
+        return false;
+    }
+
+    const uint32_t total_pairs = n_tokens * DS4_N_EXPERT_USED;
+    uint32_t n_hot = 0;
+    uint32_t n_cold = 0;
+    for (uint32_t pair_id = 0; pair_id < total_pairs; pair_id++) {
+        const int32_t expert = sel[pair_id];
+        if (expert < 0 || expert >= DS4_N_EXPERT) return false;
+        const uint32_t e = (uint32_t)expert;
+        if (g->hot_expert[il][e] && metal_graph_cuda_hot_expert_cached(model, layer, e)) {
+            g->cpu_moe_hot_pair_ids[n_hot++] = pair_id;
+        } else {
+            g->cpu_moe_cold_pair_ids[n_cold++] = pair_id;
+        }
+    }
+    if (n_hot == 0) return false;
+
+    const uint64_t x_bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
+    const uint32_t expert_in_dim = (uint32_t)layer->ffn_gate_exps->dim[0];
+    const uint32_t expert_mid_dim = (uint32_t)layer->ffn_gate_exps->dim[1];
+    const uint32_t out_dim = (uint32_t)layer->ffn_down_exps->dim[1];
+
+    if (n_cold != 0) {
+        layer_routed_moe_selected_pairs_prealloc(g->cpu_moe_out_host,
+                                                 g->cpu_model,
+                                                 layer,
+                                                 xs,
+                                                 sel,
+                                                 w,
+                                                 g->cpu_moe_cold_pair_ids,
+                                                 n_cold,
+                                                 n_tokens,
+                                                 DS4_SWIGLU_CLAMP_EXP,
+                                                 g->cpu_moe_mid,
+                                                 g->cpu_moe_xq,
+                                                 g->cpu_moe_midq,
+                                                 g->cpu_moe_pair_ids);
+        if (ds4_gpu_tensor_write(routed_out, 0, g->cpu_moe_out_host, x_bytes) == 0) {
+            return false;
+        }
+    } else if (ds4_gpu_tensor_fill_f32(routed_out, 0.0f, (uint64_t)n_tokens * DS4_N_EMBD) == 0) {
+        return false;
+    }
+
+    g->batch_routed_mid_is_f16 = false;
+    if (ds4_gpu_routed_moe_batch_cached_experts_add_tensor(routed_out,
+                                                           g->batch_routed_gate,
+                                                           g->batch_routed_up,
+                                                           g->batch_routed_mid,
+                                                           g->batch_routed_down,
+                                                           model->map,
+                                                           model->size,
+                                                           layer->ffn_gate_exps->abs_offset,
+                                                           layer->ffn_up_exps->abs_offset,
+                                                           layer->ffn_down_exps->abs_offset,
+                                                           layer->ffn_gate_exps->type,
+                                                           layer->ffn_down_exps->type,
+                                                           gate_expert_bytes,
+                                                           gate_row_bytes,
+                                                           down_expert_bytes,
+                                                           down_row_bytes,
+                                                           expert_in_dim,
+                                                           expert_mid_dim,
+                                                           out_dim,
+                                                           sel,
+                                                           w,
+                                                           g->cpu_moe_hot_pair_ids,
+                                                           n_hot,
+                                                           n_tokens,
+                                                           DS4_SWIGLU_CLAMP_EXP,
+                                                           ffn_norm) == 0) {
+        return false;
+    }
+
+    g->hot_expert_prefill_batches++;
+    g->hot_expert_prefill_slots += n_hot;
+    g->cold_expert_prefill_slots += n_cold;
+    return true;
+}
+
 static bool metal_graph_cpu_moe_handoff(
         ds4_gpu_graph          *g,
         const ds4_model         *model,
@@ -9798,6 +10128,11 @@ static bool metal_graph_cpu_moe_handoff(
                                             routed_out, xs, sel, w)) {
         return ds4_gpu_begin_commands() != 0;
     }
+    if (!decode &&
+        metal_graph_cuda_cpu_moe_hot_prefill(g, model, layer, il, ffn_norm,
+                                             routed_out, xs, sel, w, n_tokens)) {
+        return ds4_gpu_begin_commands() != 0;
+    }
 
     cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer,
                                           xs, sel, w, out,
@@ -9830,7 +10165,11 @@ static void metal_graph_shrink_cpu_moe_scratch(ds4_gpu_graph *g) {
 static void metal_graph_free(ds4_gpu_graph *g) {
     if (g && g->hot_experts_enabled) {
         fprintf(stderr,
+                "ds4: CUDA hot experts prefill: batches=%llu hot_slots=%llu cold_slots=%llu\n"
                 "ds4: CUDA hot experts decode: layers=%llu hot_slots=%llu cold_slots=%llu\n",
+                (unsigned long long)g->hot_expert_prefill_batches,
+                (unsigned long long)g->hot_expert_prefill_slots,
+                (unsigned long long)g->cold_expert_prefill_slots,
                 (unsigned long long)g->hot_expert_decode_layers,
                 (unsigned long long)g->hot_expert_decode_slots,
                 (unsigned long long)g->cold_expert_decode_slots);

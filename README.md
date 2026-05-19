@@ -817,9 +817,10 @@ one `layer expert` pair per line, with `#` comments allowed:
 ```
 
 Hot experts are added to the partial cache as exact gate/up/down expert byte
-ranges. During single-token decode, selected hot slots run from the resident
-CUDA ranges and selected cold slots still use the CPU-MoE path. Batched prefill
-still uses CPU-MoE for routed experts.
+ranges. During batched prefill and single-token decode, selected hot slots run
+from the resident CUDA ranges and selected cold slots still use the CPU-MoE
+path. The prefill path is best-effort: if the hot batch add path cannot run,
+the layer falls back to the all-CPU-MoE routed output.
 
 For 4090-class hybrid runs, add `DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1` to fail
 startup if any non-routed dense candidate cannot be cached in VRAM. This still
