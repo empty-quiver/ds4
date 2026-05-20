@@ -5403,18 +5403,6 @@ typedef void (*ds4_cpu_moe_expert_rows_fn)(
         uint64_t  row0,
         uint64_t  row1);
 
-typedef struct {
-    ds4_cpu_moe_expert_rows_fn fn;
-    void *ctx;
-    const uint32_t *active_expert;
-    uint32_t n_active;
-    uint32_t n_threads;
-    uint64_t rows_per_expert;
-    uint64_t chunk_rows;
-    volatile uint64_t next_row[DS4_N_EXPERT];
-    uint16_t owner_by_active[DS4_N_EXPERT];
-} ds4_cpu_moe_expert_rows_ctx;
-
 static uint16_t g_cpu_moe_expert_owner[DS4_N_LAYER][DS4_N_EXPERT];
 static uint8_t g_cpu_moe_expert_owner_valid[DS4_N_LAYER][DS4_N_EXPERT];
 static uint32_t g_cpu_moe_expert_owner_threads[DS4_N_LAYER];
@@ -5423,6 +5411,21 @@ static uint32_t g_cpu_moe_expert_next_owner[DS4_N_LAYER];
 static uint32_t ds4_cpu_moe_row_chunk(void) {
     return ds4_env_u32_default_range("DS4_CPU_MOE_ROW_CHUNK", 8, 1, 256);
 }
+
+typedef struct {
+    uint16_t active_idx;
+    uint16_t row0;
+    uint16_t row1;
+} ds4_cpu_moe_row_task;
+
+typedef struct {
+    ds4_cpu_moe_expert_rows_fn fn;
+    void *ctx;
+    const ds4_cpu_moe_row_task *tasks;
+    uint32_t n_threads;
+    uint64_t queue_end[DS4_MAX_THREADS];
+    volatile uint64_t queue_next[DS4_MAX_THREADS];
+} ds4_cpu_moe_task_queue_ctx;
 
 static void ds4_cpu_moe_prepare_expert_owners(
         uint32_t        il,
@@ -5456,38 +5459,37 @@ static void ds4_cpu_moe_prepare_expert_owners(
     }
 }
 
-static bool ds4_cpu_moe_take_expert_row_chunk(
-        ds4_cpu_moe_expert_rows_ctx *ctx,
-        uint32_t                     active_idx) {
-    const uint64_t row0 = __sync_fetch_and_add(&ctx->next_row[active_idx], ctx->chunk_rows);
-    if (row0 >= ctx->rows_per_expert) return false;
-    uint64_t row1 = row0 + ctx->chunk_rows;
-    if (row1 > ctx->rows_per_expert) row1 = ctx->rows_per_expert;
-    ctx->fn(ctx->ctx, active_idx, row0, row1);
-    return true;
+static bool ds4_cpu_moe_queue_pop(
+        ds4_cpu_moe_task_queue_ctx *q,
+        uint32_t                    worker,
+        ds4_cpu_moe_row_task       *task) {
+    while (true) {
+        const uint64_t idx = q->queue_next[worker];
+        if (idx >= q->queue_end[worker]) return false;
+        if (__sync_bool_compare_and_swap(&q->queue_next[worker], idx, idx + 1)) {
+            *task = q->tasks[idx];
+            return true;
+        }
+    }
 }
 
-static void ds4_cpu_moe_expert_rows_worker(void *vctx, uint64_t lane0, uint64_t lane1) {
-    ds4_cpu_moe_expert_rows_ctx *ctx = vctx;
+static void ds4_cpu_moe_task_queue_worker(void *vctx, uint64_t lane0, uint64_t lane1) {
+    ds4_cpu_moe_task_queue_ctx *q = vctx;
 
     for (uint64_t lane = lane0; lane < lane1; lane++) {
-        const uint32_t worker = (uint32_t)(lane % ctx->n_threads);
+        const uint32_t worker = (uint32_t)(lane % q->n_threads);
+        ds4_cpu_moe_row_task task;
 
-        bool progressed;
-        do {
-            progressed = false;
-            for (uint32_t ai = 0; ai < ctx->n_active; ai++) {
-                if (ctx->owner_by_active[ai] != worker) continue;
-                progressed |= ds4_cpu_moe_take_expert_row_chunk(ctx, ai);
-            }
-        } while (progressed);
+        while (ds4_cpu_moe_queue_pop(q, worker, &task)) {
+            q->fn(q->ctx, task.active_idx, task.row0, task.row1);
+        }
 
         for (;;) {
             bool stole = false;
-            const uint32_t start = ctx->n_active ? (worker * 17u) % ctx->n_active : 0;
-            for (uint32_t off = 0; off < ctx->n_active; off++) {
-                const uint32_t ai = (start + off) % ctx->n_active;
-                if (ds4_cpu_moe_take_expert_row_chunk(ctx, ai)) {
+            for (uint32_t off = 1; off < q->n_threads; off++) {
+                const uint32_t victim = (worker + off) % q->n_threads;
+                if (ds4_cpu_moe_queue_pop(q, victim, &task)) {
+                    q->fn(q->ctx, task.active_idx, task.row0, task.row1);
                     stole = true;
                     break;
                 }
@@ -5515,23 +5517,65 @@ static void ds4_cpu_moe_parallel_expert_rows(
         }
         return;
     }
+    if (g_pool.n_threads > DS4_MAX_THREADS) ds4_die("CPU-MoE queue thread count exceeds maximum");
+    if (rows_per_expert > UINT16_MAX) ds4_die("CPU-MoE queued row index exceeds task format");
 
-    ds4_cpu_moe_expert_rows_ctx sched = {
-        .fn = fn,
-        .ctx = ctx,
-        .active_expert = active_expert,
-        .n_active = n_active,
-        .n_threads = g_pool.n_threads,
-        .rows_per_expert = rows_per_expert,
-        .chunk_rows = chunk_rows,
-    };
+    uint16_t owner_by_active[DS4_N_EXPERT];
     ds4_cpu_moe_prepare_expert_owners(il, active_expert, n_active, g_pool.n_threads,
-                                      sched.owner_by_active);
+                                      owner_by_active);
+
+    const uint64_t chunks_per_expert = (rows_per_expert + chunk_rows - 1) / chunk_rows;
+    if (chunks_per_expert == 0) return;
+    if (chunks_per_expert > UINT64_MAX / n_active) ds4_die("CPU-MoE task queue size overflow");
+    const uint64_t n_tasks = chunks_per_expert * n_active;
+    if (n_tasks > SIZE_MAX / sizeof(ds4_cpu_moe_row_task)) ds4_die("CPU-MoE task queue allocation overflow");
+
+    uint64_t queue_count[DS4_MAX_THREADS] = {0};
     for (uint32_t ai = 0; ai < n_active; ai++) {
-        sched.next_row[ai] = 0;
+        const uint32_t owner = owner_by_active[ai];
+        if (owner >= g_pool.n_threads) ds4_die("CPU-MoE expert owner is outside worker range");
+        queue_count[owner] += chunks_per_expert;
     }
 
-    ds4_parallel_for_min_rows(g_pool.n_threads, ds4_cpu_moe_expert_rows_worker, &sched, 1);
+    ds4_cpu_moe_task_queue_ctx q = {
+        .fn = fn,
+        .ctx = ctx,
+        .n_threads = g_pool.n_threads,
+    };
+
+    uint64_t total = 0;
+    uint64_t queue_begin[DS4_MAX_THREADS];
+    for (uint32_t w = 0; w < g_pool.n_threads; w++) {
+        queue_begin[w] = total;
+        q.queue_next[w] = total;
+        total += queue_count[w];
+        q.queue_end[w] = total;
+    }
+    if (total != n_tasks) ds4_die("CPU-MoE task queue accounting mismatch");
+
+    ds4_cpu_moe_row_task *tasks = xmalloc((size_t)n_tasks * sizeof(tasks[0]));
+    uint64_t cursor[DS4_MAX_THREADS];
+    for (uint32_t w = 0; w < g_pool.n_threads; w++) cursor[w] = queue_begin[w];
+
+    for (uint32_t ai = 0; ai < n_active; ai++) {
+        const uint32_t owner = owner_by_active[ai];
+        for (uint64_t chunk = 0; chunk < chunks_per_expert; chunk++) {
+            const uint64_t row0 = chunk * chunk_rows;
+            uint64_t row1 = row0 + chunk_rows;
+            if (row1 > rows_per_expert) row1 = rows_per_expert;
+            ds4_cpu_moe_row_task *task = &tasks[cursor[owner]++];
+            task->active_idx = (uint16_t)ai;
+            task->row0 = (uint16_t)row0;
+            task->row1 = (uint16_t)row1;
+        }
+    }
+    for (uint32_t w = 0; w < g_pool.n_threads; w++) {
+        if (cursor[w] != q.queue_end[w]) ds4_die("CPU-MoE task queue fill mismatch");
+    }
+
+    q.tasks = tasks;
+    ds4_parallel_for_min_rows(g_pool.n_threads, ds4_cpu_moe_task_queue_worker, &q, 1);
+    free(tasks);
 }
 
 static void matvec_iq2_xxs_batch_mid_expert_rows(
