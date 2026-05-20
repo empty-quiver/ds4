@@ -1305,6 +1305,118 @@ static const char *cuda_model_range_cache_device(
     return dev;
 }
 
+static uint64_t cuda_dynamic_expert_reserve_bytes(uint64_t total_bytes) {
+    int present = 0;
+    const uint64_t reserve = cuda_parse_mib_env("DS4_CUDA_DYNAMIC_EXPERT_RESERVE_MB", &present);
+    if (present) return reserve;
+    (void)total_bytes;
+    return 2048ull * 1048576ull;
+}
+
+static const char *cuda_model_range_cache_releasable(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        const char *what) {
+    if (!model_map || bytes == 0) return NULL;
+    if (offset > model_size || bytes > model_size - offset) return NULL;
+    if (model_map == g_model_host_base && g_model_device_owned) {
+        return cuda_model_ptr(model_map, offset);
+    }
+
+    const char *cached = cuda_model_range_lookup_device_cached(model_map, offset, bytes);
+    if (cached) return cached;
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    cudaError_t mem_err = cudaMemGetInfo(&free_b, &total_b);
+    if (mem_err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA dynamic expert memory query failed: %s\n",
+                cudaGetErrorString(mem_err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    const uint64_t free_bytes = (uint64_t)free_b;
+    const uint64_t reserve = cuda_dynamic_expert_reserve_bytes((uint64_t)total_b);
+    if (free_bytes <= reserve || bytes > free_bytes - reserve) {
+        if (getenv("DS4_CUDA_DYNAMIC_EXPERT_VERBOSE") ||
+            getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+            fprintf(stderr,
+                    "ds4: CUDA dynamic expert cache skipped %s "
+                    "(request %.2f MiB free %.2f GiB reserve %.2f GiB)\n",
+                    what ? what : "expert",
+                    (double)bytes / 1048576.0,
+                    (double)free_bytes / 1073741824.0,
+                    (double)reserve / 1073741824.0);
+        }
+        return NULL;
+    }
+
+    void *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA dynamic expert alloc failed for %s (%.2f MiB): %s\n",
+                what ? what : "expert", (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+
+    const char *src = (const char *)model_map + offset;
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    for (uint64_t done = 0; done < bytes; done += chunk) {
+        const uint64_t n = bytes - done < chunk ? bytes - done : chunk;
+        err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA dynamic expert copy failed for %s at %.2f/%.2f MiB: %s\n",
+                    what ? what : "expert",
+                    (double)done / 1048576.0,
+                    (double)bytes / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaFree(dev);
+            (void)cudaGetLastError();
+            return NULL;
+        }
+    }
+
+    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
+    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+    g_model_range_bytes += bytes;
+    cuda_model_discard_source_pages(model_map, model_size, offset, bytes);
+    if (getenv("DS4_CUDA_DYNAMIC_EXPERT_VERBOSE") ||
+        getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA dynamic expert cached %s %.2f MiB (total %.2f GiB)\n",
+                what ? what : "expert",
+                (double)bytes / 1048576.0,
+                (double)g_model_range_bytes / 1073741824.0);
+    }
+    return (const char *)dev;
+}
+
+static int cuda_model_range_release_exact(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes) {
+    if (!model_map || bytes == 0) return 1;
+    auto it = g_model_range_by_offset.find(offset);
+    if (it == g_model_range_by_offset.end()) return 0;
+    if (it->second >= g_model_ranges.size()) {
+        g_model_range_by_offset.erase(it);
+        return 0;
+    }
+    cuda_model_range &r = g_model_ranges[it->second];
+    if (r.host_base != model_map || r.offset != offset || r.bytes != bytes ||
+        r.host_registered || r.arena_allocated || !r.device_ptr) {
+        return 0;
+    }
+    (void)cudaFree(r.device_ptr);
+    if (g_model_range_bytes >= r.bytes) g_model_range_bytes -= r.bytes;
+    else g_model_range_bytes = 0;
+    r = {};
+    g_model_range_by_offset.erase(it);
+    return 1;
+}
+
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
     if (getenv("DS4_CUDA_NO_MODEL_COPY") != NULL ||
@@ -1768,6 +1880,17 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
     if (!ptr) return 0;
     if (force_device_cache) return cuda_model_range_is_device_cached(model_map, offset, bytes);
     return cuda_model_range_lookup_cached(model_map, offset, bytes) != NULL;
+}
+
+extern "C" int ds4_gpu_cache_model_range_releasable(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+    if (!model_map || bytes == 0) return 1;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+    const char *cache_label = label ? label : "dynamic_expert";
+    return cuda_model_range_cache_releasable(model_map, model_size, offset, bytes, cache_label) != NULL;
+}
+
+extern "C" int ds4_gpu_uncache_model_range(const void *model_map, uint64_t offset, uint64_t bytes) {
+    return cuda_model_range_release_exact(model_map, offset, bytes);
 }
 
 extern "C" int ds4_gpu_model_range_cached(const void *model_map, uint64_t offset, uint64_t bytes) {

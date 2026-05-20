@@ -4513,6 +4513,22 @@ int ds4_gpu_model_range_cached(const void *model_map, uint64_t offset, uint64_t 
     return 0;
 }
 
+int ds4_gpu_cache_model_range_releasable(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+    (void)model_map;
+    (void)model_size;
+    (void)offset;
+    (void)bytes;
+    (void)label;
+    return 0;
+}
+
+int ds4_gpu_uncache_model_range(const void *model_map, uint64_t offset, uint64_t bytes) {
+    (void)model_map;
+    (void)offset;
+    (void)bytes;
+    return 0;
+}
+
 int ds4_gpu_set_model_fd(int fd) {
     (void)fd;
     return 1;
