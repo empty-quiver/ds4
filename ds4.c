@@ -14,6 +14,12 @@
  * no-copy MTLBuffers.
  */
 
+#ifdef __linux__
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#endif
+
 #include <errno.h>
 #include <fcntl.h>
 #include <float.h>
@@ -33,6 +39,9 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 #include "ds4.h"
 
@@ -675,9 +684,62 @@ static ds4_thread_pool g_pool;
 static __thread int g_parallel_depth;
 static uint32_t g_requested_threads;
 
+static DS4_MAYBE_UNUSED bool ds4_env_enabled_default(const char *name, bool def) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return def;
+    return !(env[0] == '0' && env[1] == '\0');
+}
+
+static uint32_t ds4_env_u32_default_range(const char *name, uint32_t def, uint32_t lo, uint32_t hi) {
+    const char *env = getenv(name);
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && v >= lo && v <= hi) {
+            return (uint32_t)v;
+        }
+    }
+    return def;
+}
+
+static DS4_MAYBE_UNUSED int ds4_affinity_cpu_for_lane(uint32_t lane) {
+    const char *env = getenv("DS4_CPU_AFFINITY_LIST");
+    if (!env || !env[0]) return (int)lane;
+
+    const char *p = env;
+    uint32_t idx = 0;
+    while (*p) {
+        char *end = NULL;
+        long cpu = strtol(p, &end, 10);
+        if (end != p && cpu >= 0 && idx == lane) return (int)cpu;
+        if (!end || *end != ',') break;
+        p = end + 1;
+        idx++;
+    }
+    return (int)lane;
+}
+
+static void ds4_pin_parallel_lane(uint32_t lane) {
+#ifdef __linux__
+    if (!ds4_env_enabled_default("DS4_CPU_AFFINITY", true)) return;
+
+    const int cpu = ds4_affinity_cpu_for_lane(lane);
+    if (cpu < 0 || cpu >= CPU_SETSIZE) return;
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+    (void)lane;
+#endif
+}
+
 static void *ds4_worker_main(void *arg) {
     const uint32_t tid = (uint32_t)(uintptr_t)arg;
     uint32_t seen_generation = 0;
+
+    ds4_pin_parallel_lane(tid);
 
     for (;;) {
         pthread_mutex_lock(&g_pool.mutex);
@@ -747,6 +809,8 @@ static void ds4_threads_init(void) {
     g_pool.shutdown = false;
     g_pool.initialized = true;
 
+    ds4_pin_parallel_lane(0);
+
     for (uint32_t i = 1; i < n_threads; i++) {
         if (pthread_create(&g_pool.threads[i], NULL, ds4_worker_main, (void *)(uintptr_t)i) != 0) {
             ds4_die("failed to create worker thread");
@@ -811,6 +875,52 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
 
 static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
     ds4_parallel_for_min_rows(n_rows, fn, ctx, 512);
+}
+
+typedef struct {
+    ds4_parallel_fn fn;
+    void *ctx;
+    volatile uint64_t next_row;
+    uint64_t n_rows;
+    uint64_t chunk_rows;
+} ds4_dynamic_rows_ctx;
+
+static void ds4_dynamic_rows_worker(void *vctx, uint64_t lane0, uint64_t lane1) {
+    ds4_dynamic_rows_ctx *ctx = vctx;
+    (void)lane0;
+    (void)lane1;
+
+    for (;;) {
+        const uint64_t row0 = __sync_fetch_and_add(&ctx->next_row, ctx->chunk_rows);
+        if (row0 >= ctx->n_rows) return;
+        uint64_t row1 = row0 + ctx->chunk_rows;
+        if (row1 > ctx->n_rows) row1 = ctx->n_rows;
+        ctx->fn(ctx->ctx, row0, row1);
+    }
+}
+
+static void ds4_parallel_for_dynamic_min_rows(
+        uint64_t        n_rows,
+        ds4_parallel_fn fn,
+        void           *ctx,
+        uint64_t        chunk_rows,
+        uint64_t        min_parallel_rows) {
+    ds4_threads_init();
+
+    if (chunk_rows == 0) chunk_rows = 1;
+    if (g_parallel_depth > 0 || g_pool.n_threads <= 1 || n_rows < min_parallel_rows) {
+        fn(ctx, 0, n_rows);
+        return;
+    }
+
+    ds4_dynamic_rows_ctx dyn = {
+        .fn = fn,
+        .ctx = ctx,
+        .next_row = 0,
+        .n_rows = n_rows,
+        .chunk_rows = chunk_rows,
+    };
+    ds4_parallel_for_min_rows(g_pool.n_threads, ds4_dynamic_rows_worker, &dyn, 1);
 }
 
 static void cursor_error(ds4_cursor *c, const char *msg) {
@@ -5287,6 +5397,165 @@ static void matvec_q4_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint6
     }
 }
 
+typedef void (*ds4_cpu_moe_expert_rows_fn)(
+        void     *ctx,
+        uint32_t  active_idx,
+        uint64_t  row0,
+        uint64_t  row1);
+
+typedef struct {
+    ds4_cpu_moe_expert_rows_fn fn;
+    void *ctx;
+    const uint32_t *active_expert;
+    uint32_t n_active;
+    uint32_t n_threads;
+    uint64_t rows_per_expert;
+    uint64_t chunk_rows;
+    volatile uint64_t next_row[DS4_N_EXPERT];
+    uint16_t owner_by_active[DS4_N_EXPERT];
+} ds4_cpu_moe_expert_rows_ctx;
+
+static uint16_t g_cpu_moe_expert_owner[DS4_N_LAYER][DS4_N_EXPERT];
+static uint8_t g_cpu_moe_expert_owner_valid[DS4_N_LAYER][DS4_N_EXPERT];
+static uint32_t g_cpu_moe_expert_owner_threads[DS4_N_LAYER];
+static uint32_t g_cpu_moe_expert_next_owner[DS4_N_LAYER];
+
+static uint32_t ds4_cpu_moe_row_chunk(void) {
+    return ds4_env_u32_default_range("DS4_CPU_MOE_ROW_CHUNK", 8, 1, 256);
+}
+
+static void ds4_cpu_moe_prepare_expert_owners(
+        uint32_t        il,
+        const uint32_t *active_expert,
+        uint32_t        n_active,
+        uint32_t        n_threads,
+        uint16_t       *owner_by_active) {
+    if (n_threads == 0) n_threads = 1;
+    if (il >= DS4_N_LAYER) {
+        for (uint32_t ai = 0; ai < n_active; ai++) {
+            owner_by_active[ai] = (uint16_t)(active_expert[ai] % n_threads);
+        }
+        return;
+    }
+
+    if (g_cpu_moe_expert_owner_threads[il] != n_threads) {
+        memset(g_cpu_moe_expert_owner_valid[il], 0, sizeof(g_cpu_moe_expert_owner_valid[il]));
+        g_cpu_moe_expert_next_owner[il] = 0;
+        g_cpu_moe_expert_owner_threads[il] = n_threads;
+    }
+
+    for (uint32_t ai = 0; ai < n_active; ai++) {
+        const uint32_t expert = active_expert[ai];
+        if (expert >= DS4_N_EXPERT) ds4_die("CPU-MoE expert owner index is outside range");
+        if (!g_cpu_moe_expert_owner_valid[il][expert]) {
+            g_cpu_moe_expert_owner[il][expert] =
+                (uint16_t)(g_cpu_moe_expert_next_owner[il]++ % n_threads);
+            g_cpu_moe_expert_owner_valid[il][expert] = 1;
+        }
+        owner_by_active[ai] = g_cpu_moe_expert_owner[il][expert];
+    }
+}
+
+static bool ds4_cpu_moe_take_expert_row_chunk(
+        ds4_cpu_moe_expert_rows_ctx *ctx,
+        uint32_t                     active_idx) {
+    const uint64_t row0 = __sync_fetch_and_add(&ctx->next_row[active_idx], ctx->chunk_rows);
+    if (row0 >= ctx->rows_per_expert) return false;
+    uint64_t row1 = row0 + ctx->chunk_rows;
+    if (row1 > ctx->rows_per_expert) row1 = ctx->rows_per_expert;
+    ctx->fn(ctx->ctx, active_idx, row0, row1);
+    return true;
+}
+
+static void ds4_cpu_moe_expert_rows_worker(void *vctx, uint64_t lane0, uint64_t lane1) {
+    ds4_cpu_moe_expert_rows_ctx *ctx = vctx;
+
+    for (uint64_t lane = lane0; lane < lane1; lane++) {
+        const uint32_t worker = (uint32_t)(lane % ctx->n_threads);
+
+        bool progressed;
+        do {
+            progressed = false;
+            for (uint32_t ai = 0; ai < ctx->n_active; ai++) {
+                if (ctx->owner_by_active[ai] != worker) continue;
+                progressed |= ds4_cpu_moe_take_expert_row_chunk(ctx, ai);
+            }
+        } while (progressed);
+
+        for (;;) {
+            bool stole = false;
+            const uint32_t start = ctx->n_active ? (worker * 17u) % ctx->n_active : 0;
+            for (uint32_t off = 0; off < ctx->n_active; off++) {
+                const uint32_t ai = (start + off) % ctx->n_active;
+                if (ds4_cpu_moe_take_expert_row_chunk(ctx, ai)) {
+                    stole = true;
+                    break;
+                }
+            }
+            if (!stole) break;
+        }
+    }
+}
+
+static void ds4_cpu_moe_parallel_expert_rows(
+        uint32_t                    il,
+        const uint32_t             *active_expert,
+        uint32_t                    n_active,
+        uint64_t                    rows_per_expert,
+        uint64_t                    chunk_rows,
+        ds4_cpu_moe_expert_rows_fn  fn,
+        void                       *ctx) {
+    ds4_threads_init();
+
+    if (n_active == 0 || rows_per_expert == 0) return;
+    if (chunk_rows == 0) chunk_rows = 1;
+    if (g_parallel_depth > 0 || g_pool.n_threads <= 1) {
+        for (uint32_t ai = 0; ai < n_active; ai++) {
+            fn(ctx, ai, 0, rows_per_expert);
+        }
+        return;
+    }
+
+    ds4_cpu_moe_expert_rows_ctx sched = {
+        .fn = fn,
+        .ctx = ctx,
+        .active_expert = active_expert,
+        .n_active = n_active,
+        .n_threads = g_pool.n_threads,
+        .rows_per_expert = rows_per_expert,
+        .chunk_rows = chunk_rows,
+    };
+    ds4_cpu_moe_prepare_expert_owners(il, active_expert, n_active, g_pool.n_threads,
+                                      sched.owner_by_active);
+    for (uint32_t ai = 0; ai < n_active; ai++) {
+        sched.next_row[ai] = 0;
+    }
+
+    ds4_parallel_for_min_rows(g_pool.n_threads, ds4_cpu_moe_expert_rows_worker, &sched, 1);
+}
+
+static void matvec_iq2_xxs_batch_mid_expert_rows(
+        void     *vctx,
+        uint32_t  active_idx,
+        uint64_t  row0,
+        uint64_t  row1) {
+    matvec_iq2_xxs_batch_mid_ctx *ctx = vctx;
+    matvec_iq2_xxs_batch_mid_worker(ctx,
+                                    (uint64_t)active_idx * ctx->out_dim + row0,
+                                    (uint64_t)active_idx * ctx->out_dim + row1);
+}
+
+static void matvec_q4_k_batch_mid_expert_rows(
+        void     *vctx,
+        uint32_t  active_idx,
+        uint64_t  row0,
+        uint64_t  row1) {
+    matvec_q4_k_batch_mid_ctx *ctx = vctx;
+    matvec_q4_k_batch_mid_worker(ctx,
+                                 (uint64_t)active_idx * ctx->out_dim + row0,
+                                 (uint64_t)active_idx * ctx->out_dim + row1);
+}
+
 #ifdef DS4_USE_BLIS
 static bool ds4_cpu_moe_blis_enabled(void) {
     const char *env = getenv("DS4_CPU_MOE_BLIS");
@@ -5615,6 +5884,7 @@ static void layer_routed_moe_selected_batch_prealloc(
         float             *moe,
         const ds4_model   *model,
         const ds4_layer_weights *layer,
+        uint32_t           il,
         const float       *norm,
         const int32_t     *selected_rows,
         const float       *weight_rows,
@@ -5725,7 +5995,13 @@ static void layer_routed_moe_selected_batch_prealloc(
             }
         }
 
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q4_k_batch_mid_worker, &mid_ctx);
+        ds4_cpu_moe_parallel_expert_rows(il,
+                                          active_expert,
+                                          n_active,
+                                          expert_out_dim,
+                                          ds4_cpu_moe_row_chunk(),
+                                          matvec_q4_k_batch_mid_expert_rows,
+                                          &mid_ctx);
     } else {
         matvec_iq2_xxs_batch_mid_ctx mid_ctx = {
             .mid = mid,
@@ -5754,7 +6030,13 @@ static void layer_routed_moe_selected_batch_prealloc(
             }
         }
 
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
+        ds4_cpu_moe_parallel_expert_rows(il,
+                                          active_expert,
+                                          n_active,
+                                          expert_out_dim,
+                                          ds4_cpu_moe_row_chunk(),
+                                          matvec_iq2_xxs_batch_mid_expert_rows,
+                                          &mid_ctx);
     }
 
     const uint64_t midq_blocks = down_in_dim / QK_K;
@@ -5790,7 +6072,11 @@ static void layer_routed_moe_selected_batch_prealloc(
             }
         }
 
-        ds4_parallel_for(down_out_dim, matvec_q4_k_batch_accum_rows_worker, &down_ctx);
+        ds4_parallel_for_dynamic_min_rows(down_out_dim,
+                                          matvec_q4_k_batch_accum_rows_worker,
+                                          &down_ctx,
+                                          ds4_cpu_moe_row_chunk(),
+                                          512);
     } else {
         matvec_q2_k_batch_accum_rows_ctx down_ctx = {
             .moe = moe,
@@ -5815,7 +6101,11 @@ static void layer_routed_moe_selected_batch_prealloc(
             }
         }
 
-        ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
+        ds4_parallel_for_dynamic_min_rows(down_out_dim,
+                                          matvec_q2_k_batch_accum_rows_worker,
+                                          &down_ctx,
+                                          ds4_cpu_moe_row_chunk(),
+                                          512);
     }
 }
 
@@ -5823,6 +6113,7 @@ static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
         float             *moe,
         const ds4_model   *model,
         const ds4_layer_weights *layer,
+        uint32_t           il,
         const float       *norm,
         const int32_t     *selected_rows,
         const float       *weight_rows,
@@ -5940,7 +6231,13 @@ static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
             }
         }
 
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q4_k_batch_mid_worker, &mid_ctx);
+        ds4_cpu_moe_parallel_expert_rows(il,
+                                          active_expert,
+                                          n_active,
+                                          expert_out_dim,
+                                          ds4_cpu_moe_row_chunk(),
+                                          matvec_q4_k_batch_mid_expert_rows,
+                                          &mid_ctx);
     } else {
         matvec_iq2_xxs_batch_mid_ctx mid_ctx = {
             .mid = mid,
@@ -5969,7 +6266,13 @@ static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
             }
         }
 
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
+        ds4_cpu_moe_parallel_expert_rows(il,
+                                          active_expert,
+                                          n_active,
+                                          expert_out_dim,
+                                          ds4_cpu_moe_row_chunk(),
+                                          matvec_iq2_xxs_batch_mid_expert_rows,
+                                          &mid_ctx);
     }
 
     const uint64_t midq_blocks = down_in_dim / QK_K;
@@ -6006,7 +6309,11 @@ static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
             }
         }
 
-        ds4_parallel_for(down_out_dim, matvec_q4_k_batch_accum_rows_worker, &down_ctx);
+        ds4_parallel_for_dynamic_min_rows(down_out_dim,
+                                          matvec_q4_k_batch_accum_rows_worker,
+                                          &down_ctx,
+                                          ds4_cpu_moe_row_chunk(),
+                                          512);
     } else {
         matvec_q2_k_batch_accum_rows_ctx down_ctx = {
             .moe = moe,
@@ -6031,7 +6338,11 @@ static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
             }
         }
 
-        ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
+        ds4_parallel_for_dynamic_min_rows(down_out_dim,
+                                          matvec_q2_k_batch_accum_rows_worker,
+                                          &down_ctx,
+                                          ds4_cpu_moe_row_chunk(),
+                                          512);
     }
 }
 
@@ -7409,6 +7720,7 @@ static void layer_routed_moe_selected_one_prealloc(
 static DS4_MAYBE_UNUSED void cpu_routed_moe_batch_handoff_prealloc(
         const ds4_model         *cpu_model,
         const ds4_layer_weights *layer,
+        uint32_t                 il,
         const float             *ffn_norm_rows,
         const int32_t           *selected_rows,
         const float             *weight_rows,
@@ -7436,6 +7748,7 @@ static DS4_MAYBE_UNUSED void cpu_routed_moe_batch_handoff_prealloc(
     layer_routed_moe_selected_batch_prealloc(routed_out_rows,
                                              cpu_model,
                                              layer,
+                                             il,
                                              ffn_norm_rows,
                                              selected_rows,
                                              weight_rows,
@@ -7543,7 +7856,13 @@ static void layer_routed_moe_batch(
         }
     }
 
-    ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
+    ds4_cpu_moe_parallel_expert_rows(il,
+                                      active_expert,
+                                      n_active,
+                                      expert_out_dim,
+                                      ds4_cpu_moe_row_chunk(),
+                                      matvec_iq2_xxs_batch_mid_expert_rows,
+                                      &mid_ctx);
 
     const uint64_t midq_blocks = down_in_dim / QK_K;
     block_q8_K *midq = xmalloc((size_t)total_pairs * midq_blocks * sizeof(midq[0]));
@@ -7579,7 +7898,11 @@ static void layer_routed_moe_batch(
         }
     }
 
-    ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
+    ds4_parallel_for_dynamic_min_rows(down_out_dim,
+                                      matvec_q2_k_batch_accum_rows_worker,
+                                      &down_ctx,
+                                      ds4_cpu_moe_row_chunk(),
+                                      512);
 
     free(midq);
     free(pair_ids);
@@ -10995,6 +11318,7 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
         layer_routed_moe_selected_pairs_prealloc(g->cpu_moe_out_host,
                                                  g->cpu_model,
                                                  layer,
+                                                 il,
                                                  xs,
                                                  sel,
                                                  w,
@@ -11124,7 +11448,7 @@ static bool metal_graph_cpu_moe_handoff(
         return ds4_gpu_begin_commands() != 0;
     }
 
-    cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer,
+    cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer, il,
                                           xs, sel, w, out,
                                           n_tokens, DS4_SWIGLU_CLAMP_EXP,
                                           g->cpu_moe_mid,
