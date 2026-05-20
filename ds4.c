@@ -10659,6 +10659,8 @@ typedef struct {
     uint64_t dynamic_expert_predictive_budget_skips;
     uint64_t dynamic_expert_box_promotions;
     uint64_t dynamic_expert_box_evictions;
+    uint64_t dynamic_expert_box_creations;
+    uint64_t dynamic_expert_box_extensions;
     uint32_t dynamic_expert_policy;
     uint32_t dynamic_expert_max_promotions;
     uint32_t dynamic_expert_max_evictions;
@@ -11019,6 +11021,80 @@ static void metal_graph_dynamic_expert_assign_box(
     g->dynamic_expert_box_id[il][expert] = box_id;
 }
 
+static uint32_t metal_graph_dynamic_expert_box_member_count(
+        const ds4_gpu_graph *g,
+        uint32_t             box_id) {
+    if (!g || box_id == 0) return 0;
+    uint32_t count = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+            if (g->dynamic_expert_owned[il][e] &&
+                !g->hot_expert_seed[il][e] &&
+                g->dynamic_expert_box_id[il][e] == box_id &&
+                count != UINT32_MAX) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+static uint32_t metal_graph_dynamic_expert_reusable_layer_box(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        bool          *created) {
+    if (created) *created = false;
+    if (!g || il >= DS4_N_LAYER ||
+        !g->dynamic_expert_group_eviction ||
+        g->dynamic_expert_group_size <= 1) {
+        return 0;
+    }
+
+    bool found = false;
+    uint32_t best_box = 0;
+    uint64_t best_score = 0;
+    uint64_t best_last_used = 0;
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        const uint32_t box_id = g->dynamic_expert_box_id[il][e];
+        if (!g->dynamic_expert_owned[il][e] ||
+            g->hot_expert_seed[il][e] ||
+            box_id == 0) {
+            continue;
+        }
+        if (metal_graph_dynamic_expert_box_member_count(g, box_id) >=
+            g->dynamic_expert_group_size) {
+            continue;
+        }
+
+        uint64_t score = 0;
+        uint64_t last_used = 0;
+        for (uint32_t member = 0; member < DS4_N_EXPERT; member++) {
+            if (!g->dynamic_expert_owned[il][member] ||
+                g->hot_expert_seed[il][member] ||
+                g->dynamic_expert_box_id[il][member] != box_id) {
+                continue;
+            }
+            score = ds4_u64_saturating_add(score,
+                                           g->dynamic_expert_score[il][member]);
+            if (g->dynamic_expert_last_used[il][member] > last_used) {
+                last_used = g->dynamic_expert_last_used[il][member];
+            }
+        }
+        if (!found ||
+            score > best_score ||
+            (score == best_score && last_used > best_last_used)) {
+            found = true;
+            best_box = box_id;
+            best_score = score;
+            best_last_used = last_used;
+        }
+    }
+
+    if (found) return best_box;
+    if (created) *created = true;
+    return metal_graph_dynamic_expert_new_box(g);
+}
+
 static void metal_graph_dynamic_expert_release_owned(
         ds4_gpu_graph *g,
         const ds4_model *model,
@@ -11376,6 +11452,7 @@ static void metal_graph_dynamic_expert_maintenance(
         if (promoted != 0) {
             g->dynamic_expert_group_promotions++;
             g->dynamic_expert_box_promotions++;
+            g->dynamic_expert_box_creations++;
         }
         return;
     }
@@ -11579,6 +11656,7 @@ static void metal_graph_dynamic_expert_predictive_maintenance(
         }
         if (promoted != 0) {
             g->dynamic_expert_box_promotions++;
+            g->dynamic_expert_box_creations++;
         }
         return;
     }
@@ -11925,10 +12003,6 @@ static bool metal_graph_layerwise_prefill_stage(
     uint32_t staged = 0;
     uint64_t staged_pairs = 0;
     uint64_t staged_bytes = 0;
-    const uint32_t sticky_box_id =
-        (g->layerwise_staging_sticky && g->dynamic_expert_group_eviction)
-            ? metal_graph_dynamic_expert_new_box(g)
-            : 0;
     while (staged < g->layerwise_staging_max_experts) {
         bool found = false;
         uint32_t best = 0;
@@ -11961,6 +12035,11 @@ static bool metal_graph_layerwise_prefill_stage(
 
         considered[best] = true;
         uint64_t one_bytes = 0;
+        bool box_created = false;
+        const uint32_t sticky_box_id =
+            g->layerwise_staging_sticky
+                ? metal_graph_dynamic_expert_reusable_layer_box(g, il, &box_created)
+                : 0;
         if (metal_graph_layerwise_prefill_stage_expert(g, model, layer, il, best,
                                                        sel, n_tokens,
                                                        async_upload,
@@ -11969,6 +12048,16 @@ static bool metal_graph_layerwise_prefill_stage(
             staged++;
             staged_pairs += best_count;
             staged_bytes += one_bytes;
+            if (sticky_box_id != 0 &&
+                g->dynamic_expert_owned[il][best] &&
+                g->dynamic_expert_box_id[il][best] == sticky_box_id) {
+                if (box_created) {
+                    g->dynamic_expert_box_promotions++;
+                    g->dynamic_expert_box_creations++;
+                } else {
+                    g->dynamic_expert_box_extensions++;
+                }
+            }
         } else {
             g->layerwise_staging_failures++;
         }
@@ -11980,9 +12069,6 @@ static bool metal_graph_layerwise_prefill_stage(
     g->layerwise_staging_experts += staged;
     g->layerwise_staging_pairs += staged_pairs;
     g->layerwise_staging_bytes += staged_bytes;
-    if (sticky_box_id != 0) {
-        g->dynamic_expert_box_promotions++;
-    }
     if (getenv("DS4_CUDA_LAYERWISE_PREFILL_STAGING_VERBOSE")) {
         fprintf(stderr,
                 "ds4: CUDA layerwise prefill staged layer=%u experts=%u pairs=%llu bytes=%.2f MiB budget=%.2f MiB\n",
@@ -12379,13 +12465,15 @@ static void metal_graph_free(ds4_gpu_graph *g) {
               g->dynamic_expert_promotion_failures != 0 ||
               g->dynamic_expert_predictive_attempts != 0)) {
         fprintf(stderr,
-                "ds4: CUDA dynamic experts: promotions=%llu evictions=%llu failures=%llu group_promotions=%llu group_evictions=%llu box_promotions=%llu box_evictions=%llu predictive_attempts=%llu predictive_promotions=%llu predictive_budget_skips=%llu used=%.2f/%.2f GiB\n",
+                "ds4: CUDA dynamic experts: promotions=%llu evictions=%llu failures=%llu group_promotions=%llu group_evictions=%llu box_promotions=%llu box_creations=%llu box_extensions=%llu box_evictions=%llu predictive_attempts=%llu predictive_promotions=%llu predictive_budget_skips=%llu used=%.2f/%.2f GiB\n",
                 (unsigned long long)g->dynamic_expert_promotions,
                 (unsigned long long)g->dynamic_expert_evictions,
                 (unsigned long long)g->dynamic_expert_promotion_failures,
                 (unsigned long long)g->dynamic_expert_group_promotions,
                 (unsigned long long)g->dynamic_expert_group_evictions,
                 (unsigned long long)g->dynamic_expert_box_promotions,
+                (unsigned long long)g->dynamic_expert_box_creations,
+                (unsigned long long)g->dynamic_expert_box_extensions,
                 (unsigned long long)g->dynamic_expert_box_evictions,
                 (unsigned long long)g->dynamic_expert_predictive_attempts,
                 (unsigned long long)g->dynamic_expert_predictive_promotions,
