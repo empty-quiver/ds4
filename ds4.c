@@ -10703,8 +10703,26 @@ typedef struct {
     uint64_t layerwise_staging_sticky_bytes;
     uint64_t layerwise_staging_failures;
     uint64_t layerwise_staging_budget_skips;
+    uint64_t layerwise_staging_min_saved_us;
+    uint64_t layerwise_staging_score_evaluated;
+    uint64_t layerwise_staging_score_selected;
+    uint64_t layerwise_staging_score_rejected;
+    uint64_t hybrid_prefill_cpu_pairs;
+    uint64_t hybrid_prefill_gpu_pairs;
+    uint64_t hybrid_prefill_syncs;
+    uint64_t hybrid_prefill_cpu_pairs_by_layer[DS4_N_LAYER];
+    uint64_t hybrid_prefill_gpu_pairs_by_layer[DS4_N_LAYER];
     double layerwise_staging_copy_seconds;
     double layerwise_staging_sync_seconds;
+    double layerwise_staging_est_cpu_saved_seconds;
+    double layerwise_staging_est_gpu_seconds;
+    double layerwise_staging_est_copy_seconds;
+    double layerwise_staging_est_net_saved_seconds;
+    double hybrid_prefill_cpu_seconds;
+    double hybrid_prefill_gpu_enqueue_seconds;
+    double hybrid_prefill_sync_seconds;
+    double hybrid_prefill_cpu_seconds_by_layer[DS4_N_LAYER];
+    double hybrid_prefill_gpu_enqueue_seconds_by_layer[DS4_N_LAYER];
     uint64_t hot_expert_prefill_batches;
     uint64_t hot_expert_prefill_slots;
     uint64_t cold_expert_prefill_slots;
@@ -12042,6 +12060,92 @@ static bool metal_graph_layerwise_prefill_stage_expert(
     return true;
 }
 
+static void metal_graph_hybrid_record_prefill_cpu(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint64_t       pairs,
+        double         seconds) {
+    if (!g || il >= DS4_N_LAYER || pairs == 0 || seconds <= 0.0) return;
+    g->hybrid_prefill_cpu_pairs += pairs;
+    g->hybrid_prefill_cpu_seconds += seconds;
+    g->hybrid_prefill_cpu_pairs_by_layer[il] += pairs;
+    g->hybrid_prefill_cpu_seconds_by_layer[il] += seconds;
+}
+
+static void metal_graph_hybrid_record_prefill_gpu(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint64_t       pairs,
+        double         seconds) {
+    if (!g || il >= DS4_N_LAYER || pairs == 0 || seconds <= 0.0) return;
+    g->hybrid_prefill_gpu_pairs += pairs;
+    g->hybrid_prefill_gpu_enqueue_seconds += seconds;
+    g->hybrid_prefill_gpu_pairs_by_layer[il] += pairs;
+    g->hybrid_prefill_gpu_enqueue_seconds_by_layer[il] += seconds;
+}
+
+static double metal_graph_hybrid_prefill_cpu_seconds_per_pair(
+        const ds4_gpu_graph *g,
+        uint32_t             il) {
+    if (!g) return 0.0;
+    if (il < DS4_N_LAYER && g->hybrid_prefill_cpu_pairs_by_layer[il] != 0) {
+        return g->hybrid_prefill_cpu_seconds_by_layer[il] /
+               (double)g->hybrid_prefill_cpu_pairs_by_layer[il];
+    }
+    if (g->hybrid_prefill_cpu_pairs != 0) {
+        return g->hybrid_prefill_cpu_seconds /
+               (double)g->hybrid_prefill_cpu_pairs;
+    }
+    return 0.0;
+}
+
+static double metal_graph_hybrid_prefill_gpu_seconds_per_pair(
+        const ds4_gpu_graph *g,
+        uint32_t             il) {
+    if (!g) return 0.0;
+    if (il < DS4_N_LAYER && g->hybrid_prefill_gpu_pairs_by_layer[il] != 0) {
+        return g->hybrid_prefill_gpu_enqueue_seconds_by_layer[il] /
+               (double)g->hybrid_prefill_gpu_pairs_by_layer[il];
+    }
+    if (g->hybrid_prefill_gpu_pairs != 0) {
+        return g->hybrid_prefill_gpu_enqueue_seconds /
+               (double)g->hybrid_prefill_gpu_pairs;
+    }
+    return 0.0;
+}
+
+static double metal_graph_layerwise_staging_copy_seconds_per_byte(
+        const ds4_gpu_graph *g) {
+    if (!g || g->layerwise_staging_bytes == 0) return 0.0;
+    return g->layerwise_staging_copy_seconds /
+           (double)g->layerwise_staging_bytes;
+}
+
+static double metal_graph_layerwise_staging_score(
+        const ds4_gpu_graph *g,
+        uint32_t             il,
+        uint32_t             pairs,
+        uint64_t             missing_bytes,
+        bool                *estimated,
+        double              *cpu_saved,
+        double              *gpu_cost,
+        double              *copy_cost) {
+    const double cpu_pair = metal_graph_hybrid_prefill_cpu_seconds_per_pair(g, il);
+    const double gpu_pair = metal_graph_hybrid_prefill_gpu_seconds_per_pair(g, il);
+    const double copy_byte = metal_graph_layerwise_staging_copy_seconds_per_byte(g);
+    const bool have_estimate = cpu_pair > 0.0 || gpu_pair > 0.0 || copy_byte > 0.0;
+
+    const double cpu = (double)pairs * cpu_pair;
+    const double gpu = (double)pairs * gpu_pair;
+    const double copy = (double)missing_bytes * copy_byte;
+    if (estimated) *estimated = have_estimate;
+    if (cpu_saved) *cpu_saved = cpu;
+    if (gpu_cost) *gpu_cost = gpu;
+    if (copy_cost) *copy_cost = copy;
+    if (!have_estimate) return (double)pairs;
+    return cpu - gpu - copy;
+}
+
 static bool metal_graph_layerwise_prefill_stage(
         ds4_gpu_graph          *g,
         const ds4_model        *model,
@@ -12076,6 +12180,11 @@ static bool metal_graph_layerwise_prefill_stage(
         uint32_t best = 0;
         uint32_t best_count = 0;
         uint64_t best_missing = 0;
+        bool best_estimated = false;
+        double best_score = 0.0;
+        double best_cpu_saved = 0.0;
+        double best_gpu_cost = 0.0;
+        double best_copy_cost = 0.0;
         for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
             const uint32_t count = counts[expert];
             if (considered[expert] || count < g->layerwise_staging_min_pairs) continue;
@@ -12091,12 +12200,34 @@ static bool metal_graph_layerwise_prefill_stage(
                 g->layerwise_staging_budget_skips++;
                 continue;
             }
-            if (!found || count > best_count ||
-                (count == best_count && missing < best_missing)) {
+            bool estimated = false;
+            double cpu_saved = 0.0;
+            double gpu_cost = 0.0;
+            double copy_cost = 0.0;
+            const double score =
+                metal_graph_layerwise_staging_score(g, il, count, missing,
+                                                    &estimated, &cpu_saved,
+                                                    &gpu_cost, &copy_cost);
+            g->layerwise_staging_score_evaluated++;
+            if (estimated &&
+                score * 1000000.0 < (double)g->layerwise_staging_min_saved_us) {
+                considered[expert] = true;
+                g->layerwise_staging_score_rejected++;
+                continue;
+            }
+            if (!found || score > best_score ||
+                (score == best_score &&
+                 (count > best_count ||
+                  (count == best_count && missing < best_missing)))) {
                 found = true;
                 best = expert;
                 best_count = count;
                 best_missing = missing;
+                best_estimated = estimated;
+                best_score = score;
+                best_cpu_saved = cpu_saved;
+                best_gpu_cost = gpu_cost;
+                best_copy_cost = copy_cost;
             }
         }
         if (!found) break;
@@ -12116,6 +12247,24 @@ static bool metal_graph_layerwise_prefill_stage(
             staged++;
             staged_pairs += best_count;
             staged_bytes += one_bytes;
+            g->layerwise_staging_score_selected++;
+            if (best_estimated) {
+                const double net_saved = best_cpu_saved - best_gpu_cost - best_copy_cost;
+                g->layerwise_staging_est_cpu_saved_seconds += best_cpu_saved;
+                g->layerwise_staging_est_gpu_seconds += best_gpu_cost;
+                g->layerwise_staging_est_copy_seconds += best_copy_cost;
+                g->layerwise_staging_est_net_saved_seconds += net_saved;
+                if (g->layerwise_staging_sticky && net_saved > 0.0) {
+                    const double saved_us_f = net_saved * 1000000.0;
+                    const uint64_t saved_us =
+                        saved_us_f >= (double)UINT64_MAX
+                            ? UINT64_MAX
+                            : (uint64_t)saved_us_f;
+                    g->dynamic_expert_score[il][best] =
+                        ds4_u64_saturating_add(g->dynamic_expert_score[il][best],
+                                                saved_us);
+                }
+            }
             if (sticky_box_id != 0 &&
                 g->dynamic_expert_owned[il][best] &&
                 g->dynamic_expert_box_id[il][best] == sticky_box_id) {
@@ -12325,6 +12474,7 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
     const uint32_t out_dim = (uint32_t)layer->ffn_down_exps->dim[1];
 
     if (n_cold != 0) {
+        const double cpu_t0 = now_sec();
         layer_routed_moe_selected_pairs_prealloc(g->cpu_moe_out_host,
                                                  g->cpu_model,
                                                  layer,
@@ -12340,6 +12490,7 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
                                                  g->cpu_moe_xq,
                                                  g->cpu_moe_midq,
                                                  g->cpu_moe_pair_ids);
+        metal_graph_hybrid_record_prefill_cpu(g, il, n_cold, now_sec() - cpu_t0);
         if (ds4_gpu_tensor_write(routed_out, 0, g->cpu_moe_out_host, x_bytes) == 0) {
             (void)metal_graph_layerwise_prefill_sync_uploads(g);
             return false;
@@ -12354,6 +12505,7 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
     }
 
     g->batch_routed_mid_is_f16 = false;
+    const double gpu_t0 = now_sec();
     if (ds4_gpu_routed_moe_batch_cached_experts_add_tensor(routed_out,
                                                            g->batch_routed_gate,
                                                            g->batch_routed_up,
@@ -12382,6 +12534,7 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
                                                            ffn_norm) == 0) {
         return false;
     }
+    metal_graph_hybrid_record_prefill_gpu(g, il, n_hot, now_sec() - gpu_t0);
 
     g->hot_expert_prefill_batches++;
     g->hot_expert_prefill_slots += n_hot;
@@ -12401,9 +12554,14 @@ static bool metal_graph_cpu_moe_handoff(
         ds4_gpu_tensor         *routed_out,
         uint32_t                n_tokens) {
     if (!g || !model || !layer || n_tokens == 0) return false;
-    if (!metal_graph_ensure_cpu_moe_scratch(g, n_tokens) ||
-        ds4_gpu_end_commands() == 0) {
+    if (!metal_graph_ensure_cpu_moe_scratch(g, n_tokens)) {
         return false;
+    }
+    const double sync_t0 = (!decode && g->backend == DS4_BACKEND_CUDA) ? now_sec() : 0.0;
+    if (ds4_gpu_end_commands() == 0) return false;
+    if (!decode && g->backend == DS4_BACKEND_CUDA) {
+        g->hybrid_prefill_syncs++;
+        g->hybrid_prefill_sync_seconds += now_sec() - sync_t0;
     }
     if (g->backend == DS4_BACKEND_CUDA) {
         metal_graph_layerwise_prefill_release_staged(g, model);
@@ -12466,6 +12624,7 @@ static bool metal_graph_cpu_moe_handoff(
         return ds4_gpu_begin_commands() != 0;
     }
 
+    const double cpu_t0 = (!decode && g->backend == DS4_BACKEND_CUDA) ? now_sec() : 0.0;
     cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer, il,
                                           xs, sel, w, out,
                                           n_tokens, DS4_SWIGLU_CLAMP_EXP,
@@ -12473,6 +12632,10 @@ static bool metal_graph_cpu_moe_handoff(
                                           g->cpu_moe_xq,
                                           g->cpu_moe_midq,
                                           g->cpu_moe_pair_ids);
+    if (!decode && g->backend == DS4_BACKEND_CUDA) {
+        metal_graph_hybrid_record_prefill_cpu(g, il, pair_count,
+                                              now_sec() - cpu_t0);
+    }
 
     if (g->backend == DS4_BACKEND_CUDA &&
         ds4_gpu_tensor_write(routed_out, 0, out, x_bytes) == 0) {
@@ -12512,7 +12675,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     }
     if (g && g->layerwise_staging_enabled) {
         fprintf(stderr,
-                "ds4: CUDA layerwise prefill staging: batches=%llu experts=%llu pairs=%llu bytes=%.2f GiB copy=%.3f s sync=%.3f s sticky_experts=%llu sticky_bytes=%.2f GiB failures=%llu budget_skips=%llu\n",
+                "ds4: CUDA layerwise prefill staging: batches=%llu experts=%llu pairs=%llu bytes=%.2f GiB copy=%.3f s sync=%.3f s sticky_experts=%llu sticky_bytes=%.2f GiB failures=%llu budget_skips=%llu score_eval=%llu score_selected=%llu score_rejected=%llu est_net=%.3f s\n",
                 (unsigned long long)g->layerwise_staging_batches,
                 (unsigned long long)g->layerwise_staging_experts,
                 (unsigned long long)g->layerwise_staging_pairs,
@@ -12522,7 +12685,22 @@ static void metal_graph_free(ds4_gpu_graph *g) {
                 (unsigned long long)g->layerwise_staging_sticky_experts,
                 (double)g->layerwise_staging_sticky_bytes / 1073741824.0,
                 (unsigned long long)g->layerwise_staging_failures,
-                (unsigned long long)g->layerwise_staging_budget_skips);
+                (unsigned long long)g->layerwise_staging_budget_skips,
+                (unsigned long long)g->layerwise_staging_score_evaluated,
+                (unsigned long long)g->layerwise_staging_score_selected,
+                (unsigned long long)g->layerwise_staging_score_rejected,
+                g->layerwise_staging_est_net_saved_seconds);
+        fprintf(stderr,
+                "ds4: CUDA hybrid prefill timing: cpu=%.3f s/%llu pairs gpu_enqueue=%.3f s/%llu pairs handoff_sync=%.3f s/%llu syncs est_cpu_saved=%.3f s est_gpu=%.3f s est_copy=%.3f s\n",
+                g->hybrid_prefill_cpu_seconds,
+                (unsigned long long)g->hybrid_prefill_cpu_pairs,
+                g->hybrid_prefill_gpu_enqueue_seconds,
+                (unsigned long long)g->hybrid_prefill_gpu_pairs,
+                g->hybrid_prefill_sync_seconds,
+                (unsigned long long)g->hybrid_prefill_syncs,
+                g->layerwise_staging_est_cpu_saved_seconds,
+                g->layerwise_staging_est_gpu_seconds,
+                g->layerwise_staging_est_copy_seconds);
         if (g->gpu_model) {
             metal_graph_layerwise_prefill_release_staged(g, g->gpu_model);
         }
@@ -18580,6 +18758,8 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
         (uint32_t)ds4_env_u64_default("DS4_CUDA_LAYERWISE_PREFILL_STAGING_MIN_PAIRS", 16);
     g->layerwise_staging_max_experts =
         (uint32_t)ds4_env_u64_default("DS4_CUDA_LAYERWISE_PREFILL_STAGING_MAX_EXPERTS", 8);
+    g->layerwise_staging_min_saved_us =
+        ds4_env_u64_default("DS4_CUDA_LAYERWISE_PREFILL_STAGING_MIN_SAVED_US", 0);
     if (g->layerwise_staging_max_experts > DS4_N_EXPERT) {
         g->layerwise_staging_max_experts = DS4_N_EXPERT;
     }
@@ -18711,10 +18891,11 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
     }
     if (g->layerwise_staging_enabled) {
         fprintf(stderr,
-                "ds4: CUDA layerwise prefill staging enabled budget=%.2f GiB min_pairs=%u max_experts=%u sticky=%s overlap=%s\n",
+                "ds4: CUDA layerwise prefill staging enabled budget=%.2f GiB min_pairs=%u max_experts=%u min_saved_us=%llu sticky=%s overlap=%s\n",
                 (double)g->layerwise_staging_budget_bytes / 1073741824.0,
                 g->layerwise_staging_min_pairs,
                 g->layerwise_staging_max_experts,
+                (unsigned long long)g->layerwise_staging_min_saved_us,
                 g->layerwise_staging_sticky ? "yes" : "no",
                 g->layerwise_staging_overlap ? "yes" : "no");
     }

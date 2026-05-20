@@ -836,7 +836,10 @@ DS4_CUDA_LAYERWISE_PREFILL_STAGING_MAX_EXPERTS=2 \
 This opt-in path counts routed prefill pairs after router selection, copies the
 top cold experts' gate/up/down ranges into releasable CUDA cache entries, runs
 those staged pairs through the cached CUDA MoE path, and leaves the remaining
-cold pairs on CPU-MoE. The staged ranges are released at the next CUDA
+cold pairs on CPU-MoE. Once timing data is available, staging ranks candidates
+by estimated CPU time saved minus GPU enqueue and copy cost instead of raw pair
+count alone. `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MIN_SAVED_US` can require a
+minimum estimated positive win. The staged ranges are released at the next CUDA
 synchronization point.
 
 To keep staged experts resident for later chunks or subsequent requests, enable
@@ -900,6 +903,7 @@ Useful controls:
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MB` or `DS4_CUDA_LAYERWISE_PREFILL_STAGING_GB`
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MIN_PAIRS`
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MAX_EXPERTS`
+* `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MIN_SAVED_US`
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_STICKY=1`
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_OVERLAP=1`
 * `DS4_CUDA_DYNAMIC_EXPERT_DECODE_EAGER=1`
