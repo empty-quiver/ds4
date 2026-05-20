@@ -855,6 +855,11 @@ instead of being released after the layer. Future prefill/decode passes can use
 them as normal resident hot experts, and the staging pass only needs to copy the
 new delta that is not already in VRAM.
 
+`DS4_CUDA_LAYERWISE_PREFILL_STAGING_OVERLAP=1` issues staged expert uploads on a
+separate CUDA upload stream and waits for them only after CPU-MoE has computed
+the remaining cold pairs. This is experimental; it is useful for measuring
+whether staging copy time is on the critical path.
+
 For 4090-class hybrid runs, add `DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1` to fail
 startup if any non-routed dense candidate cannot be cached in VRAM. This still
 allows optional routed expert candidates to be skipped when the VRAM budget is
@@ -872,6 +877,7 @@ Useful controls:
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MIN_PAIRS`
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MAX_EXPERTS`
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_STICKY=1`
+* `DS4_CUDA_LAYERWISE_PREFILL_STAGING_OVERLAP=1`
 * `DS4_CUDA_WEIGHT_CACHE_VERBOSE=1`
 * `DS4_CUDA_STRICT_WEIGHT_CACHE=1`
 

@@ -4522,6 +4522,19 @@ int ds4_gpu_cache_model_range_releasable(const void *model_map, uint64_t model_s
     return 0;
 }
 
+int ds4_gpu_cache_model_range_releasable_async(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+    (void)model_map;
+    (void)model_size;
+    (void)offset;
+    (void)bytes;
+    (void)label;
+    return 0;
+}
+
+int ds4_gpu_sync_model_range_uploads(void) {
+    return 1;
+}
+
 int ds4_gpu_uncache_model_range(const void *model_map, uint64_t offset, uint64_t bytes) {
     (void)model_map;
     (void)offset;

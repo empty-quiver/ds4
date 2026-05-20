@@ -10621,6 +10621,7 @@ typedef struct {
     bool dynamic_expert_eager;
     bool layerwise_staging_enabled;
     bool layerwise_staging_sticky;
+    bool layerwise_staging_overlap;
     bool dynamic_expert_owned[DS4_N_LAYER][DS4_N_EXPERT];
     bool dynamic_expert_gate_owned[DS4_N_LAYER][DS4_N_EXPERT];
     bool dynamic_expert_up_owned[DS4_N_LAYER][DS4_N_EXPERT];
@@ -10673,6 +10674,7 @@ typedef struct {
     uint64_t layerwise_staging_failures;
     uint64_t layerwise_staging_budget_skips;
     double layerwise_staging_copy_seconds;
+    double layerwise_staging_sync_seconds;
     uint64_t hot_expert_prefill_batches;
     uint64_t hot_expert_prefill_slots;
     uint64_t cold_expert_prefill_slots;
@@ -11301,13 +11303,18 @@ static bool metal_graph_layerwise_prefill_stage_tensor(
         uint64_t         offset,
         uint64_t         bytes,
         const char      *label,
-        bool            *owned) {
+        bool            *owned,
+        bool             async_upload) {
     if (!g || !model || !owned) return false;
     *owned = false;
     if (bytes == 0) return true;
     if (ds4_gpu_model_range_cached(model->map, offset, bytes) != 0) return true;
-    if (ds4_gpu_cache_model_range_releasable(model->map, model->size,
-                                             offset, bytes, label) == 0) {
+    const int ok = async_upload
+        ? ds4_gpu_cache_model_range_releasable_async(model->map, model->size,
+                                                     offset, bytes, label)
+        : ds4_gpu_cache_model_range_releasable(model->map, model->size,
+                                               offset, bytes, label);
+    if (ok == 0) {
         return false;
     }
     *owned = true;
@@ -11322,6 +11329,7 @@ static bool metal_graph_layerwise_prefill_stage_expert(
         uint32_t                expert,
         const int32_t          *current_sel,
         uint32_t                current_tokens,
+        bool                    async_upload,
         uint64_t               *remaining_budget,
         uint64_t               *staged_bytes_out) {
     if (!g || !model || !layer || !remaining_budget || !staged_bytes_out ||
@@ -11354,13 +11362,16 @@ static bool metal_graph_layerwise_prefill_stage_expert(
     snprintf(label, sizeof(label), "layer-stage:blk.%u.expert.%u.gate", il, expert);
     if (!metal_graph_layerwise_prefill_stage_tensor(g, model,
                                                     r.gate_offset, r.gate_bytes,
-                                                    label, &gate_owned)) {
+                                                    label, &gate_owned,
+                                                    async_upload)) {
         return false;
     }
     snprintf(label, sizeof(label), "layer-stage:blk.%u.expert.%u.up", il, expert);
     if (!metal_graph_layerwise_prefill_stage_tensor(g, model,
                                                     r.up_offset, r.up_bytes,
-                                                    label, &up_owned)) {
+                                                    label, &up_owned,
+                                                    async_upload)) {
+        if (async_upload) (void)ds4_gpu_sync_model_range_uploads();
         if (gate_owned) {
             (void)ds4_gpu_uncache_model_range(model->map, r.gate_offset, r.gate_bytes);
         }
@@ -11369,7 +11380,9 @@ static bool metal_graph_layerwise_prefill_stage_expert(
     snprintf(label, sizeof(label), "layer-stage:blk.%u.expert.%u.down", il, expert);
     if (!metal_graph_layerwise_prefill_stage_tensor(g, model,
                                                     r.down_offset, r.down_bytes,
-                                                    label, &down_owned)) {
+                                                    label, &down_owned,
+                                                    async_upload)) {
+        if (async_upload) (void)ds4_gpu_sync_model_range_uploads();
         if (gate_owned) {
             (void)ds4_gpu_uncache_model_range(model->map, r.gate_offset, r.gate_bytes);
         }
@@ -11381,6 +11394,7 @@ static bool metal_graph_layerwise_prefill_stage_expert(
     g->layerwise_staging_copy_seconds += now_sec() - t0;
 
     if (!metal_graph_cuda_hot_expert_cached(model, layer, expert)) {
+        if (async_upload) (void)ds4_gpu_sync_model_range_uploads();
         if (gate_owned) {
             (void)ds4_gpu_uncache_model_range(model->map, r.gate_offset, r.gate_bytes);
         }
@@ -11437,7 +11451,8 @@ static bool metal_graph_layerwise_prefill_stage(
         const ds4_layer_weights *layer,
         uint32_t                il,
         const int32_t          *sel,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        bool                    async_upload) {
     if (!g || !model || !layer || !sel || !g->layerwise_staging_enabled ||
         il >= DS4_N_LAYER || n_tokens == 0) {
         return false;
@@ -11493,6 +11508,7 @@ static bool metal_graph_layerwise_prefill_stage(
         uint64_t one_bytes = 0;
         if (metal_graph_layerwise_prefill_stage_expert(g, model, layer, il, best,
                                                        sel, n_tokens,
+                                                       async_upload,
                                                        &remaining, &one_bytes)) {
             staged++;
             staged_pairs += best_count;
@@ -11517,6 +11533,14 @@ static bool metal_graph_layerwise_prefill_stage(
                 (double)g->layerwise_staging_budget_bytes / 1048576.0);
     }
     return true;
+}
+
+static bool metal_graph_layerwise_prefill_sync_uploads(ds4_gpu_graph *g) {
+    if (!g || !g->layerwise_staging_overlap || !g->layerwise_staged_active) return true;
+    const double t0 = now_sec();
+    const int ok = ds4_gpu_sync_model_range_uploads();
+    g->layerwise_staging_sync_seconds += now_sec() - t0;
+    return ok != 0;
 }
 
 static bool metal_graph_cuda_cpu_moe_hot_decode(
@@ -11648,12 +11672,16 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
     }
 
     const uint32_t total_pairs = n_tokens * DS4_N_EXPERT_USED;
-    (void)metal_graph_layerwise_prefill_stage(g, model, layer, il, sel, n_tokens);
+    (void)metal_graph_layerwise_prefill_stage(g, model, layer, il, sel, n_tokens,
+                                              g->layerwise_staging_overlap);
     uint32_t n_hot = 0;
     uint32_t n_cold = 0;
     for (uint32_t pair_id = 0; pair_id < total_pairs; pair_id++) {
         const int32_t expert = sel[pair_id];
-        if (expert < 0 || expert >= DS4_N_EXPERT) return false;
+        if (expert < 0 || expert >= DS4_N_EXPERT) {
+            (void)metal_graph_layerwise_prefill_sync_uploads(g);
+            return false;
+        }
         const uint32_t e = (uint32_t)expert;
         if (metal_graph_cuda_expert_gpu_resident(g, model, layer, il, e)) {
             g->cpu_moe_hot_pair_ids[n_hot++] = pair_id;
@@ -11661,7 +11689,10 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
             g->cpu_moe_cold_pair_ids[n_cold++] = pair_id;
         }
     }
-    if (n_hot == 0) return false;
+    if (n_hot == 0) {
+        (void)metal_graph_layerwise_prefill_sync_uploads(g);
+        return false;
+    }
 
     const uint64_t x_bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
     const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
@@ -11689,9 +11720,15 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
                                                  g->cpu_moe_midq,
                                                  g->cpu_moe_pair_ids);
         if (ds4_gpu_tensor_write(routed_out, 0, g->cpu_moe_out_host, x_bytes) == 0) {
+            (void)metal_graph_layerwise_prefill_sync_uploads(g);
             return false;
         }
     } else if (ds4_gpu_tensor_fill_f32(routed_out, 0.0f, (uint64_t)n_tokens * DS4_N_EMBD) == 0) {
+        (void)metal_graph_layerwise_prefill_sync_uploads(g);
+        return false;
+    }
+
+    if (!metal_graph_layerwise_prefill_sync_uploads(g)) {
         return false;
     }
 
@@ -11854,12 +11891,13 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     }
     if (g && g->layerwise_staging_enabled) {
         fprintf(stderr,
-                "ds4: CUDA layerwise prefill staging: batches=%llu experts=%llu pairs=%llu bytes=%.2f GiB copy=%.3f s sticky_experts=%llu sticky_bytes=%.2f GiB failures=%llu budget_skips=%llu\n",
+                "ds4: CUDA layerwise prefill staging: batches=%llu experts=%llu pairs=%llu bytes=%.2f GiB copy=%.3f s sync=%.3f s sticky_experts=%llu sticky_bytes=%.2f GiB failures=%llu budget_skips=%llu\n",
                 (unsigned long long)g->layerwise_staging_batches,
                 (unsigned long long)g->layerwise_staging_experts,
                 (unsigned long long)g->layerwise_staging_pairs,
                 (double)g->layerwise_staging_bytes / 1073741824.0,
                 g->layerwise_staging_copy_seconds,
+                g->layerwise_staging_sync_seconds,
                 (unsigned long long)g->layerwise_staging_sticky_experts,
                 (double)g->layerwise_staging_sticky_bytes / 1073741824.0,
                 (unsigned long long)g->layerwise_staging_failures,
@@ -17871,13 +17909,16 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
     g->cpu_model = e->cpu_moe ? &e->cpu_model : NULL;
     g->dynamic_experts_enabled =
         e->backend == DS4_BACKEND_CUDA && e->cpu_moe && ds4_dynamic_experts_env_enabled();
-    g->dynamic_expert_eager = accelerator_cuda_env_enabled("DS4_CUDA_DYNAMIC_EXPERT_EAGER");
+    g->dynamic_expert_eager = ds4_env_enabled_default("DS4_CUDA_DYNAMIC_EXPERT_EAGER", false);
     g->layerwise_staging_enabled =
         e->backend == DS4_BACKEND_CUDA && e->cpu_moe &&
-        accelerator_cuda_env_enabled("DS4_CUDA_LAYERWISE_PREFILL_STAGING");
+        ds4_env_enabled_default("DS4_CUDA_LAYERWISE_PREFILL_STAGING", false);
     g->layerwise_staging_sticky =
         g->layerwise_staging_enabled &&
-        accelerator_cuda_env_enabled("DS4_CUDA_LAYERWISE_PREFILL_STAGING_STICKY");
+        ds4_env_enabled_default("DS4_CUDA_LAYERWISE_PREFILL_STAGING_STICKY", false);
+    g->layerwise_staging_overlap =
+        g->layerwise_staging_enabled &&
+        ds4_env_enabled_default("DS4_CUDA_LAYERWISE_PREFILL_STAGING_OVERLAP", false);
     g->dynamic_expert_policy = ds4_dynamic_expert_policy_from_env();
     g->dynamic_expert_budget_bytes = ds4_env_bytes_default(
         "DS4_CUDA_DYNAMIC_EXPERT_CACHE_GB",
@@ -17932,11 +17973,12 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
     }
     if (g->layerwise_staging_enabled) {
         fprintf(stderr,
-                "ds4: CUDA layerwise prefill staging enabled budget=%.2f GiB min_pairs=%u max_experts=%u sticky=%s\n",
+                "ds4: CUDA layerwise prefill staging enabled budget=%.2f GiB min_pairs=%u max_experts=%u sticky=%s overlap=%s\n",
                 (double)g->layerwise_staging_budget_bytes / 1073741824.0,
                 g->layerwise_staging_min_pairs,
                 g->layerwise_staging_max_experts,
-                g->layerwise_staging_sticky ? "yes" : "no");
+                g->layerwise_staging_sticky ? "yes" : "no",
+                g->layerwise_staging_overlap ? "yes" : "no");
     }
 }
 

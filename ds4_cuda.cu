@@ -105,6 +105,13 @@ struct cuda_model_arena {
     uint64_t used;
 };
 
+struct cuda_model_pending_discard {
+    const void *host_base;
+    uint64_t model_size;
+    uint64_t offset;
+    uint64_t bytes;
+};
+
 struct cuda_q8_f16_range {
     const void *host_base;
     uint64_t offset;
@@ -125,6 +132,7 @@ struct cuda_q8_f32_range {
 
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
+static std::vector<cuda_model_pending_discard> g_model_pending_discards;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
 static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
@@ -149,6 +157,7 @@ static cudaEvent_t g_model_stage_event[4];
 static uint64_t g_model_stage_bytes;
 
 static int cuda_ok(cudaError_t err, const char *what);
+static int cuda_model_upload_stream_sync(const char *what);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -898,8 +907,20 @@ static void *cuda_align_ptr(void *ptr, uint64_t align) {
     return (void *)(((p + a - 1u) / a) * a);
 }
 
+static int cuda_model_upload_stream_ensure(void) {
+    if (g_model_upload_stream) return 1;
+    cudaError_t err = cudaStreamCreateWithFlags(&g_model_upload_stream, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA model upload stream creation failed: %s\n", cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
 static int cuda_model_stage_pool_alloc(uint64_t bytes) {
     if (g_model_stage_bytes >= bytes) return 1;
+    if (!cuda_model_upload_stream_sync("model_staging_resize")) return 0;
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -912,14 +933,7 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
         }
     }
     g_model_stage_bytes = 0;
-    if (!g_model_upload_stream) {
-        cudaError_t err = cudaStreamCreateWithFlags(&g_model_upload_stream, cudaStreamNonBlocking);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model upload stream creation failed: %s\n", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return 0;
-        }
-    }
+    if (!cuda_model_upload_stream_ensure()) return 0;
     for (size_t i = 0; i < 4; i++) {
         cudaError_t err = cudaMallocHost(&g_model_stage_raw[i], (size_t)bytes);
         if (err != cudaSuccess) {
@@ -1248,6 +1262,81 @@ static const char *cuda_model_range_ptr_from_fd(
     return (const char *)dev;
 }
 
+static int cuda_model_upload_stream_sync(const char *what) {
+    if (!g_model_upload_stream) return 1;
+    cudaError_t err = cudaStreamSynchronize(g_model_upload_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA model range upload sync failed for %s: %s\n",
+                what ? what : "weights", cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    for (const cuda_model_pending_discard &d : g_model_pending_discards) {
+        cuda_model_discard_source_pages(d.host_base, d.model_size, d.offset, d.bytes);
+    }
+    g_model_pending_discards.clear();
+    return 1;
+}
+
+static void cuda_model_defer_source_discard(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes) {
+    if (!model_map || bytes == 0) return;
+    g_model_pending_discards.push_back({model_map, model_size, offset, bytes});
+}
+
+static int cuda_model_range_copy_to_device(
+        char *dev,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        const char *what,
+        int async_upload) {
+    if (!dev || !model_map || bytes == 0) return bytes == 0;
+
+    if (async_upload) {
+        if (!cuda_model_upload_stream_ensure()) return 0;
+        const char *src = (const char *)model_map + offset;
+        const uint64_t chunk = cuda_model_copy_chunk_bytes();
+        for (uint64_t done = 0; done < bytes; done += chunk) {
+            const uint64_t n = bytes - done < chunk ? bytes - done : chunk;
+            cudaError_t err = cudaMemcpyAsync(dev + done, src + done, (size_t)n,
+                                              cudaMemcpyHostToDevice, g_model_upload_stream);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "ds4: CUDA model range async mmap copy failed for %s at %.2f/%.2f MiB: %s\n",
+                        what ? what : "weights",
+                        (double)done / 1048576.0,
+                        (double)bytes / 1048576.0,
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                return 0;
+            }
+        }
+        return 1;
+    }
+
+    const char *src = (const char *)model_map + offset;
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    for (uint64_t done = 0; done < bytes; done += chunk) {
+        const uint64_t n = bytes - done < chunk ? bytes - done : chunk;
+        cudaError_t err = cudaMemcpy(dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA dynamic expert copy failed for %s at %.2f/%.2f MiB: %s\n",
+                    what ? what : "expert",
+                    (double)done / 1048576.0,
+                    (double)bytes / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+    }
+    cuda_model_discard_source_pages(model_map, model_size, offset, bytes);
+    return 1;
+}
+
 static const char *cuda_model_range_cache_device(
         const void *model_map,
         uint64_t model_size,
@@ -1313,12 +1402,13 @@ static uint64_t cuda_dynamic_expert_reserve_bytes(uint64_t total_bytes) {
     return 2048ull * 1048576ull;
 }
 
-static const char *cuda_model_range_cache_releasable(
+static const char *cuda_model_range_cache_releasable_impl(
         const void *model_map,
         uint64_t model_size,
         uint64_t offset,
         uint64_t bytes,
-        const char *what) {
+        const char *what,
+        int async_upload) {
     if (!model_map || bytes == 0) return NULL;
     if (offset > model_size || bytes > model_size - offset) return NULL;
     if (model_map == g_model_host_base && g_model_device_owned) {
@@ -1362,27 +1452,21 @@ static const char *cuda_model_range_cache_releasable(
         return NULL;
     }
 
-    const char *src = (const char *)model_map + offset;
-    const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    for (uint64_t done = 0; done < bytes; done += chunk) {
-        const uint64_t n = bytes - done < chunk ? bytes - done : chunk;
-        err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA dynamic expert copy failed for %s at %.2f/%.2f MiB: %s\n",
-                    what ? what : "expert",
-                    (double)done / 1048576.0,
-                    (double)bytes / 1048576.0,
-                    cudaGetErrorString(err));
-            (void)cudaFree(dev);
-            (void)cudaGetLastError();
-            return NULL;
-        }
+    if (!cuda_model_range_copy_to_device((char *)dev, model_map, model_size,
+                                         offset, bytes, what, async_upload)) {
+        if (async_upload) (void)cuda_model_upload_stream_sync(what);
+        (void)cudaFree(dev);
+        return NULL;
     }
 
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
-    cuda_model_discard_source_pages(model_map, model_size, offset, bytes);
+    if (async_upload) {
+        cuda_model_defer_source_discard(model_map, model_size, offset, bytes);
+    } else {
+        cuda_model_discard_source_pages(model_map, model_size, offset, bytes);
+    }
     if (getenv("DS4_CUDA_DYNAMIC_EXPERT_VERBOSE") ||
         getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr, "ds4: CUDA dynamic expert cached %s %.2f MiB (total %.2f GiB)\n",
@@ -1391,6 +1475,26 @@ static const char *cuda_model_range_cache_releasable(
                 (double)g_model_range_bytes / 1073741824.0);
     }
     return (const char *)dev;
+}
+
+static const char *cuda_model_range_cache_releasable(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        const char *what) {
+    return cuda_model_range_cache_releasable_impl(model_map, model_size,
+                                                  offset, bytes, what, 0);
+}
+
+static const char *cuda_model_range_cache_releasable_async(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        const char *what) {
+    return cuda_model_range_cache_releasable_impl(model_map, model_size,
+                                                  offset, bytes, what, 1);
 }
 
 static int cuda_model_range_release_exact(
@@ -1409,6 +1513,7 @@ static int cuda_model_range_release_exact(
         r.host_registered || r.arena_allocated || !r.device_ptr) {
         return 0;
     }
+    if (!cuda_model_upload_stream_sync("release_dynamic_expert")) return 0;
     (void)cudaFree(r.device_ptr);
     if (g_model_range_bytes >= r.bytes) g_model_range_bytes -= r.bytes;
     else g_model_range_bytes = 0;
@@ -1505,6 +1610,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 }
 
 static void cuda_model_range_release_all(void) {
+    (void)cuda_model_upload_stream_sync("release_all");
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
@@ -1517,6 +1623,7 @@ static void cuda_model_range_release_all(void) {
     }
     g_model_arenas.clear();
     g_model_ranges.clear();
+    g_model_pending_discards.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
     g_model_auto_cache_limit_bytes = 0;
@@ -1887,6 +1994,17 @@ extern "C" int ds4_gpu_cache_model_range_releasable(const void *model_map, uint6
     if (offset > model_size || bytes > model_size - offset) return 0;
     const char *cache_label = label ? label : "dynamic_expert";
     return cuda_model_range_cache_releasable(model_map, model_size, offset, bytes, cache_label) != NULL;
+}
+
+extern "C" int ds4_gpu_cache_model_range_releasable_async(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+    if (!model_map || bytes == 0) return 1;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+    const char *cache_label = label ? label : "dynamic_expert";
+    return cuda_model_range_cache_releasable_async(model_map, model_size, offset, bytes, cache_label) != NULL;
+}
+
+extern "C" int ds4_gpu_sync_model_range_uploads(void) {
+    return cuda_model_upload_stream_sync("dynamic_expert");
 }
 
 extern "C" int ds4_gpu_uncache_model_range(const void *model_map, uint64_t offset, uint64_t bytes) {
