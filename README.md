@@ -822,6 +822,23 @@ from the resident CUDA ranges and selected cold slots still use the CPU-MoE
 path. The prefill path is best-effort: if the hot batch add path cannot run,
 the layer falls back to the all-CPU-MoE routed output.
 
+Layerwise prefill staging can temporarily move high-volume cold experts into
+VRAM for the current prefill layer:
+
+```sh
+DS4_CUDA_LAYERWISE_PREFILL_STAGING=1 \
+DS4_CUDA_LAYERWISE_PREFILL_STAGING_MB=512 \
+DS4_CUDA_LAYERWISE_PREFILL_STAGING_MIN_PAIRS=16 \
+DS4_CUDA_LAYERWISE_PREFILL_STAGING_MAX_EXPERTS=2 \
+./ds4 --cuda --cpu-moe -p "Hello"
+```
+
+This opt-in path counts routed prefill pairs after router selection, copies the
+top cold experts' gate/up/down ranges into releasable CUDA cache entries, runs
+those staged pairs through the cached CUDA MoE path, and leaves the remaining
+cold pairs on CPU-MoE. The staged ranges are released at the next CUDA
+synchronization point.
+
 For 4090-class hybrid runs, add `DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1` to fail
 startup if any non-routed dense candidate cannot be cached in VRAM. This still
 allows optional routed expert candidates to be skipped when the VRAM budget is
@@ -834,6 +851,10 @@ Useful controls:
 * `DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1`
 * `DS4_CUDA_ROUTE_PROFILE=/path/to/profile.tsv`
 * `DS4_CUDA_HOT_EXPERTS_FILE=/path/to/hot-experts.txt`
+* `DS4_CUDA_LAYERWISE_PREFILL_STAGING=1`
+* `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MB` or `DS4_CUDA_LAYERWISE_PREFILL_STAGING_GB`
+* `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MIN_PAIRS`
+* `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MAX_EXPERTS`
 * `DS4_CUDA_WEIGHT_CACHE_VERBOSE=1`
 * `DS4_CUDA_STRICT_WEIGHT_CACHE=1`
 
