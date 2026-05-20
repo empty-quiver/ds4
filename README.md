@@ -874,7 +874,10 @@ DS4_CUDA_DYNAMIC_EXPERT_DECODE_GROUP_SIZE=4 \
 
 `DS4_CUDA_DYNAMIC_EXPERT_DECODE_EVICT=1` allows decode promotions to evict
 existing dynamic experts. On 4090-class hybrid runs this is usually too
-aggressive unless you are deliberately testing churn.
+aggressive unless you are deliberately testing churn. When decode eviction is
+off and the dynamic expert cache is full, decode maintenance records
+`decode_budget_skips` instead of promotion failures and skips the candidate
+search.
 
 `DS4_CUDA_LAYERWISE_PREFILL_STAGING_OVERLAP=1` issues staged expert uploads on a
 separate CUDA upload stream and waits for them only after CPU-MoE has computed

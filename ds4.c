@@ -10663,6 +10663,7 @@ typedef struct {
     uint64_t dynamic_expert_predictive_attempts;
     uint64_t dynamic_expert_predictive_budget_skips;
     uint64_t dynamic_expert_decode_promotions;
+    uint64_t dynamic_expert_decode_budget_skips;
     uint64_t dynamic_expert_box_promotions;
     uint64_t dynamic_expert_box_evictions;
     uint64_t dynamic_expert_box_creations;
@@ -11305,6 +11306,15 @@ static bool metal_graph_dynamic_expert_ensure_budget(
     return true;
 }
 
+static bool metal_graph_dynamic_expert_noevict_has_room(
+        const ds4_gpu_graph *g,
+        uint64_t             bytes) {
+    if (!g) return false;
+    if (bytes == 0) return true;
+    if (bytes > g->dynamic_expert_budget_bytes) return false;
+    return g->dynamic_expert_used_bytes <= g->dynamic_expert_budget_bytes - bytes;
+}
+
 static bool metal_graph_dynamic_expert_promote(
         ds4_gpu_graph          *g,
         const ds4_model        *model,
@@ -11313,7 +11323,8 @@ static bool metal_graph_dynamic_expert_promote(
         uint32_t                expert,
         const int32_t          *current_sel,
         uint32_t                current_tokens,
-        bool                    allow_eviction) {
+        bool                    allow_eviction,
+        uint64_t               *budget_skip_counter) {
     if (!g || !model || !layer || il >= DS4_N_LAYER || expert >= DS4_N_EXPERT) return false;
     if (g->hot_expert[il][expert] &&
         metal_graph_cuda_hot_expert_cached(model, layer, expert)) {
@@ -11330,6 +11341,11 @@ static bool metal_graph_dynamic_expert_promote(
                                                                       &up_cached,
                                                                       &down_cached);
     if (missing == UINT64_MAX) return false;
+    if (!allow_eviction &&
+        !metal_graph_dynamic_expert_noevict_has_room(g, missing)) {
+        if (budget_skip_counter) (*budget_skip_counter)++;
+        return false;
+    }
     if (!metal_graph_dynamic_expert_ensure_budget(g, model, missing,
                                                   current_sel, il, current_tokens,
                                                   allow_eviction)) {
@@ -11438,6 +11454,14 @@ static void metal_graph_dynamic_expert_maintenance(
             return;
         }
     }
+    const bool allow_eviction = !decode || g->dynamic_expert_decode_evict;
+    uint64_t *budget_skip_counter =
+        (decode && !allow_eviction) ? &g->dynamic_expert_decode_budget_skips : NULL;
+    if (budget_skip_counter &&
+        g->dynamic_expert_used_bytes >= g->dynamic_expert_budget_bytes) {
+        (*budget_skip_counter)++;
+        return;
+    }
     if (group_size > 1) {
         const uint32_t group_cap =
             group_size < max_promotions ? group_size : max_promotions;
@@ -11472,13 +11496,13 @@ static void metal_graph_dynamic_expert_maintenance(
 
         uint32_t promoted = 0;
         const uint32_t box_id = metal_graph_dynamic_expert_new_box(g);
-        const bool allow_eviction = !decode || g->dynamic_expert_decode_evict;
         for (uint32_t i = 0; i < top_count; i++) {
             if (metal_graph_dynamic_expert_promote(g, model, layer, il,
                                                    top_expert[i],
                                                    current_sel,
                                                    current_tokens,
-                                                   allow_eviction)) {
+                                                   allow_eviction,
+                                                   budget_skip_counter)) {
                 metal_graph_dynamic_expert_assign_box(g, il, top_expert[i], box_id);
                 promoted++;
             } else {
@@ -11511,7 +11535,8 @@ static void metal_graph_dynamic_expert_maintenance(
         if (!found) return;
         if (!metal_graph_dynamic_expert_promote(g, model, layer, il, best,
                                                 current_sel, current_tokens,
-                                                !decode || g->dynamic_expert_decode_evict)) {
+                                                allow_eviction,
+                                                budget_skip_counter)) {
             return;
         }
         if (decode) g->dynamic_expert_decode_promotions++;
@@ -11675,7 +11700,7 @@ static void metal_graph_dynamic_expert_predictive_maintenance(
             if (metal_graph_dynamic_expert_promote(g, model, target,
                                                    best_layer, expert,
                                                    selected, n_tokens,
-                                                   true)) {
+                                                   true, NULL)) {
                 metal_graph_dynamic_expert_assign_box(g, best_layer, expert, box_id);
                 g->dynamic_expert_predictive_last_promoted[best_layer][expert] =
                     best_score[i];
@@ -11770,7 +11795,7 @@ static void metal_graph_dynamic_expert_predictive_maintenance(
         if (metal_graph_dynamic_expert_promote(g, model, best_layer_weights,
                                                best_layer, best_expert,
                                                selected, n_tokens,
-                                               true)) {
+                                               true, NULL)) {
             g->dynamic_expert_predictive_last_promoted[best_layer][best_expert] =
                 best_score;
             g->dynamic_expert_predictive_promotions++;
@@ -12507,15 +12532,17 @@ static void metal_graph_free(ds4_gpu_graph *g) {
               g->dynamic_expert_promotions != 0 ||
               g->dynamic_expert_evictions != 0 ||
               g->dynamic_expert_promotion_failures != 0 ||
+              g->dynamic_expert_decode_budget_skips != 0 ||
               g->dynamic_expert_predictive_attempts != 0)) {
         fprintf(stderr,
-                "ds4: CUDA dynamic experts: promotions=%llu evictions=%llu failures=%llu group_promotions=%llu group_evictions=%llu decode_promotions=%llu box_promotions=%llu box_creations=%llu box_extensions=%llu box_evictions=%llu predictive_attempts=%llu predictive_promotions=%llu predictive_budget_skips=%llu used=%.2f/%.2f GiB\n",
+                "ds4: CUDA dynamic experts: promotions=%llu evictions=%llu failures=%llu group_promotions=%llu group_evictions=%llu decode_promotions=%llu decode_budget_skips=%llu box_promotions=%llu box_creations=%llu box_extensions=%llu box_evictions=%llu predictive_attempts=%llu predictive_promotions=%llu predictive_budget_skips=%llu used=%.2f/%.2f GiB\n",
                 (unsigned long long)g->dynamic_expert_promotions,
                 (unsigned long long)g->dynamic_expert_evictions,
                 (unsigned long long)g->dynamic_expert_promotion_failures,
                 (unsigned long long)g->dynamic_expert_group_promotions,
                 (unsigned long long)g->dynamic_expert_group_evictions,
                 (unsigned long long)g->dynamic_expert_decode_promotions,
+                (unsigned long long)g->dynamic_expert_decode_budget_skips,
                 (unsigned long long)g->dynamic_expert_box_promotions,
                 (unsigned long long)g->dynamic_expert_box_creations,
                 (unsigned long long)g->dynamic_expert_box_extensions,
