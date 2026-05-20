@@ -290,6 +290,15 @@ static double cli_now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+static int cli_env_int_default(const char *name, int def) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return def;
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (end == env || *end != '\0' || v < 0 || v > INT32_MAX) return def;
+    return (int)v;
+}
+
 static char *read_prompt_file(const char *path, bool fatal);
 
 typedef struct {
@@ -510,8 +519,12 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    const int decode_progress_interval =
+        cli_env_int_default("DS4_CLI_DECODE_PROGRESS_INTERVAL", 0);
     int generated = 0;
     const double t_decode0 = cli_now_sec();
+    double t_decode_window = t_decode0;
+    int generated_window = 0;
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
@@ -556,6 +569,21 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             fflush(stdout);
             free(piece);
             generated++;
+            generated_window++;
+            if (decode_progress_interval > 0 &&
+                generated % decode_progress_interval == 0) {
+                const double t_now = cli_now_sec();
+                const double window_s = t_now - t_decode_window;
+                const double total_s = t_now - t_decode0;
+                fprintf(stderr,
+                        "\nds4: decode progress: tokens=%d/%d window=%.2f t/s total=%.2f t/s\n",
+                        generated,
+                        max_tokens,
+                        window_s > 0.0 ? (double)generated_window / window_s : 0.0,
+                        total_s > 0.0 ? (double)generated / total_s : 0.0);
+                t_decode_window = t_now;
+                generated_window = 0;
+            }
             if (generated >= max_tokens) break;
         }
         if (stop) break;

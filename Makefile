@@ -11,6 +11,13 @@ CFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 
 LDLIBS ?= -lm -pthread
+USE_BLIS ?= 0
+BLIS_CFLAGS ?= -I/usr/local/include
+BLIS_LDLIBS ?= -L/usr/local/lib -lblis-mt
+ifeq ($(USE_BLIS),1)
+CFLAGS += -DDS4_USE_BLIS $(BLIS_CFLAGS)
+LDLIBS += $(BLIS_LDLIBS)
+endif
 METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
@@ -27,6 +34,9 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+ifeq ($(USE_BLIS),1)
+CUDA_LDLIBS += $(BLIS_LDLIBS)
+endif
 CORE_OBJS = ds4.o ds4_cuda.o
 CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)

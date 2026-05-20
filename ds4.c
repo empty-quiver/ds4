@@ -42,6 +42,12 @@
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
+#ifdef DS4_USE_BLIS
+#include <blis.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -374,6 +380,42 @@ static inline DS4_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t
     return sum;
 #endif
 }
+
+#if defined(__AVX2__)
+#define DS4_MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
+
+static inline DS4_MAYBE_UNUSED float ds4_hsum_float_8(__m256 x) {
+    __m128 res = _mm256_extractf128_ps(x, 1);
+    res = _mm_add_ps(res, _mm256_castps256_ps128(x));
+    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    res = _mm_add_ss(res, _mm_movehdup_ps(res));
+    return _mm_cvtss_f32(res);
+}
+
+static inline DS4_MAYBE_UNUSED __m256 ds4_mm256_fmadd_ps(__m256 a, __m256 b, __m256 c) {
+#if defined(__FMA__)
+    return _mm256_fmadd_ps(a, b, c);
+#else
+    return _mm256_add_ps(_mm256_mul_ps(a, b), c);
+#endif
+}
+
+static inline DS4_MAYBE_UNUSED int64_t ds4_load_i8x8_as_i64(const int8_t v[8]) {
+    int64_t r;
+    memcpy(&r, v, sizeof(r));
+    return r;
+}
+
+static inline DS4_MAYBE_UNUSED __m256i ds4_q2_k_scale_shuffle(int i) {
+    static const uint8_t k_shuffle[128] = {
+         0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,     2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+         4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5,     6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7,
+         8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9,    10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,
+        12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,    14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,
+    };
+    return _mm256_loadu_si256((const __m256i *)k_shuffle + i);
+}
+#endif
 
 /* =========================================================================
  * Shared Helpers, Allocation Guards, Threads, and Cursor Reads.
@@ -2344,6 +2386,67 @@ static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const bl
     }
 
     *s = sum;
+#elif defined(__AVX2__)
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; i++) {
+        const float d = y[i].d * f16_to_f32(x[i].d);
+        const float dmin = -y[i].d * f16_to_f32(x[i].dmin);
+        const uint8_t *q2 = x[i].qs;
+        const int8_t *q8 = y[i].qs;
+
+        const __m128i mins_and_scales = _mm_loadu_si128((const __m128i *)x[i].scales);
+        const __m128i scales8 = _mm_and_si128(mins_and_scales, m4);
+        const __m128i mins8 = _mm_and_si128(_mm_srli_epi16(mins_and_scales, 4), m4);
+        const __m256i mins = _mm256_cvtepi8_epi16(mins8);
+        const __m256i min_prod = _mm256_madd_epi16(mins, _mm256_loadu_si256((const __m256i *)y[i].bsums));
+        acc = ds4_mm256_fmadd_ps(_mm256_broadcast_ss(&dmin), _mm256_cvtepi32_ps(min_prod), acc);
+
+        const __m256i all_scales = _mm256_cvtepi8_epi16(scales8);
+        const __m128i l_scales = _mm256_extracti128_si256(all_scales, 0);
+        const __m128i h_scales = _mm256_extracti128_si256(all_scales, 1);
+        const __m256i scales[2] = {
+            DS4_MM256_SET_M128I(l_scales, l_scales),
+            DS4_MM256_SET_M128I(h_scales, h_scales),
+        };
+
+        __m256i sumi = _mm256_setzero_si256();
+
+        for (int j = 0; j < QK_K / 128; j++) {
+            const __m256i q2bits = _mm256_loadu_si256((const __m256i *)q2);
+            q2 += 32;
+
+            const __m256i q8_0 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_3 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+
+            const __m256i q2_0 = _mm256_and_si256(q2bits, m3);
+            const __m256i q2_1 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 2), m3);
+            const __m256i q2_2 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 4), m3);
+            const __m256i q2_3 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 6), m3);
+
+            __m256i p0 = _mm256_maddubs_epi16(q2_0, q8_0);
+            __m256i p1 = _mm256_maddubs_epi16(q2_1, q8_1);
+            __m256i p2 = _mm256_maddubs_epi16(q2_2, q8_2);
+            __m256i p3 = _mm256_maddubs_epi16(q2_3, q8_3);
+
+            p0 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], ds4_q2_k_scale_shuffle(0)), p0);
+            p1 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], ds4_q2_k_scale_shuffle(1)), p1);
+            p2 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], ds4_q2_k_scale_shuffle(2)), p2);
+            p3 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], ds4_q2_k_scale_shuffle(3)), p3);
+
+            p0 = _mm256_add_epi32(p0, p1);
+            p2 = _mm256_add_epi32(p2, p3);
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p0, p2));
+        }
+
+        acc = ds4_mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+
+    *s = ds4_hsum_float_8(acc);
 #else
     float sumf = 0.0f;
 
@@ -2559,6 +2662,60 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
     }
 
     *s = 0.25f * sumf;
+#elif defined(__AVX2__)
+    uint32_t aux32[4];
+    const uint8_t *aux8 = (const uint8_t *)aux32;
+    __m256 accumf = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const uint16_t *q2 = x[i].qs;
+        const int8_t *q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+
+            memcpy(aux32, q2, sizeof(aux32));
+            q2 += 8;
+
+            const __m256i q2_1 = _mm256_set_epi64x(
+                iq2xxs_grid[aux8[3]], iq2xxs_grid[aux8[2]],
+                iq2xxs_grid[aux8[1]], iq2xxs_grid[aux8[0]]);
+            const __m256i q2_2 = _mm256_set_epi64x(
+                iq2xxs_grid[aux8[11]], iq2xxs_grid[aux8[10]],
+                iq2xxs_grid[aux8[9]],  iq2xxs_grid[aux8[8]]);
+            const __m256i s2_1 = _mm256_set_epi64x(
+                ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >> 21) & 127]),
+                ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >> 14) & 127]),
+                ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >>  7) & 127]),
+                ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >>  0) & 127]));
+            const __m256i s2_2 = _mm256_set_epi64x(
+                ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >> 21) & 127]),
+                ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >> 14) & 127]),
+                ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >>  7) & 127]),
+                ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >>  0) & 127]));
+
+            const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
+            const __m256i q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+            const uint16_t ls1 = (uint16_t)(aux32[1] >> 28);
+            const uint16_t ls2 = (uint16_t)(aux32[3] >> 28);
+            const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16((int16_t)(2 * ls1 + 1)));
+            const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16((int16_t)(2 * ls2 + 1)));
+            sumi1 = _mm256_add_epi32(sumi1, p1);
+            sumi2 = _mm256_add_epi32(sumi2, p2);
+        }
+
+        accumf = ds4_mm256_fmadd_ps(_mm256_set1_ps(d),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)),
+                                    accumf);
+    }
+
+    *s = 0.125f * ds4_hsum_float_8(accumf);
 #else
     uint32_t aux32[2];
     const uint8_t *aux8 = (const uint8_t *)aux32;
@@ -2667,6 +2824,73 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
 
     *s0 = 0.25f * total0;
     *s1 = 0.25f * total1;
+#elif defined(__AVX2__)
+    const int nb = n / QK_K;
+    __m256 accum0 = _mm256_setzero_ps();
+    __m256 accum1 = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = f16_to_f32(x0[i].d) * y[i].d;
+        const float d1 = f16_to_f32(x1[i].d) * y[i].d;
+        const uint16_t *q20 = x0[i].qs;
+        const uint16_t *q21 = x1[i].qs;
+        const int8_t *q8 = y[i].qs;
+        __m256i sumi01 = _mm256_setzero_si256();
+        __m256i sumi02 = _mm256_setzero_si256();
+        __m256i sumi11 = _mm256_setzero_si256();
+        __m256i sumi12 = _mm256_setzero_si256();
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+
+#define DS4_IQ2_AVX2_ACCUM(q2_ptr, accum_a, accum_b) do {                              \
+                uint32_t aux32[4];                                                     \
+                memcpy(aux32, (q2_ptr), sizeof(aux32));                                \
+                (q2_ptr) += 8;                                                         \
+                const uint8_t *aux8 = (const uint8_t *)aux32;                          \
+                const __m256i q2_1 = _mm256_set_epi64x(                                \
+                    iq2xxs_grid[aux8[3]], iq2xxs_grid[aux8[2]],                       \
+                    iq2xxs_grid[aux8[1]], iq2xxs_grid[aux8[0]]);                      \
+                const __m256i q2_2 = _mm256_set_epi64x(                                \
+                    iq2xxs_grid[aux8[11]], iq2xxs_grid[aux8[10]],                     \
+                    iq2xxs_grid[aux8[9]],  iq2xxs_grid[aux8[8]]);                     \
+                const __m256i s2_1 = _mm256_set_epi64x(                                \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >> 21) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >> 14) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >>  7) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >>  0) & 127]));       \
+                const __m256i s2_2 = _mm256_set_epi64x(                                \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >> 21) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >> 14) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >>  7) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >>  0) & 127]));       \
+                const __m256i dot1 = _mm256_maddubs_epi16(q2_1, _mm256_sign_epi8(q8_1, s2_1)); \
+                const __m256i dot2 = _mm256_maddubs_epi16(q2_2, _mm256_sign_epi8(q8_2, s2_2)); \
+                const uint16_t ls1 = (uint16_t)(aux32[1] >> 28);                       \
+                const uint16_t ls2 = (uint16_t)(aux32[3] >> 28);                       \
+                (accum_a) = _mm256_add_epi32((accum_a), _mm256_madd_epi16(             \
+                    dot1, _mm256_set1_epi16((int16_t)(2 * ls1 + 1))));                 \
+                (accum_b) = _mm256_add_epi32((accum_b), _mm256_madd_epi16(             \
+                    dot2, _mm256_set1_epi16((int16_t)(2 * ls2 + 1))));                 \
+            } while (0)
+
+            DS4_IQ2_AVX2_ACCUM(q20, sumi01, sumi02);
+            DS4_IQ2_AVX2_ACCUM(q21, sumi11, sumi12);
+
+#undef DS4_IQ2_AVX2_ACCUM
+        }
+
+        accum0 = ds4_mm256_fmadd_ps(_mm256_set1_ps(d0),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(sumi01, sumi02)),
+                                    accum0);
+        accum1 = ds4_mm256_fmadd_ps(_mm256_set1_ps(d1),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(sumi11, sumi12)),
+                                    accum1);
+    }
+
+    *s0 = 0.125f * ds4_hsum_float_8(accum0);
+    *s1 = 0.125f * ds4_hsum_float_8(accum1);
 #else
     ds4_vec_dot_iq2_xxs_q8_K(n, s0, x0, y);
     ds4_vec_dot_iq2_xxs_q8_K(n, s1, x1, y);
@@ -5063,6 +5287,326 @@ static void matvec_q4_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint6
     }
 }
 
+#ifdef DS4_USE_BLIS
+static bool ds4_cpu_moe_blis_enabled(void) {
+    const char *env = getenv("DS4_CPU_MOE_BLIS");
+    return env && env[0] && !(env[0] == '0' && env[1] == '\0');
+}
+
+static uint32_t ds4_cpu_moe_blis_tile_rows(void) {
+    const char *env = getenv("DS4_CPU_MOE_BLIS_TILE_ROWS");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && v >= 8 && v <= 512) {
+            return (uint32_t)v;
+        }
+    }
+    return 64;
+}
+
+static uint32_t ds4_cpu_moe_blis_min_pairs(void) {
+    const char *env = getenv("DS4_CPU_MOE_BLIS_MIN_PAIRS");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && v <= UINT32_MAX) {
+            return (uint32_t)v;
+        }
+    }
+    return 16;
+}
+
+static void ds4_blis_sgemm_row_nt(
+        uint32_t     rows,
+        uint32_t     cols,
+        uint64_t     k_u64,
+        const float *a_row_major,
+        const float *b_row_major,
+        float       *c_row_major) {
+    const char transa = 'T';
+    const char transb = 'N';
+    const f77_int m = (f77_int)cols;
+    const f77_int n = (f77_int)rows;
+    const f77_int k = (f77_int)k_u64;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    /* BLIS's Fortran BLAS entrypoint is column-major. A row-major
+     * rows-by-k times row-major cols-by-k^T is the same memory layout as
+     * C^T = B * A^T in column-major form. */
+    sgemm(&transa, &transb,
+          &m, &n, &k,
+          &alpha,
+          b_row_major, &k,
+          a_row_major, &k,
+          &beta,
+          c_row_major, &m);
+}
+
+static void ds4_dequant_iq2_xxs_row_f32(float *dst, const block_iq2_xxs *x, uint64_t n) {
+    if (n % QK_K != 0) ds4_die("IQ2_XXS BLIS dequant row is not QK_K aligned");
+    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    const uint64_t nb = n / QK_K;
+    uint64_t pos = 0;
+
+    for (uint64_t b = 0; b < nb; b++) {
+        const float d = 0.125f * f16_to_f32(x[b].d);
+        const uint16_t *q2 = x[b].qs;
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            uint32_t aux32[2];
+            memcpy(aux32, q2, sizeof(aux32));
+            q2 += 4;
+            const uint8_t *aux8 = (const uint8_t *)aux32;
+            const float scale = d * (float)(2u * (aux32[1] >> 28) + 1u);
+
+            for (int l = 0; l < 4; l++) {
+                const uint32_t sign_idx = (aux32[1] >> (7 * l)) & 127u;
+                const int8_t *grid = iq2xxs_signed_grid[aux8[l]][sign_idx];
+                for (int j = 0; j < 8; j++) {
+                    dst[pos++] = scale * (float)grid[j];
+                }
+            }
+        }
+    }
+}
+
+static void ds4_dequant_q2_k_row_f32(float *dst, const block_q2_K *x, uint64_t n) {
+    if (n % QK_K != 0) ds4_die("Q2_K BLIS dequant row is not QK_K aligned");
+    const uint64_t nb = n / QK_K;
+    uint64_t block_pos = 0;
+
+    for (uint64_t b = 0; b < nb; b++, block_pos += QK_K) {
+        const float d = f16_to_f32(x[b].d);
+        const float dmin = f16_to_f32(x[b].dmin);
+        const uint8_t *q2_base = x[b].qs;
+        const uint8_t *sc = x[b].scales;
+        int is = 0;
+
+        for (int k = 0; k < QK_K / 128; k++) {
+            const uint8_t *q2 = q2_base + 32 * k;
+            for (int shift = 0; shift < 8; shift += 2) {
+                const float scale0 = d * (float)(sc[is] & 0x0f);
+                const float min0 = dmin * (float)(sc[is] >> 4);
+                uint64_t pos = block_pos + (uint64_t)k * 128u + (uint64_t)(shift / 2) * 32u;
+                for (int j = 0; j < 16; j++) {
+                    dst[pos + j] = scale0 * (float)((q2[j] >> shift) & 0x03) - min0;
+                }
+                is++;
+
+                const float scale1 = d * (float)(sc[is] & 0x0f);
+                const float min1 = dmin * (float)(sc[is] >> 4);
+                for (int j = 0; j < 16; j++) {
+                    dst[pos + 16u + (uint64_t)j] =
+                        scale1 * (float)((q2[16 + j] >> shift) & 0x03) - min1;
+                }
+                is++;
+            }
+        }
+    }
+}
+
+static void ds4_gather_pair_rows_f32(
+        float          *dst,
+        const float    *src_rows,
+        uint64_t        row_dim,
+        const uint32_t *pair_ids,
+        uint32_t        begin,
+        uint32_t        end,
+        uint32_t        slot_stride) {
+    for (uint32_t i = begin; i < end; i++) {
+        const uint32_t pair_id = pair_ids[i];
+        const uint32_t row_id = pair_id / slot_stride;
+        memcpy(dst + (uint64_t)(i - begin) * row_dim,
+               src_rows + (uint64_t)row_id * row_dim,
+               (size_t)row_dim * sizeof(dst[0]));
+    }
+}
+
+static void ds4_gather_mid_pair_rows_f32(
+        float          *dst,
+        const float    *mid,
+        uint64_t        row_dim,
+        const uint32_t *pair_ids,
+        uint32_t        begin,
+        uint32_t        end) {
+    for (uint32_t i = begin; i < end; i++) {
+        const uint32_t pair_id = pair_ids[i];
+        memcpy(dst + (uint64_t)(i - begin) * row_dim,
+               mid + (uint64_t)pair_id * row_dim,
+               (size_t)row_dim * sizeof(dst[0]));
+    }
+}
+
+static bool layer_routed_moe_iq2_q2_blis_grouped(
+        float                  *moe,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        const float            *norm,
+        const float            *weight_rows,
+        uint32_t                n_tok,
+        float                   clamp,
+        float                  *mid,
+        const uint32_t         *pair_ids,
+        const uint32_t         *expert_offset,
+        const uint32_t         *active_expert,
+        uint32_t                n_active) {
+    if (!ds4_cpu_moe_blis_enabled()) return false;
+    if (!(layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+          layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+          layer->ffn_down_exps->type == DS4_TENSOR_Q2_K)) {
+        return false;
+    }
+    if (n_tok <= 1 || n_active == 0) return false;
+
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_out_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    const uint64_t down_out_dim = layer->ffn_down_exps->dim[1];
+    if (expert_in_dim > INT32_MAX || expert_out_dim > INT32_MAX ||
+        down_in_dim > INT32_MAX || down_out_dim > INT32_MAX) {
+        return false;
+    }
+    if (expert_out_dim != down_in_dim || down_out_dim != DS4_N_EMBD) {
+        return false;
+    }
+
+    uint32_t max_pairs = 0;
+    for (uint32_t ai = 0; ai < n_active; ai++) {
+        const uint32_t expert = active_expert[ai];
+        const uint32_t n_pairs = expert_offset[expert + 1] - expert_offset[expert];
+        if (n_pairs > max_pairs) max_pairs = n_pairs;
+    }
+    if (max_pairs == 0 || max_pairs > INT32_MAX) return false;
+    if (max_pairs < ds4_cpu_moe_blis_min_pairs()) return false;
+
+    const uint32_t tile_rows = ds4_cpu_moe_blis_tile_rows();
+    const uint64_t max_k = expert_in_dim > down_in_dim ? expert_in_dim : down_in_dim;
+    float *w_tile = xmalloc((size_t)tile_rows * (size_t)max_k * sizeof(w_tile[0]));
+    float *x_panel = xmalloc((size_t)max_pairs * (size_t)expert_in_dim * sizeof(x_panel[0]));
+    float *mid_panel = xmalloc((size_t)max_pairs * (size_t)down_in_dim * sizeof(mid_panel[0]));
+    float *gate_c = xmalloc((size_t)tile_rows * (size_t)max_pairs * sizeof(gate_c[0]));
+    float *up_c = xmalloc((size_t)tile_rows * (size_t)max_pairs * sizeof(up_c[0]));
+    float *down_c = xmalloc((size_t)tile_rows * (size_t)max_pairs * sizeof(down_c[0]));
+
+    memset(moe, 0, (size_t)((uint64_t)n_tok * down_out_dim) * sizeof(moe[0]));
+
+    for (uint32_t ai = 0; ai < n_active; ai++) {
+        const uint32_t expert = active_expert[ai];
+        const uint32_t begin = expert_offset[expert];
+        const uint32_t end = expert_offset[expert + 1];
+        const uint32_t n_pairs = end - begin;
+        if (n_pairs == 0) continue;
+
+        uint64_t gate_in_dim = 0, gate_out_dim = 0, gate_row_bytes = 0;
+        uint64_t up_in_dim = 0, up_out_dim = 0, up_row_bytes = 0;
+        const uint8_t *gate_base = tensor_expert_bytes(model, layer->ffn_gate_exps, expert,
+                                                       &gate_in_dim, &gate_out_dim, &gate_row_bytes);
+        const uint8_t *up_base = tensor_expert_bytes(model, layer->ffn_up_exps, expert,
+                                                     &up_in_dim, &up_out_dim, &up_row_bytes);
+        if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
+            gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
+            ds4_die("BLIS IQ2_XXS expert tensor layout mismatch");
+        }
+
+        ds4_gather_pair_rows_f32(x_panel, norm, expert_in_dim,
+                                 pair_ids, begin, end, DS4_N_EXPERT_USED);
+
+        for (uint64_t row0 = 0; row0 < expert_out_dim; row0 += tile_rows) {
+            const uint32_t rows = (uint32_t)((expert_out_dim - row0) < tile_rows ?
+                                            (expert_out_dim - row0) : tile_rows);
+            for (uint32_t r = 0; r < rows; r++) {
+                const block_iq2_xxs *row =
+                    (const block_iq2_xxs *)(gate_base + (row0 + r) * gate_row_bytes);
+                ds4_dequant_iq2_xxs_row_f32(w_tile + (uint64_t)r * expert_in_dim,
+                                             row,
+                                             expert_in_dim);
+            }
+            ds4_blis_sgemm_row_nt(rows, n_pairs, expert_in_dim,
+                                   w_tile, x_panel, gate_c);
+
+            for (uint32_t r = 0; r < rows; r++) {
+                const block_iq2_xxs *row =
+                    (const block_iq2_xxs *)(up_base + (row0 + r) * up_row_bytes);
+                ds4_dequant_iq2_xxs_row_f32(w_tile + (uint64_t)r * expert_in_dim,
+                                             row,
+                                             expert_in_dim);
+            }
+            ds4_blis_sgemm_row_nt(rows, n_pairs, expert_in_dim,
+                                   w_tile, x_panel, up_c);
+
+            for (uint32_t r = 0; r < rows; r++) {
+                const uint64_t out_row = row0 + r;
+                for (uint32_t j = 0; j < n_pairs; j++) {
+                    const uint32_t pair_id = pair_ids[begin + j];
+                    float gate = gate_c[(uint64_t)r * n_pairs + j];
+                    float up = up_c[(uint64_t)r * n_pairs + j];
+                    if (clamp > 1.0e-6f) {
+                        if (gate > clamp) gate = clamp;
+                        if (up > clamp) up = clamp;
+                        if (up < -clamp) up = -clamp;
+                    }
+                    mid[(uint64_t)pair_id * expert_out_dim + out_row] =
+                        silu(gate) * up * weight_rows[pair_id];
+                }
+            }
+        }
+
+        uint64_t down_in = 0, down_out = 0, down_row_bytes = 0;
+        const uint8_t *down_base = tensor_expert_bytes(model, layer->ffn_down_exps, expert,
+                                                       &down_in, &down_out, &down_row_bytes);
+        if (down_in != down_in_dim || down_out != down_out_dim) {
+            ds4_die("BLIS Q2_K down tensor layout mismatch");
+        }
+        ds4_gather_mid_pair_rows_f32(mid_panel, mid, down_in_dim, pair_ids, begin, end);
+
+        for (uint64_t row0 = 0; row0 < down_out_dim; row0 += tile_rows) {
+            const uint32_t rows = (uint32_t)((down_out_dim - row0) < tile_rows ?
+                                            (down_out_dim - row0) : tile_rows);
+            for (uint32_t r = 0; r < rows; r++) {
+                const block_q2_K *row =
+                    (const block_q2_K *)(down_base + (row0 + r) * down_row_bytes);
+                ds4_dequant_q2_k_row_f32(w_tile + (uint64_t)r * down_in_dim,
+                                          row,
+                                          down_in_dim);
+            }
+            ds4_blis_sgemm_row_nt(rows, n_pairs, down_in_dim,
+                                   w_tile, mid_panel, down_c);
+
+            for (uint32_t r = 0; r < rows; r++) {
+                const uint64_t out_row = row0 + r;
+                for (uint32_t j = 0; j < n_pairs; j++) {
+                    const uint32_t pair_id = pair_ids[begin + j];
+                    const uint32_t token = pair_id / DS4_N_EXPERT_USED;
+                    moe[(uint64_t)token * down_out_dim + out_row] +=
+                        down_c[(uint64_t)r * n_pairs + j];
+                }
+            }
+        }
+    }
+
+    free(down_c);
+    free(up_c);
+    free(gate_c);
+    free(mid_panel);
+    free(x_panel);
+    free(w_tile);
+    return true;
+}
+#else
+static bool ds4_cpu_moe_blis_enabled(void) {
+    static bool warned = false;
+    const char *env = getenv("DS4_CPU_MOE_BLIS");
+    const bool requested = env && env[0] && !(env[0] == '0' && env[1] == '\0');
+    if (requested && !warned) {
+        fprintf(stderr, "ds4: DS4_CPU_MOE_BLIS requested but binary was built without USE_BLIS=1\n");
+        warned = true;
+    }
+    return false;
+}
+#endif
+
 /* CPU-MoE handoff gets router selections and weights from GPU buffers, then
  * runs the expert projections on reusable host scratch. Prefill keeps the
  * efficient expert-grouped batch layout; decode reuses the same scratch path
@@ -5132,6 +5676,26 @@ static void layer_routed_moe_selected_batch_prealloc(
         const uint32_t expert = (uint32_t)selected_rows[pair_id];
         pair_ids[cursor[expert]++] = pair_id;
     }
+
+#ifdef DS4_USE_BLIS
+    if (!is_q4 &&
+        layer_routed_moe_iq2_q2_blis_grouped(moe,
+                                             model,
+                                             layer,
+                                             norm,
+                                             weight_rows,
+                                             n_tok,
+                                             clamp,
+                                             mid,
+                                             pair_ids,
+                                             counts,
+                                             active_expert,
+                                             n_active)) {
+        return;
+    }
+#else
+    (void)ds4_cpu_moe_blis_enabled();
+#endif
 
     if (is_q4) {
         matvec_q4_k_batch_mid_ctx mid_ctx = {
@@ -5327,6 +5891,26 @@ static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
         const uint32_t expert = (uint32_t)selected_rows[pair_id];
         pair_ids[cursor[expert]++] = pair_id;
     }
+
+#ifdef DS4_USE_BLIS
+    if (!is_q4 &&
+        layer_routed_moe_iq2_q2_blis_grouped(moe,
+                                             model,
+                                             layer,
+                                             norm,
+                                             weight_rows,
+                                             n_tok,
+                                             clamp,
+                                             mid,
+                                             pair_ids,
+                                             counts,
+                                             active_expert,
+                                             n_active)) {
+        return;
+    }
+#else
+    (void)ds4_cpu_moe_blis_enabled();
+#endif
 
     if (is_q4) {
         matvec_q4_k_batch_mid_ctx mid_ctx = {
@@ -9667,6 +10251,7 @@ typedef struct {
     bool hot_expert[DS4_N_LAYER][DS4_N_EXPERT];
     bool hot_expert_seed[DS4_N_LAYER][DS4_N_EXPERT];
     bool dynamic_experts_enabled;
+    bool dynamic_expert_eager;
     bool dynamic_expert_owned[DS4_N_LAYER][DS4_N_EXPERT];
     bool dynamic_expert_gate_owned[DS4_N_LAYER][DS4_N_EXPERT];
     bool dynamic_expert_up_owned[DS4_N_LAYER][DS4_N_EXPERT];
@@ -10515,18 +11100,27 @@ static bool metal_graph_cpu_moe_handoff(
     if (!xs || !sel || !w || !out) return false;
 
     metal_graph_record_route_profile(g, il, sel, n_tokens, decode);
-    metal_graph_dynamic_expert_maintenance(g, model, layer, il, sel, n_tokens);
+    if (g->dynamic_expert_eager) {
+        metal_graph_dynamic_expert_observe(g, il, sel, n_tokens, decode);
+        metal_graph_dynamic_expert_maintenance(g, model, layer, il, sel, n_tokens);
+    } else {
+        metal_graph_dynamic_expert_maintenance(g, model, layer, il, sel, n_tokens);
+    }
 
     if (decode && n_tokens == 1 &&
         metal_graph_cuda_cpu_moe_hot_decode(g, model, layer, il, ffn_norm,
                                             routed_out, xs, sel, w)) {
-        metal_graph_dynamic_expert_observe(g, il, sel, n_tokens, decode);
+        if (!g->dynamic_expert_eager) {
+            metal_graph_dynamic_expert_observe(g, il, sel, n_tokens, decode);
+        }
         return ds4_gpu_begin_commands() != 0;
     }
     if (!decode &&
         metal_graph_cuda_cpu_moe_hot_prefill(g, model, layer, il, ffn_norm,
                                              routed_out, xs, sel, w, n_tokens)) {
-        metal_graph_dynamic_expert_observe(g, il, sel, n_tokens, decode);
+        if (!g->dynamic_expert_eager) {
+            metal_graph_dynamic_expert_observe(g, il, sel, n_tokens, decode);
+        }
         return ds4_gpu_begin_commands() != 0;
     }
 
@@ -10543,7 +11137,9 @@ static bool metal_graph_cpu_moe_handoff(
         return false;
     }
 
-    metal_graph_dynamic_expert_observe(g, il, sel, n_tokens, decode);
+    if (!g->dynamic_expert_eager) {
+        metal_graph_dynamic_expert_observe(g, il, sel, n_tokens, decode);
+    }
     return ds4_gpu_begin_commands() != 0;
 }
 
@@ -16570,6 +17166,7 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
     g->cpu_model = e->cpu_moe ? &e->cpu_model : NULL;
     g->dynamic_experts_enabled =
         e->backend == DS4_BACKEND_CUDA && e->cpu_moe && ds4_dynamic_experts_env_enabled();
+    g->dynamic_expert_eager = accelerator_cuda_env_enabled("DS4_CUDA_DYNAMIC_EXPERT_EAGER");
     g->dynamic_expert_policy = ds4_dynamic_expert_policy_from_env();
     g->dynamic_expert_budget_bytes = ds4_env_bytes_default(
         "DS4_CUDA_DYNAMIC_EXPERT_CACHE_GB",
@@ -16597,7 +17194,7 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
     if (g->dynamic_experts_enabled) {
         fprintf(stderr,
                 "ds4: CUDA dynamic experts enabled policy=%s budget=%.2f GiB min_score=%llu "
-                "prefill_weight=%llu decode_weight=%llu maintenance_interval=%llu "
+                "prefill_weight=%llu decode_weight=%llu maintenance_interval=%llu eager=%s "
                 "max_promotions=%u max_evictions=%u\n",
                 g->dynamic_expert_policy == DS4_DYNAMIC_EXPERT_POLICY_SCORE ? "score" :
                     (g->dynamic_expert_policy == DS4_DYNAMIC_EXPERT_POLICY_LRU ? "lru" : "append"),
@@ -16606,6 +17203,7 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
                 (unsigned long long)g->dynamic_expert_prefill_weight,
                 (unsigned long long)g->dynamic_expert_decode_weight,
                 (unsigned long long)g->dynamic_expert_maintenance_interval,
+                g->dynamic_expert_eager ? "yes" : "no",
                 g->dynamic_expert_max_promotions,
                 g->dynamic_expert_max_evictions);
     }
