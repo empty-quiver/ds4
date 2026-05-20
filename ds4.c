@@ -10619,6 +10619,8 @@ typedef struct {
     bool hot_expert_seed[DS4_N_LAYER][DS4_N_EXPERT];
     bool dynamic_experts_enabled;
     bool dynamic_expert_eager;
+    bool dynamic_expert_predictive;
+    bool dynamic_expert_group_eviction;
     bool layerwise_staging_enabled;
     bool layerwise_staging_sticky;
     bool layerwise_staging_overlap;
@@ -10626,6 +10628,7 @@ typedef struct {
     bool dynamic_expert_gate_owned[DS4_N_LAYER][DS4_N_EXPERT];
     bool dynamic_expert_up_owned[DS4_N_LAYER][DS4_N_EXPERT];
     bool dynamic_expert_down_owned[DS4_N_LAYER][DS4_N_EXPERT];
+    uint32_t dynamic_expert_box_id[DS4_N_LAYER][DS4_N_EXPERT];
     uint64_t dynamic_expert_score[DS4_N_LAYER][DS4_N_EXPERT];
     uint64_t dynamic_expert_last_used[DS4_N_LAYER][DS4_N_EXPERT];
     uint64_t dynamic_expert_gate_offset[DS4_N_LAYER][DS4_N_EXPERT];
@@ -10642,12 +10645,28 @@ typedef struct {
     uint64_t dynamic_expert_decode_weight;
     uint64_t dynamic_expert_maintenance_interval;
     uint64_t dynamic_expert_maintenance_steps;
+    uint64_t dynamic_expert_predictive_min_count;
+    uint64_t dynamic_expert_predictive_hysteresis;
+    uint64_t dynamic_expert_predictive_prompt_score[DS4_N_EXPERT];
+    uint64_t dynamic_expert_predictive_last_promoted[DS4_N_LAYER][DS4_N_EXPERT];
     uint64_t dynamic_expert_promotions;
     uint64_t dynamic_expert_evictions;
     uint64_t dynamic_expert_promotion_failures;
+    uint64_t dynamic_expert_group_evictions;
+    uint64_t dynamic_expert_group_promotions;
+    uint64_t dynamic_expert_predictive_promotions;
+    uint64_t dynamic_expert_predictive_attempts;
+    uint64_t dynamic_expert_predictive_budget_skips;
+    uint64_t dynamic_expert_box_promotions;
+    uint64_t dynamic_expert_box_evictions;
     uint32_t dynamic_expert_policy;
     uint32_t dynamic_expert_max_promotions;
     uint32_t dynamic_expert_max_evictions;
+    uint32_t dynamic_expert_group_size;
+    uint32_t dynamic_expert_next_box_id;
+    uint32_t dynamic_expert_predictive_lookahead;
+    uint32_t dynamic_expert_predictive_max_promotions;
+    uint32_t dynamic_expert_predictive_group_size;
     uint64_t layerwise_staging_budget_bytes;
     uint32_t layerwise_staging_min_pairs;
     uint32_t layerwise_staging_max_experts;
@@ -10678,10 +10697,14 @@ typedef struct {
     uint64_t hot_expert_prefill_batches;
     uint64_t hot_expert_prefill_slots;
     uint64_t cold_expert_prefill_slots;
+    uint64_t hot_expert_prefill_thin_skips;
+    uint64_t hot_expert_prefill_thin_slots;
+    uint32_t hot_expert_prefill_min_pairs;
     uint64_t hot_expert_decode_layers;
     uint64_t hot_expert_decode_slots;
     uint64_t cold_expert_decode_slots;
     const ds4_model *gpu_model;
+    const ds4_weights *gpu_weights;
     const ds4_model *cpu_model;
     uint32_t cpu_moe_tok_cap;
     float *cpu_moe_mid;
@@ -10735,6 +10758,15 @@ static uint64_t ds4_env_bytes_default(const char *gb_name, const char *mb_name, 
         }
     }
     return def;
+}
+
+static uint64_t ds4_u64_saturating_add(uint64_t a, uint64_t b) {
+    return UINT64_MAX - a < b ? UINT64_MAX : a + b;
+}
+
+static uint64_t ds4_u64_saturating_mul(uint64_t a, uint64_t b) {
+    if (a != 0 && b > UINT64_MAX / a) return UINT64_MAX;
+    return a * b;
 }
 
 static uint32_t ds4_dynamic_expert_policy_from_env(void) {
@@ -10968,6 +11000,25 @@ static uint64_t metal_graph_dynamic_expert_missing_bytes(
     return bytes;
 }
 
+static uint32_t metal_graph_dynamic_expert_new_box(ds4_gpu_graph *g) {
+    if (!g) return 0;
+    g->dynamic_expert_next_box_id++;
+    if (g->dynamic_expert_next_box_id == 0) {
+        g->dynamic_expert_next_box_id = 1;
+    }
+    return g->dynamic_expert_next_box_id;
+}
+
+static void metal_graph_dynamic_expert_assign_box(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       expert,
+        uint32_t       box_id) {
+    if (!g || box_id == 0 || il >= DS4_N_LAYER || expert >= DS4_N_EXPERT) return;
+    if (!g->dynamic_expert_owned[il][expert] || g->hot_expert_seed[il][expert]) return;
+    g->dynamic_expert_box_id[il][expert] = box_id;
+}
+
 static void metal_graph_dynamic_expert_release_owned(
         ds4_gpu_graph *g,
         const ds4_model *model,
@@ -11009,6 +11060,7 @@ static void metal_graph_dynamic_expert_release_owned(
     g->dynamic_expert_gate_bytes[il][expert] = 0;
     g->dynamic_expert_up_bytes[il][expert] = 0;
     g->dynamic_expert_down_bytes[il][expert] = 0;
+    g->dynamic_expert_box_id[il][expert] = 0;
     g->dynamic_expert_evictions++;
 }
 
@@ -11034,6 +11086,89 @@ static bool metal_graph_dynamic_expert_evict_one(
         uint32_t current_tokens) {
     if (!g || !model) return false;
     if (g->dynamic_expert_policy == DS4_DYNAMIC_EXPERT_POLICY_APPEND) return false;
+
+    if (g->dynamic_expert_group_eviction) {
+        enum { DS4_DYNAMIC_EXPERT_MAX_BOX_CANDIDATES = DS4_N_LAYER * DS4_N_EXPERT };
+        uint32_t cand_box[DS4_DYNAMIC_EXPERT_MAX_BOX_CANDIDATES] = {0};
+        uint32_t cand_l[DS4_DYNAMIC_EXPERT_MAX_BOX_CANDIDATES] = {0};
+        uint32_t cand_e[DS4_DYNAMIC_EXPERT_MAX_BOX_CANDIDATES] = {0};
+        uint64_t cand_key[DS4_DYNAMIC_EXPERT_MAX_BOX_CANDIDATES] = {0};
+        bool cand_current[DS4_DYNAMIC_EXPERT_MAX_BOX_CANDIDATES] = {0};
+        uint32_t cand_count = 0;
+
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+                if (!g->dynamic_expert_owned[il][e] || g->hot_expert_seed[il][e]) continue;
+                const uint32_t box_id = g->dynamic_expert_box_id[il][e];
+                uint32_t idx = UINT32_MAX;
+                if (box_id != 0) {
+                    for (uint32_t i = 0; i < cand_count; i++) {
+                        if (cand_box[i] == box_id) {
+                            idx = i;
+                            break;
+                        }
+                    }
+                }
+                if (idx == UINT32_MAX) {
+                    if (cand_count >= DS4_DYNAMIC_EXPERT_MAX_BOX_CANDIDATES) return false;
+                    idx = cand_count++;
+                    cand_box[idx] = box_id;
+                    cand_l[idx] = il;
+                    cand_e[idx] = e;
+                }
+                if (metal_graph_dynamic_expert_is_current(current_sel, current_tokens,
+                                                          current_layer, il, e)) {
+                    cand_current[idx] = true;
+                }
+                if (g->dynamic_expert_policy == DS4_DYNAMIC_EXPERT_POLICY_LRU) {
+                    if (g->dynamic_expert_last_used[il][e] > cand_key[idx]) {
+                        cand_key[idx] = g->dynamic_expert_last_used[il][e];
+                    }
+                } else {
+                    cand_key[idx] =
+                        ds4_u64_saturating_add(cand_key[idx],
+                                                g->dynamic_expert_score[il][e]);
+                }
+            }
+        }
+
+        bool found = false;
+        uint32_t best_idx = 0;
+        uint64_t best_key = UINT64_MAX;
+        for (uint32_t i = 0; i < cand_count; i++) {
+            if (cand_current[i]) continue;
+            if (!found || cand_key[i] < best_key) {
+                found = true;
+                best_key = cand_key[i];
+                best_idx = i;
+            }
+        }
+        if (!found) return false;
+
+        bool released = false;
+        const uint32_t best_box = cand_box[best_idx];
+        const uint32_t best_l = cand_l[best_idx];
+        const uint32_t best_e = cand_e[best_idx];
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+                if (!g->dynamic_expert_owned[il][e] ||
+                    g->hot_expert_seed[il][e]) {
+                    continue;
+                }
+                if ((best_box == 0 && (il != best_l || e != best_e)) ||
+                    (best_box != 0 && g->dynamic_expert_box_id[il][e] != best_box)) {
+                    continue;
+                }
+                metal_graph_dynamic_expert_release_owned(g, model, il, e);
+                released = true;
+            }
+        }
+        if (released) {
+            g->dynamic_expert_group_evictions++;
+            g->dynamic_expert_box_evictions++;
+        }
+        return released;
+    }
 
     bool found = false;
     uint32_t best_l = 0;
@@ -11191,6 +11326,59 @@ static void metal_graph_dynamic_expert_maintenance(
         (g->dynamic_expert_maintenance_steps % g->dynamic_expert_maintenance_interval) != 0) {
         return;
     }
+    if (g->dynamic_expert_group_size > 1) {
+        const uint32_t group_cap =
+            g->dynamic_expert_group_size < g->dynamic_expert_max_promotions
+                ? g->dynamic_expert_group_size
+                : g->dynamic_expert_max_promotions;
+        if (group_cap == 0) return;
+
+        uint32_t top_expert[DS4_N_EXPERT] = {0};
+        uint64_t top_score[DS4_N_EXPERT] = {0};
+        uint32_t top_count = 0;
+        for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+            if (g->hot_expert[il][e]) continue;
+            const uint64_t score = g->dynamic_expert_score[il][e];
+            if (score < g->dynamic_expert_min_score) continue;
+            uint32_t pos = top_count;
+            while (pos > 0 &&
+                   (score > top_score[pos - 1u] ||
+                    (score == top_score[pos - 1u] &&
+                     g->dynamic_expert_last_used[il][e] >
+                     g->dynamic_expert_last_used[il][top_expert[pos - 1u]]))) {
+                if (pos < group_cap) {
+                    top_score[pos] = top_score[pos - 1u];
+                    top_expert[pos] = top_expert[pos - 1u];
+                }
+                pos--;
+            }
+            if (pos < group_cap) {
+                top_score[pos] = score;
+                top_expert[pos] = e;
+                if (top_count < group_cap) top_count++;
+            }
+        }
+        if (top_count == 0) return;
+
+        uint32_t promoted = 0;
+        const uint32_t box_id = metal_graph_dynamic_expert_new_box(g);
+        for (uint32_t i = 0; i < top_count; i++) {
+            if (metal_graph_dynamic_expert_promote(g, model, layer, il,
+                                                   top_expert[i],
+                                                   current_sel,
+                                                   current_tokens)) {
+                metal_graph_dynamic_expert_assign_box(g, il, top_expert[i], box_id);
+                promoted++;
+            } else {
+                break;
+            }
+        }
+        if (promoted != 0) {
+            g->dynamic_expert_group_promotions++;
+            g->dynamic_expert_box_promotions++;
+        }
+        return;
+    }
     for (uint32_t promoted = 0; promoted < g->dynamic_expert_max_promotions; promoted++) {
         bool found = false;
         uint32_t best = 0;
@@ -11236,6 +11424,267 @@ static void metal_graph_dynamic_expert_observe(
         }
         g->dynamic_expert_last_used[il][e] = g->dynamic_expert_step;
     }
+}
+
+static void metal_graph_dynamic_expert_predictive_maintenance(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il,
+        const int32_t     *selected,
+        uint32_t           n_tokens,
+        bool               decode) {
+    if (!g || !model || !weights || !selected || decode || il >= DS4_N_LAYER) return;
+    if (!g->dynamic_experts_enabled || !g->dynamic_expert_predictive) return;
+    if (g->dynamic_expert_predictive_lookahead == 0 ||
+        g->dynamic_expert_predictive_max_promotions == 0 ||
+        n_tokens == 0) {
+        return;
+    }
+
+    uint32_t counts[DS4_N_EXPERT] = {0};
+    const uint64_t total = (uint64_t)n_tokens * DS4_N_EXPERT_USED;
+    for (uint64_t i = 0; i < total; i++) {
+        const int32_t expert = selected[i];
+        if (expert < 0 || expert >= DS4_N_EXPERT) continue;
+        const uint32_t e = (uint32_t)expert;
+        if (counts[e] != UINT32_MAX) counts[e]++;
+    }
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        if (counts[e] == 0) continue;
+        g->dynamic_expert_predictive_prompt_score[e] =
+            ds4_u64_saturating_add(g->dynamic_expert_predictive_prompt_score[e],
+                                   counts[e]);
+    }
+
+    if (g->dynamic_expert_predictive_group_size > 1) {
+        bool found_layer = false;
+        uint32_t best_layer = 0;
+        uint32_t best_count = 0;
+        uint64_t best_total_score = 0;
+        uint32_t best_expert[DS4_N_EXPERT] = {0};
+        uint64_t best_score[DS4_N_EXPERT] = {0};
+
+        const uint32_t group_cap =
+            g->dynamic_expert_predictive_group_size < g->dynamic_expert_predictive_max_promotions
+                ? g->dynamic_expert_predictive_group_size
+                : g->dynamic_expert_predictive_max_promotions;
+        if (group_cap == 0) return;
+
+        for (uint32_t ahead = 1; ahead <= g->dynamic_expert_predictive_lookahead; ahead++) {
+            const uint32_t target_layer = il + ahead;
+            if (target_layer >= DS4_N_LAYER) break;
+            const ds4_layer_weights *target = &weights->layer[target_layer];
+            uint32_t top_expert[DS4_N_EXPERT] = {0};
+            uint64_t top_score[DS4_N_EXPERT] = {0};
+            uint32_t top_count = 0;
+            uint64_t total_score = 0;
+
+            for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+                if (g->hot_expert[target_layer][e] &&
+                    metal_graph_cuda_hot_expert_cached(model, target, e)) {
+                    continue;
+                }
+                const uint64_t score = g->dynamic_expert_predictive_prompt_score[e];
+                if (score < g->dynamic_expert_predictive_min_count) continue;
+                const uint64_t last =
+                    g->dynamic_expert_predictive_last_promoted[target_layer][e];
+                if (last != 0 &&
+                    score < ds4_u64_saturating_add(last,
+                                                   g->dynamic_expert_predictive_hysteresis)) {
+                    continue;
+                }
+                uint32_t pos = top_count;
+                while (pos > 0 &&
+                       (score > top_score[pos - 1u] ||
+                        (score == top_score[pos - 1u] &&
+                         counts[e] > counts[top_expert[pos - 1u]]))) {
+                    if (pos < group_cap) {
+                        top_score[pos] = top_score[pos - 1u];
+                        top_expert[pos] = top_expert[pos - 1u];
+                    }
+                    pos--;
+                }
+                if (pos < group_cap) {
+                    top_score[pos] = score;
+                    top_expert[pos] = e;
+                    if (top_count < group_cap) top_count++;
+                }
+            }
+
+            for (uint32_t i = 0; i < top_count; i++) {
+                total_score = ds4_u64_saturating_add(total_score, top_score[i]);
+            }
+            if (top_count == 0) continue;
+            if (!found_layer || total_score > best_total_score ||
+                (total_score == best_total_score && top_count > best_count)) {
+                found_layer = true;
+                best_layer = target_layer;
+                best_count = top_count;
+                best_total_score = total_score;
+                for (uint32_t i = 0; i < top_count; i++) {
+                    best_expert[i] = top_expert[i];
+                    best_score[i] = top_score[i];
+                }
+            }
+        }
+
+        if (!found_layer) return;
+        const ds4_layer_weights *target = &weights->layer[best_layer];
+        uint32_t promoted = 0;
+        const uint32_t box_id = metal_graph_dynamic_expert_new_box(g);
+        for (uint32_t i = 0; i < best_count; i++) {
+            const uint32_t expert = best_expert[i];
+            ds4_expert_cache_ranges r;
+            if (!metal_graph_cuda_expert_cache_ranges(target, expert, &r)) continue;
+            const uint64_t missing =
+                metal_graph_dynamic_expert_missing_bytes(model, &r, NULL, NULL, NULL);
+            if (missing == UINT64_MAX) continue;
+            if (missing > g->dynamic_expert_budget_bytes) {
+                g->dynamic_expert_predictive_budget_skips++;
+                continue;
+            }
+
+            g->dynamic_expert_predictive_attempts++;
+            const uint64_t weighted_score =
+                ds4_u64_saturating_mul(best_score[i],
+                                        g->dynamic_expert_prefill_weight);
+            if (weighted_score > g->dynamic_expert_score[best_layer][expert]) {
+                g->dynamic_expert_score[best_layer][expert] = weighted_score;
+            }
+            if (g->dynamic_expert_step != 0) {
+                g->dynamic_expert_last_used[best_layer][expert] =
+                    g->dynamic_expert_step;
+            }
+            if (metal_graph_dynamic_expert_promote(g, model, target,
+                                                   best_layer, expert,
+                                                   selected, n_tokens)) {
+                metal_graph_dynamic_expert_assign_box(g, best_layer, expert, box_id);
+                g->dynamic_expert_predictive_last_promoted[best_layer][expert] =
+                    best_score[i];
+                g->dynamic_expert_predictive_promotions++;
+                promoted++;
+                if (getenv("DS4_CUDA_DYNAMIC_EXPERT_VERBOSE")) {
+                    fprintf(stderr,
+                            "ds4: CUDA predictive group promoted from layer=%u target=%u expert=%u score=%llu group_score=%llu\n",
+                            il,
+                            best_layer,
+                            expert,
+                            (unsigned long long)best_score[i],
+                            (unsigned long long)best_total_score);
+                }
+            } else {
+                break;
+            }
+        }
+        if (promoted != 0) {
+            g->dynamic_expert_box_promotions++;
+        }
+        return;
+    }
+
+    bool considered[DS4_N_LAYER][DS4_N_EXPERT] = {{0}};
+    uint32_t promoted_total = 0;
+    while (promoted_total < g->dynamic_expert_predictive_max_promotions) {
+        bool found = false;
+        uint32_t best_layer = 0;
+        uint32_t best_expert = 0;
+        uint64_t best_score = 0;
+        uint32_t best_recent = 0;
+
+        for (uint32_t ahead = 1; ahead <= g->dynamic_expert_predictive_lookahead; ahead++) {
+            const uint32_t target_layer = il + ahead;
+            if (target_layer >= DS4_N_LAYER) break;
+            const ds4_layer_weights *target = &weights->layer[target_layer];
+            for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+                if (considered[target_layer][e]) continue;
+                if (g->hot_expert[target_layer][e] &&
+                    metal_graph_cuda_hot_expert_cached(model, target, e)) {
+                    continue;
+                }
+                const uint64_t score = g->dynamic_expert_predictive_prompt_score[e];
+                if (score < g->dynamic_expert_predictive_min_count) continue;
+                const uint64_t last = g->dynamic_expert_predictive_last_promoted[target_layer][e];
+                if (last != 0 &&
+                    score < ds4_u64_saturating_add(last,
+                                                   g->dynamic_expert_predictive_hysteresis)) {
+                    continue;
+                }
+                const uint32_t recent = counts[e];
+                if (!found || score > best_score ||
+                    (score == best_score && recent > best_recent) ||
+                    (score == best_score && recent == best_recent &&
+                     target_layer < best_layer)) {
+                    found = true;
+                    best_layer = target_layer;
+                    best_expert = e;
+                    best_score = score;
+                    best_recent = recent;
+                }
+            }
+        }
+        if (!found) break;
+        considered[best_layer][best_expert] = true;
+
+        ds4_expert_cache_ranges r;
+        const ds4_layer_weights *best_layer_weights = &weights->layer[best_layer];
+        if (!metal_graph_cuda_expert_cache_ranges(best_layer_weights, best_expert, &r)) {
+            continue;
+        }
+        const uint64_t missing =
+            metal_graph_dynamic_expert_missing_bytes(model, &r, NULL, NULL, NULL);
+        if (missing == UINT64_MAX) continue;
+        if (missing > g->dynamic_expert_budget_bytes) {
+            g->dynamic_expert_predictive_budget_skips++;
+            continue;
+        }
+
+        g->dynamic_expert_predictive_attempts++;
+        const uint64_t weighted_score =
+            ds4_u64_saturating_mul(best_score, g->dynamic_expert_prefill_weight);
+        if (weighted_score > g->dynamic_expert_score[best_layer][best_expert]) {
+            g->dynamic_expert_score[best_layer][best_expert] = weighted_score;
+        }
+        if (g->dynamic_expert_step != 0) {
+            g->dynamic_expert_last_used[best_layer][best_expert] =
+                g->dynamic_expert_step;
+        }
+        if (metal_graph_dynamic_expert_promote(g, model, best_layer_weights,
+                                               best_layer, best_expert,
+                                               selected, n_tokens)) {
+            g->dynamic_expert_predictive_last_promoted[best_layer][best_expert] =
+                best_score;
+            g->dynamic_expert_predictive_promotions++;
+            promoted_total++;
+            if (getenv("DS4_CUDA_DYNAMIC_EXPERT_VERBOSE")) {
+                fprintf(stderr,
+                        "ds4: CUDA predictive expert promoted from layer=%u target=%u expert=%u score=%llu recent=%u\n",
+                        il,
+                        best_layer,
+                        best_expert,
+                        (unsigned long long)best_score,
+                        best_recent);
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+static void metal_graph_dynamic_expert_after_layer(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        uint32_t           il,
+        const int32_t     *selected,
+        uint32_t           n_tokens,
+        bool               decode) {
+    if (!g || !selected || il >= DS4_N_LAYER || n_tokens == 0) return;
+    if (!g->dynamic_expert_eager) {
+        metal_graph_dynamic_expert_observe(g, il, selected, n_tokens, decode);
+    }
+    metal_graph_dynamic_expert_predictive_maintenance(g, model, g->gpu_weights, il,
+                                                       selected, n_tokens,
+                                                       decode);
 }
 
 static void metal_graph_layerwise_prefill_release_staged(
@@ -11330,6 +11779,7 @@ static bool metal_graph_layerwise_prefill_stage_expert(
         const int32_t          *current_sel,
         uint32_t                current_tokens,
         bool                    async_upload,
+        uint32_t                box_id,
         uint64_t               *remaining_budget,
         uint64_t               *staged_bytes_out) {
     if (!g || !model || !layer || !remaining_budget || !staged_bytes_out ||
@@ -11437,6 +11887,7 @@ static bool metal_graph_layerwise_prefill_stage_expert(
         g->dynamic_expert_gate_bytes[il][expert] = r.gate_bytes;
         g->dynamic_expert_up_bytes[il][expert] = r.up_bytes;
         g->dynamic_expert_down_bytes[il][expert] = r.down_bytes;
+        metal_graph_dynamic_expert_assign_box(g, il, expert, box_id);
         g->dynamic_expert_used_bytes += missing;
         g->dynamic_expert_promotions++;
         g->layerwise_staging_sticky_experts++;
@@ -11474,6 +11925,10 @@ static bool metal_graph_layerwise_prefill_stage(
     uint32_t staged = 0;
     uint64_t staged_pairs = 0;
     uint64_t staged_bytes = 0;
+    const uint32_t sticky_box_id =
+        (g->layerwise_staging_sticky && g->dynamic_expert_group_eviction)
+            ? metal_graph_dynamic_expert_new_box(g)
+            : 0;
     while (staged < g->layerwise_staging_max_experts) {
         bool found = false;
         uint32_t best = 0;
@@ -11509,6 +11964,7 @@ static bool metal_graph_layerwise_prefill_stage(
         if (metal_graph_layerwise_prefill_stage_expert(g, model, layer, il, best,
                                                        sel, n_tokens,
                                                        async_upload,
+                                                       sticky_box_id,
                                                        &remaining, &one_bytes)) {
             staged++;
             staged_pairs += best_count;
@@ -11524,6 +11980,9 @@ static bool metal_graph_layerwise_prefill_stage(
     g->layerwise_staging_experts += staged;
     g->layerwise_staging_pairs += staged_pairs;
     g->layerwise_staging_bytes += staged_bytes;
+    if (sticky_box_id != 0) {
+        g->dynamic_expert_box_promotions++;
+    }
     if (getenv("DS4_CUDA_LAYERWISE_PREFILL_STAGING_VERBOSE")) {
         fprintf(stderr,
                 "ds4: CUDA layerwise prefill staged layer=%u experts=%u pairs=%llu bytes=%.2f MiB budget=%.2f MiB\n",
@@ -11693,6 +12152,14 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
         (void)metal_graph_layerwise_prefill_sync_uploads(g);
         return false;
     }
+    if (n_cold != 0 &&
+        g->hot_expert_prefill_min_pairs > 1 &&
+        n_hot < g->hot_expert_prefill_min_pairs) {
+        g->hot_expert_prefill_thin_skips++;
+        g->hot_expert_prefill_thin_slots += n_hot;
+        (void)metal_graph_layerwise_prefill_sync_uploads(g);
+        return false;
+    }
 
     const uint64_t x_bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
     const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
@@ -11832,17 +12299,15 @@ static bool metal_graph_cpu_moe_handoff(
     if (decode && n_tokens == 1 &&
         metal_graph_cuda_cpu_moe_hot_decode(g, model, layer, il, ffn_norm,
                                             routed_out, xs, sel, w)) {
-        if (!g->dynamic_expert_eager) {
-            metal_graph_dynamic_expert_observe(g, il, sel, n_tokens, decode);
-        }
+        metal_graph_dynamic_expert_after_layer(g, model, il, sel,
+                                               n_tokens, decode);
         return ds4_gpu_begin_commands() != 0;
     }
     if (!decode &&
         metal_graph_cuda_cpu_moe_hot_prefill(g, model, layer, il, ffn_norm,
                                              routed_out, xs, sel, w, n_tokens)) {
-        if (!g->dynamic_expert_eager) {
-            metal_graph_dynamic_expert_observe(g, il, sel, n_tokens, decode);
-        }
+        metal_graph_dynamic_expert_after_layer(g, model, il, sel,
+                                               n_tokens, decode);
         return ds4_gpu_begin_commands() != 0;
     }
 
@@ -11859,9 +12324,8 @@ static bool metal_graph_cpu_moe_handoff(
         return false;
     }
 
-    if (!g->dynamic_expert_eager) {
-        metal_graph_dynamic_expert_observe(g, il, sel, n_tokens, decode);
-    }
+    metal_graph_dynamic_expert_after_layer(g, model, il, sel,
+                                           n_tokens, decode);
     return ds4_gpu_begin_commands() != 0;
 }
 
@@ -11880,11 +12344,13 @@ static void metal_graph_shrink_cpu_moe_scratch(ds4_gpu_graph *g) {
 static void metal_graph_free(ds4_gpu_graph *g) {
     if (g && g->hot_experts_enabled) {
         fprintf(stderr,
-                "ds4: CUDA hot experts prefill: batches=%llu hot_slots=%llu cold_slots=%llu\n"
+                "ds4: CUDA hot experts prefill: batches=%llu hot_slots=%llu cold_slots=%llu thin_skips=%llu thin_slots=%llu\n"
                 "ds4: CUDA hot experts decode: layers=%llu hot_slots=%llu cold_slots=%llu\n",
                 (unsigned long long)g->hot_expert_prefill_batches,
                 (unsigned long long)g->hot_expert_prefill_slots,
                 (unsigned long long)g->cold_expert_prefill_slots,
+                (unsigned long long)g->hot_expert_prefill_thin_skips,
+                (unsigned long long)g->hot_expert_prefill_thin_slots,
                 (unsigned long long)g->hot_expert_decode_layers,
                 (unsigned long long)g->hot_expert_decode_slots,
                 (unsigned long long)g->cold_expert_decode_slots);
@@ -11910,12 +12376,20 @@ static void metal_graph_free(ds4_gpu_graph *g) {
               g->dynamic_expert_used_bytes != 0 ||
               g->dynamic_expert_promotions != 0 ||
               g->dynamic_expert_evictions != 0 ||
-              g->dynamic_expert_promotion_failures != 0)) {
+              g->dynamic_expert_promotion_failures != 0 ||
+              g->dynamic_expert_predictive_attempts != 0)) {
         fprintf(stderr,
-                "ds4: CUDA dynamic experts: promotions=%llu evictions=%llu failures=%llu used=%.2f/%.2f GiB\n",
+                "ds4: CUDA dynamic experts: promotions=%llu evictions=%llu failures=%llu group_promotions=%llu group_evictions=%llu box_promotions=%llu box_evictions=%llu predictive_attempts=%llu predictive_promotions=%llu predictive_budget_skips=%llu used=%.2f/%.2f GiB\n",
                 (unsigned long long)g->dynamic_expert_promotions,
                 (unsigned long long)g->dynamic_expert_evictions,
                 (unsigned long long)g->dynamic_expert_promotion_failures,
+                (unsigned long long)g->dynamic_expert_group_promotions,
+                (unsigned long long)g->dynamic_expert_group_evictions,
+                (unsigned long long)g->dynamic_expert_box_promotions,
+                (unsigned long long)g->dynamic_expert_box_evictions,
+                (unsigned long long)g->dynamic_expert_predictive_attempts,
+                (unsigned long long)g->dynamic_expert_predictive_promotions,
+                (unsigned long long)g->dynamic_expert_predictive_budget_skips,
                 (double)g->dynamic_expert_used_bytes / 1073741824.0,
                 (double)g->dynamic_expert_budget_bytes / 1073741824.0);
         if (g->gpu_model) {
@@ -12320,6 +12794,7 @@ static bool metal_graph_alloc_raw_cap(
         uint32_t                prefill_cap,
         bool                    enable_mtp) {
     memset(g, 0, sizeof(*g));
+    g->gpu_weights = weights;
     g->mtp_enabled = enable_mtp;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
@@ -17906,10 +18381,17 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
     g->backend = e->backend;
     g->cpu_moe = e->cpu_moe;
     g->gpu_model = &e->model;
+    g->gpu_weights = &e->weights;
     g->cpu_model = e->cpu_moe ? &e->cpu_model : NULL;
     g->dynamic_experts_enabled =
         e->backend == DS4_BACKEND_CUDA && e->cpu_moe && ds4_dynamic_experts_env_enabled();
     g->dynamic_expert_eager = ds4_env_enabled_default("DS4_CUDA_DYNAMIC_EXPERT_EAGER", false);
+    g->dynamic_expert_predictive =
+        g->dynamic_experts_enabled &&
+        ds4_env_enabled_default("DS4_CUDA_DYNAMIC_EXPERT_PREDICTIVE", false);
+    g->dynamic_expert_group_eviction =
+        g->dynamic_experts_enabled &&
+        ds4_env_enabled_default("DS4_CUDA_DYNAMIC_EXPERT_GROUP_EVICTION", false);
     g->layerwise_staging_enabled =
         e->backend == DS4_BACKEND_CUDA && e->cpu_moe &&
         ds4_env_enabled_default("DS4_CUDA_LAYERWISE_PREFILL_STAGING", false);
@@ -17938,6 +18420,12 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
     g->dynamic_expert_min_score = ds4_env_u64_default("DS4_CUDA_DYNAMIC_EXPERT_MIN_SCORE", 32);
     g->dynamic_expert_prefill_weight = ds4_env_u64_default("DS4_CUDA_DYNAMIC_EXPERT_PREFILL_WEIGHT", 1);
     g->dynamic_expert_decode_weight = ds4_env_u64_default("DS4_CUDA_DYNAMIC_EXPERT_DECODE_WEIGHT", 4);
+    g->dynamic_expert_predictive_min_count =
+        ds4_env_u64_default("DS4_CUDA_DYNAMIC_EXPERT_PREDICTIVE_MIN_COUNT",
+                            g->dynamic_expert_min_score);
+    g->dynamic_expert_predictive_hysteresis =
+        ds4_env_u64_default("DS4_CUDA_DYNAMIC_EXPERT_PREDICTIVE_HYSTERESIS",
+                            g->dynamic_expert_predictive_min_count);
     g->dynamic_expert_maintenance_interval =
         ds4_env_u64_default("DS4_CUDA_DYNAMIC_EXPERT_MAINTENANCE_INTERVAL", 16);
     if (g->dynamic_expert_maintenance_interval == 0) g->dynamic_expert_maintenance_interval = 1;
@@ -17945,8 +18433,39 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
         (uint32_t)ds4_env_u64_default("DS4_CUDA_DYNAMIC_EXPERT_MAX_PROMOTIONS", 1);
     g->dynamic_expert_max_evictions =
         (uint32_t)ds4_env_u64_default("DS4_CUDA_DYNAMIC_EXPERT_MAX_EVICTIONS", 4);
+    g->dynamic_expert_group_size =
+        (uint32_t)ds4_env_u64_default("DS4_CUDA_DYNAMIC_EXPERT_GROUP_SIZE", 1);
+    g->dynamic_expert_predictive_lookahead =
+        (uint32_t)ds4_env_u64_default("DS4_CUDA_DYNAMIC_EXPERT_PREDICTIVE_LOOKAHEAD", 2);
+    g->dynamic_expert_predictive_max_promotions =
+        (uint32_t)ds4_env_u64_default("DS4_CUDA_DYNAMIC_EXPERT_PREDICTIVE_MAX_PROMOTIONS", 2);
+    g->dynamic_expert_predictive_group_size =
+        (uint32_t)ds4_env_u64_default("DS4_CUDA_DYNAMIC_EXPERT_PREDICTIVE_GROUP_SIZE",
+                                      g->dynamic_expert_group_size > 1
+                                          ? g->dynamic_expert_group_size
+                                          : 1);
+    g->hot_expert_prefill_min_pairs =
+        (uint32_t)ds4_env_u64_default("DS4_CUDA_HOT_EXPERT_PREFILL_MIN_PAIRS", 1);
     if (g->dynamic_expert_max_promotions > 64) g->dynamic_expert_max_promotions = 64;
     if (g->dynamic_expert_max_evictions > 256) g->dynamic_expert_max_evictions = 256;
+    if (g->dynamic_expert_group_size == 0) {
+        g->dynamic_expert_group_size = 1;
+    }
+    if (g->dynamic_expert_group_size > 64) {
+        g->dynamic_expert_group_size = 64;
+    }
+    if (g->dynamic_expert_predictive_lookahead >= DS4_N_LAYER) {
+        g->dynamic_expert_predictive_lookahead = DS4_N_LAYER - 1;
+    }
+    if (g->dynamic_expert_predictive_max_promotions > 64) {
+        g->dynamic_expert_predictive_max_promotions = 64;
+    }
+    if (g->dynamic_expert_predictive_group_size == 0) {
+        g->dynamic_expert_predictive_group_size = 1;
+    }
+    if (g->dynamic_expert_predictive_group_size > 64) {
+        g->dynamic_expert_predictive_group_size = 64;
+    }
     g->hot_experts_enabled =
         e->hot_experts_enabled || g->dynamic_experts_enabled || g->layerwise_staging_enabled;
     metal_graph_init_route_profile(g);
@@ -17959,7 +18478,7 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
         fprintf(stderr,
                 "ds4: CUDA dynamic experts enabled policy=%s budget=%.2f GiB min_score=%llu "
                 "prefill_weight=%llu decode_weight=%llu maintenance_interval=%llu eager=%s "
-                "max_promotions=%u max_evictions=%u\n",
+                "max_promotions=%u max_evictions=%u group_size=%u box_eviction=%s\n",
                 g->dynamic_expert_policy == DS4_DYNAMIC_EXPERT_POLICY_SCORE ? "score" :
                     (g->dynamic_expert_policy == DS4_DYNAMIC_EXPERT_POLICY_LRU ? "lru" : "append"),
                 (double)g->dynamic_expert_budget_bytes / 1073741824.0,
@@ -17969,7 +18488,27 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
                 (unsigned long long)g->dynamic_expert_maintenance_interval,
                 g->dynamic_expert_eager ? "yes" : "no",
                 g->dynamic_expert_max_promotions,
-                g->dynamic_expert_max_evictions);
+                g->dynamic_expert_max_evictions,
+                g->dynamic_expert_group_size,
+                g->dynamic_expert_group_eviction ? "yes" : "no");
+        if (g->dynamic_expert_predictive) {
+            fprintf(stderr,
+                    "ds4: CUDA predictive dynamic experts enabled lookahead=%u max_promotions=%u min_count=%llu hysteresis=%llu\n",
+                    g->dynamic_expert_predictive_lookahead,
+                    g->dynamic_expert_predictive_max_promotions,
+                    (unsigned long long)g->dynamic_expert_predictive_min_count,
+                    (unsigned long long)g->dynamic_expert_predictive_hysteresis);
+            if (g->dynamic_expert_predictive_group_size > 1) {
+                fprintf(stderr,
+                        "ds4: CUDA predictive dynamic expert grouping enabled group_size=%u\n",
+                        g->dynamic_expert_predictive_group_size);
+            }
+        }
+    }
+    if (g->hot_experts_enabled && g->hot_expert_prefill_min_pairs > 1) {
+        fprintf(stderr,
+                "ds4: CUDA hot expert prefill min_pairs=%u\n",
+                g->hot_expert_prefill_min_pairs);
     }
     if (g->layerwise_staging_enabled) {
         fprintf(stderr,
