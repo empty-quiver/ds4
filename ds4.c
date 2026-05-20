@@ -10620,6 +10620,7 @@ typedef struct {
     bool dynamic_experts_enabled;
     bool dynamic_expert_eager;
     bool layerwise_staging_enabled;
+    bool layerwise_staging_sticky;
     bool dynamic_expert_owned[DS4_N_LAYER][DS4_N_EXPERT];
     bool dynamic_expert_gate_owned[DS4_N_LAYER][DS4_N_EXPERT];
     bool dynamic_expert_up_owned[DS4_N_LAYER][DS4_N_EXPERT];
@@ -10667,6 +10668,8 @@ typedef struct {
     uint64_t layerwise_staging_experts;
     uint64_t layerwise_staging_pairs;
     uint64_t layerwise_staging_bytes;
+    uint64_t layerwise_staging_sticky_experts;
+    uint64_t layerwise_staging_sticky_bytes;
     uint64_t layerwise_staging_failures;
     uint64_t layerwise_staging_budget_skips;
     double layerwise_staging_copy_seconds;
@@ -11317,6 +11320,8 @@ static bool metal_graph_layerwise_prefill_stage_expert(
         const ds4_layer_weights *layer,
         uint32_t                il,
         uint32_t                expert,
+        const int32_t          *current_sel,
+        uint32_t                current_tokens,
         uint64_t               *remaining_budget,
         uint64_t               *staged_bytes_out) {
     if (!g || !model || !layer || !remaining_budget || !staged_bytes_out ||
@@ -11334,6 +11339,12 @@ static bool metal_graph_layerwise_prefill_stage_expert(
                                                                       &up_cached,
                                                                       &down_cached);
     if (missing == UINT64_MAX || missing > *remaining_budget) return false;
+    if (g->layerwise_staging_sticky &&
+        !metal_graph_dynamic_expert_ensure_budget(g, model, missing,
+                                                  current_sel, il,
+                                                  current_tokens)) {
+        return false;
+    }
 
     char label[96];
     bool gate_owned = false;
@@ -11385,9 +11396,12 @@ static bool metal_graph_layerwise_prefill_stage_expert(
     g->layerwise_staged_active = true;
     g->layerwise_staged_layer = il;
     g->layerwise_staged_expert[expert] = true;
-    g->layerwise_staged_gate_owned[expert] = gate_owned;
-    g->layerwise_staged_up_owned[expert] = up_owned;
-    g->layerwise_staged_down_owned[expert] = down_owned;
+    g->layerwise_staged_gate_owned[expert] =
+        g->layerwise_staging_sticky ? false : gate_owned;
+    g->layerwise_staged_up_owned[expert] =
+        g->layerwise_staging_sticky ? false : up_owned;
+    g->layerwise_staged_down_owned[expert] =
+        g->layerwise_staging_sticky ? false : down_owned;
     g->layerwise_staged_gate_offset[expert] = r.gate_offset;
     g->layerwise_staged_up_offset[expert] = r.up_offset;
     g->layerwise_staged_down_offset[expert] = r.down_offset;
@@ -11397,6 +11411,23 @@ static bool metal_graph_layerwise_prefill_stage_expert(
     if (missing <= *remaining_budget) *remaining_budget -= missing;
     g->layerwise_staged_bytes += missing;
     *staged_bytes_out = missing;
+    if (g->layerwise_staging_sticky) {
+        g->hot_expert[il][expert] = true;
+        g->dynamic_expert_owned[il][expert] = gate_owned || up_owned || down_owned;
+        g->dynamic_expert_gate_owned[il][expert] = gate_owned;
+        g->dynamic_expert_up_owned[il][expert] = up_owned;
+        g->dynamic_expert_down_owned[il][expert] = down_owned;
+        g->dynamic_expert_gate_offset[il][expert] = r.gate_offset;
+        g->dynamic_expert_up_offset[il][expert] = r.up_offset;
+        g->dynamic_expert_down_offset[il][expert] = r.down_offset;
+        g->dynamic_expert_gate_bytes[il][expert] = r.gate_bytes;
+        g->dynamic_expert_up_bytes[il][expert] = r.up_bytes;
+        g->dynamic_expert_down_bytes[il][expert] = r.down_bytes;
+        g->dynamic_expert_used_bytes += missing;
+        g->dynamic_expert_promotions++;
+        g->layerwise_staging_sticky_experts++;
+        g->layerwise_staging_sticky_bytes += missing;
+    }
     return true;
 }
 
@@ -11461,6 +11492,7 @@ static bool metal_graph_layerwise_prefill_stage(
         considered[best] = true;
         uint64_t one_bytes = 0;
         if (metal_graph_layerwise_prefill_stage_expert(g, model, layer, il, best,
+                                                       sel, n_tokens,
                                                        &remaining, &one_bytes)) {
             staged++;
             staged_pairs += best_count;
@@ -11822,19 +11854,25 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     }
     if (g && g->layerwise_staging_enabled) {
         fprintf(stderr,
-                "ds4: CUDA layerwise prefill staging: batches=%llu experts=%llu pairs=%llu bytes=%.2f GiB copy=%.3f s failures=%llu budget_skips=%llu\n",
+                "ds4: CUDA layerwise prefill staging: batches=%llu experts=%llu pairs=%llu bytes=%.2f GiB copy=%.3f s sticky_experts=%llu sticky_bytes=%.2f GiB failures=%llu budget_skips=%llu\n",
                 (unsigned long long)g->layerwise_staging_batches,
                 (unsigned long long)g->layerwise_staging_experts,
                 (unsigned long long)g->layerwise_staging_pairs,
                 (double)g->layerwise_staging_bytes / 1073741824.0,
                 g->layerwise_staging_copy_seconds,
+                (unsigned long long)g->layerwise_staging_sticky_experts,
+                (double)g->layerwise_staging_sticky_bytes / 1073741824.0,
                 (unsigned long long)g->layerwise_staging_failures,
                 (unsigned long long)g->layerwise_staging_budget_skips);
         if (g->gpu_model) {
             metal_graph_layerwise_prefill_release_staged(g, g->gpu_model);
         }
     }
-    if (g && g->dynamic_experts_enabled) {
+    if (g && (g->dynamic_experts_enabled ||
+              g->dynamic_expert_used_bytes != 0 ||
+              g->dynamic_expert_promotions != 0 ||
+              g->dynamic_expert_evictions != 0 ||
+              g->dynamic_expert_promotion_failures != 0)) {
         fprintf(stderr,
                 "ds4: CUDA dynamic experts: promotions=%llu evictions=%llu failures=%llu used=%.2f/%.2f GiB\n",
                 (unsigned long long)g->dynamic_expert_promotions,
@@ -17837,6 +17875,9 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
     g->layerwise_staging_enabled =
         e->backend == DS4_BACKEND_CUDA && e->cpu_moe &&
         accelerator_cuda_env_enabled("DS4_CUDA_LAYERWISE_PREFILL_STAGING");
+    g->layerwise_staging_sticky =
+        g->layerwise_staging_enabled &&
+        accelerator_cuda_env_enabled("DS4_CUDA_LAYERWISE_PREFILL_STAGING_STICKY");
     g->dynamic_expert_policy = ds4_dynamic_expert_policy_from_env();
     g->dynamic_expert_budget_bytes = ds4_env_bytes_default(
         "DS4_CUDA_DYNAMIC_EXPERT_CACHE_GB",
@@ -17891,10 +17932,11 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
     }
     if (g->layerwise_staging_enabled) {
         fprintf(stderr,
-                "ds4: CUDA layerwise prefill staging enabled budget=%.2f GiB min_pairs=%u max_experts=%u\n",
+                "ds4: CUDA layerwise prefill staging enabled budget=%.2f GiB min_pairs=%u max_experts=%u sticky=%s\n",
                 (double)g->layerwise_staging_budget_bytes / 1073741824.0,
                 g->layerwise_staging_min_pairs,
-                g->layerwise_staging_max_experts);
+                g->layerwise_staging_max_experts,
+                g->layerwise_staging_sticky ? "yes" : "no");
     }
 }
 

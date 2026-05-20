@@ -839,6 +839,22 @@ those staged pairs through the cached CUDA MoE path, and leaves the remaining
 cold pairs on CPU-MoE. The staged ranges are released at the next CUDA
 synchronization point.
 
+To keep staged experts resident for later chunks or subsequent requests, enable
+sticky staging:
+
+```sh
+DS4_CUDA_LAYERWISE_PREFILL_STAGING=1 \
+DS4_CUDA_LAYERWISE_PREFILL_STAGING_STICKY=1 \
+DS4_CUDA_DYNAMIC_EXPERT_CACHE_GB=2 \
+DS4_CUDA_DYNAMIC_EXPERT_POLICY=lru \
+./ds4 --cuda --cpu-moe -p "Hello"
+```
+
+Sticky staged experts are promoted into the dynamic CUDA expert ownership table
+instead of being released after the layer. Future prefill/decode passes can use
+them as normal resident hot experts, and the staging pass only needs to copy the
+new delta that is not already in VRAM.
+
 For 4090-class hybrid runs, add `DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1` to fail
 startup if any non-routed dense candidate cannot be cached in VRAM. This still
 allows optional routed expert candidates to be skipped when the VRAM budget is
@@ -855,6 +871,7 @@ Useful controls:
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MB` or `DS4_CUDA_LAYERWISE_PREFILL_STAGING_GB`
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MIN_PAIRS`
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MAX_EXPERTS`
+* `DS4_CUDA_LAYERWISE_PREFILL_STAGING_STICKY=1`
 * `DS4_CUDA_WEIGHT_CACHE_VERBOSE=1`
 * `DS4_CUDA_STRICT_WEIGHT_CACHE=1`
 
