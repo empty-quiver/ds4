@@ -855,6 +855,27 @@ instead of being released after the layer. Future prefill/decode passes can use
 them as normal resident hot experts, and the staging pass only needs to copy the
 new delta that is not already in VRAM.
 
+Decode can use a separate dynamic expert scoring policy from prefill. This is
+useful because decode sees one token per layer and can become very sensitive to
+cache churn. By default, decode uses the normal score, interval, promotion
+count, and group size, but it does not evict resident experts while promoting
+new decode hits. Enable eager decode observation when you want the current
+token's selected experts to become promotion candidates before the hot/cold
+split for that layer:
+
+```sh
+DS4_CUDA_DYNAMIC_EXPERT_DECODE_EAGER=1 \
+DS4_CUDA_DYNAMIC_EXPERT_DECODE_MIN_SCORE=8 \
+DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAINTENANCE_INTERVAL=1 \
+DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAX_PROMOTIONS=4 \
+DS4_CUDA_DYNAMIC_EXPERT_DECODE_GROUP_SIZE=4 \
+./ds4 --cuda --cpu-moe -p "Hello"
+```
+
+`DS4_CUDA_DYNAMIC_EXPERT_DECODE_EVICT=1` allows decode promotions to evict
+existing dynamic experts. On 4090-class hybrid runs this is usually too
+aggressive unless you are deliberately testing churn.
+
 `DS4_CUDA_LAYERWISE_PREFILL_STAGING_OVERLAP=1` issues staged expert uploads on a
 separate CUDA upload stream and waits for them only after CPU-MoE has computed
 the remaining cold pairs. This is experimental; it is useful for measuring
@@ -878,6 +899,32 @@ Useful controls:
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_MAX_EXPERTS`
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_STICKY=1`
 * `DS4_CUDA_LAYERWISE_PREFILL_STAGING_OVERLAP=1`
+* `DS4_CUDA_DYNAMIC_EXPERT_DECODE_EAGER=1`
+* `DS4_CUDA_DYNAMIC_EXPERT_DECODE_EVICT=1`
+* `DS4_CUDA_DYNAMIC_EXPERT_DECODE_MIN_SCORE`
+* `DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAINTENANCE_INTERVAL`
+* `DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAX_PROMOTIONS`
+* `DS4_CUDA_DYNAMIC_EXPERT_DECODE_GROUP_SIZE`
+
+For server-shaped cache-policy tests, use
+`scripts/bench_server_decode_cache.py`. It launches `ds4-server`, sends related
+OpenAI-compatible chat requests with a long shared prefix, optionally enables
+disk KV cache, and prints per-request JSON timing while preserving the server's
+shutdown diagnostics:
+
+```sh
+scripts/bench_server_decode_cache.py \
+  --binary ./ds4-server \
+  --model-path /path/to/deepseek-v4-flash.gguf \
+  --prompt-file tests/test-vectors/prompts/long_memory_archive.txt \
+  --ctx 8192 \
+  --threads 16 \
+  --requests 2 \
+  --max-tokens 128 \
+  --kv-disk-dir /tmp/ds4-fixture-kv \
+  --kv-disk-space-mb 2048 \
+  --server-log /tmp/ds4-server-decode-cache.log
+```
 * `DS4_CUDA_WEIGHT_CACHE_VERBOSE=1`
 * `DS4_CUDA_STRICT_WEIGHT_CACHE=1`
 
