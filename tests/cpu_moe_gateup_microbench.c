@@ -54,7 +54,7 @@ static void bench_fill_q8_rows(block_q8_K *rows, uint32_t n_rows, uint32_t dim, 
     free(tmp);
 }
 
-static void bench_iq2_pair_panel4(
+static DS4_MAYBE_UNUSED void bench_iq2_pair_panel4(
         int n,
         float out0[4],
         float out1[4],
@@ -221,15 +221,15 @@ static double bench_panel4(
             for (; p + 3 < pairs; p += 4) {
                 float g[4];
                 float u[4];
-                bench_iq2_pair_panel4((int)(blocks * QK_K),
-                                      g,
-                                      u,
-                                      gate_row,
-                                      up_row,
-                                      xq + (uint64_t)(p + 0) * blocks,
-                                      xq + (uint64_t)(p + 1) * blocks,
-                                      xq + (uint64_t)(p + 2) * blocks,
-                                      xq + (uint64_t)(p + 3) * blocks);
+                ds4_vec_dot_iq2_xxs_pair_panel4_q8_K((int)(blocks * QK_K),
+                                                      g,
+                                                      u,
+                                                      gate_row,
+                                                      up_row,
+                                                      xq + (uint64_t)(p + 0) * blocks,
+                                                      xq + (uint64_t)(p + 1) * blocks,
+                                                      xq + (uint64_t)(p + 2) * blocks,
+                                                      xq + (uint64_t)(p + 3) * blocks);
                 for (uint32_t k = 0; k < 4; k++) {
                     gate_out[(uint64_t)r * pairs + p + k] = g[k];
                     up_out[(uint64_t)r * pairs + p + k] = u[k];
