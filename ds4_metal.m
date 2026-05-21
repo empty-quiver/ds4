@@ -3921,6 +3921,15 @@ int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count)
     return 1;
 }
 
+void *ds4_gpu_host_alloc(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    return malloc((size_t)bytes);
+}
+
+void ds4_gpu_host_free(void *ptr) {
+    free(ptr);
+}
+
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || (!data && bytes != 0)) return 0;
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
@@ -3938,6 +3947,18 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
     if (bytes != 0) {
         memcpy(data, (const uint8_t *)[obj.buffer contents] + obj.offset + offset, (size_t)bytes);
     }
+    return 1;
+}
+
+int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+    return ds4_gpu_tensor_write(tensor, offset, data, bytes);
+}
+
+int ds4_gpu_tensor_read_async(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
+    return ds4_gpu_tensor_read(tensor, offset, data, bytes);
+}
+
+int ds4_gpu_wait_transfer(void) {
     return 1;
 }
 

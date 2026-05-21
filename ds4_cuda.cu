@@ -83,6 +83,7 @@ static uint64_t g_model_file_size;
 static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
+static cudaEvent_t g_tensor_transfer_event;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
@@ -1659,6 +1660,10 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    if (g_tensor_transfer_event) {
+        (void)cudaEventDestroy(g_tensor_transfer_event);
+        g_tensor_transfer_event = NULL;
+    }
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
         g_cublas_ready = 0;
@@ -1821,6 +1826,29 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint
     return cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
 }
 
+static int cuda_tensor_transfer_event_ensure(void) {
+    if (g_tensor_transfer_event) return 1;
+    return cuda_ok(cudaEventCreateWithFlags(&g_tensor_transfer_event, cudaEventDisableTiming),
+                   "tensor transfer event create");
+}
+
+extern "C" void *ds4_gpu_host_alloc(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    void *ptr = NULL;
+    cudaError_t err = cudaMallocHost(&ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA pinned host allocation failed for %.2f MiB: %s\n",
+                (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    return ptr;
+}
+
+extern "C" void ds4_gpu_host_free(void *ptr) {
+    if (ptr) (void)cudaFreeHost(ptr);
+}
+
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
@@ -1829,6 +1857,37 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
+}
+
+extern "C" int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+    if (!tensor || (!data && bytes != 0) || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    if (bytes == 0) return 1;
+    if (!cuda_tensor_transfer_event_ensure()) return 0;
+    cudaError_t err = cudaMemcpyAsync((char *)tensor->ptr + offset,
+                                      data,
+                                      (size_t)bytes,
+                                      cudaMemcpyHostToDevice,
+                                      0);
+    if (!cuda_ok(err, "tensor async write")) return 0;
+    return cuda_ok(cudaEventRecord(g_tensor_transfer_event, 0), "tensor async write event");
+}
+
+extern "C" int ds4_gpu_tensor_read_async(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
+    if (!tensor || (!data && bytes != 0) || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    if (bytes == 0) return 1;
+    if (!cuda_tensor_transfer_event_ensure()) return 0;
+    cudaError_t err = cudaMemcpyAsync(data,
+                                      (const char *)tensor->ptr + offset,
+                                      (size_t)bytes,
+                                      cudaMemcpyDeviceToHost,
+                                      0);
+    if (!cuda_ok(err, "tensor async read")) return 0;
+    return cuda_ok(cudaEventRecord(g_tensor_transfer_event, 0), "tensor async read event");
+}
+
+extern "C" int ds4_gpu_wait_transfer(void) {
+    if (!g_tensor_transfer_event) return 1;
+    return cuda_ok(cudaEventSynchronize(g_tensor_transfer_event), "tensor transfer wait");
 }
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,

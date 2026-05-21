@@ -11808,11 +11808,18 @@ static void metal_graph_free_route_profile(ds4_gpu_graph *g) {
     g->route_profile_prefill_tokens = 0;
 }
 
+static void *metal_graph_realloc_cpu_moe_host(void *ptr, uint64_t bytes) {
+    void *new_ptr = ds4_gpu_host_alloc(bytes);
+    if (!new_ptr) ds4_die("out of pinned CPU-MoE host memory");
+    ds4_gpu_host_free(ptr);
+    return new_ptr;
+}
+
 static void metal_graph_free_cpu_moe_scratch(ds4_gpu_graph *g) {
-    free(g->cpu_moe_out_host);
-    free(g->cpu_moe_weight_host);
-    free(g->cpu_moe_selected_host);
-    free(g->cpu_moe_ffn_norm_host);
+    ds4_gpu_host_free(g->cpu_moe_out_host);
+    ds4_gpu_host_free(g->cpu_moe_weight_host);
+    ds4_gpu_host_free(g->cpu_moe_selected_host);
+    ds4_gpu_host_free(g->cpu_moe_ffn_norm_host);
     free(g->cpu_moe_pair_ids);
     free(g->cpu_moe_hot_pair_ids);
     free(g->cpu_moe_cold_pair_ids);
@@ -11863,18 +11870,22 @@ static bool metal_graph_ensure_cpu_moe_scratch(ds4_gpu_graph *g, uint32_t n_toke
     g->cpu_moe_cold_pair_ids = xrealloc(g->cpu_moe_cold_pair_ids,
                                         (size_t)total_pairs * sizeof(*g->cpu_moe_cold_pair_ids));
     if (g->backend == DS4_BACKEND_CUDA) {
-        g->cpu_moe_ffn_norm_host = xrealloc(g->cpu_moe_ffn_norm_host,
-                                            (size_t)((uint64_t)cap * DS4_N_EMBD) *
-                                            sizeof(*g->cpu_moe_ffn_norm_host));
-        g->cpu_moe_selected_host = xrealloc(g->cpu_moe_selected_host,
-                                            (size_t)total_pairs *
-                                            sizeof(*g->cpu_moe_selected_host));
-        g->cpu_moe_weight_host = xrealloc(g->cpu_moe_weight_host,
-                                          (size_t)total_pairs *
-                                          sizeof(*g->cpu_moe_weight_host));
-        g->cpu_moe_out_host = xrealloc(g->cpu_moe_out_host,
-                                       (size_t)((uint64_t)cap * DS4_N_EMBD) *
-                                       sizeof(*g->cpu_moe_out_host));
+        g->cpu_moe_ffn_norm_host =
+            metal_graph_realloc_cpu_moe_host(g->cpu_moe_ffn_norm_host,
+                                             (uint64_t)cap * DS4_N_EMBD *
+                                             sizeof(*g->cpu_moe_ffn_norm_host));
+        g->cpu_moe_selected_host =
+            metal_graph_realloc_cpu_moe_host(g->cpu_moe_selected_host,
+                                             total_pairs *
+                                             sizeof(*g->cpu_moe_selected_host));
+        g->cpu_moe_weight_host =
+            metal_graph_realloc_cpu_moe_host(g->cpu_moe_weight_host,
+                                             total_pairs *
+                                             sizeof(*g->cpu_moe_weight_host));
+        g->cpu_moe_out_host =
+            metal_graph_realloc_cpu_moe_host(g->cpu_moe_out_host,
+                                             (uint64_t)cap * DS4_N_EMBD *
+                                             sizeof(*g->cpu_moe_out_host));
     }
     g->cpu_moe_tok_cap = cap;
     return true;
@@ -13159,8 +13170,9 @@ static bool metal_graph_cuda_cpu_moe_hot_decode(
     if (n_cold != 0) {
         if (!xs) {
             const double read_t0 = now_sec();
-            if (ds4_gpu_tensor_read(ffn_norm, 0, g->cpu_moe_ffn_norm_host,
-                                    (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
+            if (ds4_gpu_tensor_read_async(ffn_norm, 0, g->cpu_moe_ffn_norm_host,
+                                          (uint64_t)DS4_N_EMBD * sizeof(float)) == 0 ||
+                ds4_gpu_wait_transfer() == 0) {
                 return false;
             }
             g->hybrid_decode_read_seconds += now_sec() - read_t0;
@@ -13219,8 +13231,8 @@ static bool metal_graph_cuda_cpu_moe_hot_decode(
         g->hybrid_decode_cpu_seconds += now_sec() - cpu_t0;
 
         const double upload_t0 = now_sec();
-        if (ds4_gpu_tensor_write(g->cpu_moe_cold_out, 0, g->cpu_moe_out_host,
-                                 (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
+        if (ds4_gpu_tensor_write_async(g->cpu_moe_cold_out, 0, g->cpu_moe_out_host,
+                                       (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
             (void)ds4_gpu_end_commands();
             return false;
         }
@@ -13431,8 +13443,9 @@ static bool metal_graph_cpu_moe_handoff(
         }
         const double read_t0 = cuda_decode ? now_sec() : 0.0;
         if (decode) {
-            if (ds4_gpu_tensor_read(router_selected, 0, g->cpu_moe_selected_host, sel_bytes) == 0 ||
-                ds4_gpu_tensor_read(router_weights, 0, g->cpu_moe_weight_host, weight_bytes) == 0) {
+            if (ds4_gpu_tensor_read_async(router_selected, 0, g->cpu_moe_selected_host, sel_bytes) == 0 ||
+                ds4_gpu_tensor_read_async(router_weights, 0, g->cpu_moe_weight_host, weight_bytes) == 0 ||
+                ds4_gpu_wait_transfer() == 0) {
                 return false;
             }
         } else {
@@ -13493,7 +13506,8 @@ static bool metal_graph_cpu_moe_handoff(
 
     if (cuda_decode && !xs) {
         const double read_t0 = now_sec();
-        if (ds4_gpu_tensor_read(ffn_norm, 0, g->cpu_moe_ffn_norm_host, x_bytes) == 0) {
+        if (ds4_gpu_tensor_read_async(ffn_norm, 0, g->cpu_moe_ffn_norm_host, x_bytes) == 0 ||
+            ds4_gpu_wait_transfer() == 0) {
             return false;
         }
         g->hybrid_decode_read_seconds += now_sec() - read_t0;
@@ -13522,7 +13536,10 @@ static bool metal_graph_cpu_moe_handoff(
 
     if (cuda_backend) {
         const double upload_t0 = cuda_decode ? now_sec() : 0.0;
-        if (ds4_gpu_tensor_write(routed_out, 0, out, x_bytes) == 0) {
+        const int write_ok = cuda_decode
+            ? ds4_gpu_tensor_write_async(routed_out, 0, out, x_bytes)
+            : ds4_gpu_tensor_write(routed_out, 0, out, x_bytes);
+        if (write_ok == 0) {
             return false;
         }
         if (cuda_decode) {
