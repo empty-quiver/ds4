@@ -2703,6 +2703,102 @@ static void ds4_vec_dot_q2_K_panel4_q8_K(
 #endif
 }
 
+static void ds4_vec_dot_q2_K_panel2_q8_K(
+        int n,
+        float out[2],
+        const block_q2_K *x,
+        const block_q8_K *y0,
+        const block_q8_K *y1) {
+#if defined(__AVX2__)
+    const int nb = n / QK_K;
+    const block_q8_K *ys[2] = { y0, y1 };
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    __m256 acc[2] = {
+        _mm256_setzero_ps(), _mm256_setzero_ps(),
+    };
+
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *q2 = x[i].qs;
+        const __m128i mins_and_scales = _mm_loadu_si128((const __m128i *)x[i].scales);
+        const __m128i scales8 = _mm_and_si128(mins_and_scales, m4);
+        const __m128i mins8 = _mm_and_si128(_mm_srli_epi16(mins_and_scales, 4), m4);
+        const __m256i mins = _mm256_cvtepi8_epi16(mins8);
+        const __m256i all_scales = _mm256_cvtepi8_epi16(scales8);
+        const __m128i l_scales = _mm256_extracti128_si256(all_scales, 0);
+        const __m128i h_scales = _mm256_extracti128_si256(all_scales, 1);
+        const __m256i scales[2] = {
+            DS4_MM256_SET_M128I(l_scales, l_scales),
+            DS4_MM256_SET_M128I(h_scales, h_scales),
+        };
+        __m256i sumi[2] = {
+            _mm256_setzero_si256(), _mm256_setzero_si256(),
+        };
+        const float xd = f16_to_f32(x[i].d);
+        const float xmin = f16_to_f32(x[i].dmin);
+
+        for (int p = 0; p < 2; p++) {
+            const float dmin = -ys[p][i].d * xmin;
+            const __m256i min_prod = _mm256_madd_epi16(
+                    mins, _mm256_loadu_si256((const __m256i *)ys[p][i].bsums));
+            acc[p] = ds4_mm256_fmadd_ps(_mm256_broadcast_ss(&dmin),
+                                        _mm256_cvtepi32_ps(min_prod),
+                                        acc[p]);
+        }
+
+        const int8_t *q8[2] = { ys[0][i].qs, ys[1][i].qs };
+        for (int j = 0; j < QK_K / 128; j++) {
+            const __m256i q2bits = _mm256_loadu_si256((const __m256i *)q2);
+            q2 += 32;
+
+            const __m256i q2_0 = _mm256_and_si256(q2bits, m3);
+            const __m256i q2_1 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 2), m3);
+            const __m256i q2_2 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 4), m3);
+            const __m256i q2_3 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 6), m3);
+            const __m256i s0 = _mm256_shuffle_epi8(scales[j], ds4_q2_k_scale_shuffle(0));
+            const __m256i s1 = _mm256_shuffle_epi8(scales[j], ds4_q2_k_scale_shuffle(1));
+            const __m256i s2 = _mm256_shuffle_epi8(scales[j], ds4_q2_k_scale_shuffle(2));
+            const __m256i s3 = _mm256_shuffle_epi8(scales[j], ds4_q2_k_scale_shuffle(3));
+
+            for (int p = 0; p < 2; p++) {
+                const __m256i q8_0 = _mm256_loadu_si256((const __m256i *)q8[p]); q8[p] += 32;
+                const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8[p]); q8[p] += 32;
+                const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8[p]); q8[p] += 32;
+                const __m256i q8_3 = _mm256_loadu_si256((const __m256i *)q8[p]); q8[p] += 32;
+
+                __m256i p0 = _mm256_maddubs_epi16(q2_0, q8_0);
+                __m256i p1 = _mm256_maddubs_epi16(q2_1, q8_1);
+                __m256i p2 = _mm256_maddubs_epi16(q2_2, q8_2);
+                __m256i p3 = _mm256_maddubs_epi16(q2_3, q8_3);
+
+                p0 = _mm256_madd_epi16(s0, p0);
+                p1 = _mm256_madd_epi16(s1, p1);
+                p2 = _mm256_madd_epi16(s2, p2);
+                p3 = _mm256_madd_epi16(s3, p3);
+
+                p0 = _mm256_add_epi32(p0, p1);
+                p2 = _mm256_add_epi32(p2, p3);
+                sumi[p] = _mm256_add_epi32(sumi[p], _mm256_add_epi32(p0, p2));
+            }
+        }
+
+        for (int p = 0; p < 2; p++) {
+            const float d = ys[p][i].d * xd;
+            acc[p] = ds4_mm256_fmadd_ps(_mm256_broadcast_ss(&d),
+                                        _mm256_cvtepi32_ps(sumi[p]),
+                                        acc[p]);
+        }
+    }
+
+    for (int p = 0; p < 2; p++) {
+        out[p] = ds4_hsum_float_8(acc[p]);
+    }
+#else
+    ds4_vec_dot_q2_K_q8_K(n, out + 0, x, y0);
+    ds4_vec_dot_q2_K_q8_K(n, out + 1, x, y1);
+#endif
+}
+
 static DS4_MAYBE_UNUSED void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const block_q8_K *y) {
     const int nb = n / QK_K;
 
@@ -3230,6 +3326,116 @@ static void ds4_vec_dot_iq2_xxs_pair_panel4_q8_K(
     ds4_vec_dot_iq2_xxs_pair_q8_K(n, out0 + 1, out1 + 1, x0, x1, y1);
     ds4_vec_dot_iq2_xxs_pair_q8_K(n, out0 + 2, out1 + 2, x0, x1, y2);
     ds4_vec_dot_iq2_xxs_pair_q8_K(n, out0 + 3, out1 + 3, x0, x1, y3);
+#endif
+}
+
+static void ds4_vec_dot_iq2_xxs_pair_panel2_q8_K(
+        int n,
+        float out0[2],
+        float out1[2],
+        const block_iq2_xxs *x0,
+        const block_iq2_xxs *x1,
+        const block_q8_K *y0,
+        const block_q8_K *y1) {
+#if defined(__AVX2__)
+    const int nb = n / QK_K;
+    const block_q8_K *ys[2] = { y0, y1 };
+    __m256 accum0[2] = {
+        _mm256_setzero_ps(), _mm256_setzero_ps(),
+    };
+    __m256 accum1[2] = {
+        _mm256_setzero_ps(), _mm256_setzero_ps(),
+    };
+
+    for (int i = 0; i < nb; i++) {
+        const float x0d = f16_to_f32(x0[i].d);
+        const float x1d = f16_to_f32(x1[i].d);
+        const uint16_t *q20 = x0[i].qs;
+        const uint16_t *q21 = x1[i].qs;
+        const int8_t *q8[2] = { ys[0][i].qs, ys[1][i].qs };
+        __m256i sumi01[2] = {
+            _mm256_setzero_si256(), _mm256_setzero_si256(),
+        };
+        __m256i sumi02[2] = {
+            _mm256_setzero_si256(), _mm256_setzero_si256(),
+        };
+        __m256i sumi11[2] = {
+            _mm256_setzero_si256(), _mm256_setzero_si256(),
+        };
+        __m256i sumi12[2] = {
+            _mm256_setzero_si256(), _mm256_setzero_si256(),
+        };
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            __m256i q8_1[2];
+            __m256i q8_2[2];
+            for (int p = 0; p < 2; p++) {
+                q8_1[p] = _mm256_loadu_si256((const __m256i *)q8[p]);
+                q8[p] += 32;
+                q8_2[p] = _mm256_loadu_si256((const __m256i *)q8[p]);
+                q8[p] += 32;
+            }
+
+#define DS4_IQ2_PANEL2_ACCUM(q2_ptr, accum_a, accum_b) do {                            \
+                uint32_t aux32[4];                                                     \
+                memcpy(aux32, (q2_ptr), sizeof(aux32));                                \
+                (q2_ptr) += 8;                                                         \
+                const uint8_t *aux8 = (const uint8_t *)aux32;                          \
+                const __m256i q2_1 = _mm256_set_epi64x(                                \
+                    iq2xxs_grid[aux8[3]], iq2xxs_grid[aux8[2]],                       \
+                    iq2xxs_grid[aux8[1]], iq2xxs_grid[aux8[0]]);                      \
+                const __m256i q2_2 = _mm256_set_epi64x(                                \
+                    iq2xxs_grid[aux8[11]], iq2xxs_grid[aux8[10]],                     \
+                    iq2xxs_grid[aux8[9]],  iq2xxs_grid[aux8[8]]);                     \
+                const __m256i s2_1 = _mm256_set_epi64x(                                \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >> 21) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >> 14) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >>  7) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >>  0) & 127]));       \
+                const __m256i s2_2 = _mm256_set_epi64x(                                \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >> 21) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >> 14) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >>  7) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >>  0) & 127]));       \
+                const uint16_t ls1 = (uint16_t)(aux32[1] >> 28);                       \
+                const uint16_t ls2 = (uint16_t)(aux32[3] >> 28);                       \
+                const __m256i scale1 = _mm256_set1_epi16((int16_t)(2 * ls1 + 1));      \
+                const __m256i scale2 = _mm256_set1_epi16((int16_t)(2 * ls2 + 1));      \
+                for (int bp = 0; bp < 2; bp++) {                                      \
+                    const __m256i dot1 = _mm256_maddubs_epi16(                         \
+                        q2_1, _mm256_sign_epi8(q8_1[bp], s2_1));                      \
+                    const __m256i dot2 = _mm256_maddubs_epi16(                         \
+                        q2_2, _mm256_sign_epi8(q8_2[bp], s2_2));                      \
+                    (accum_a)[bp] = _mm256_add_epi32((accum_a)[bp],                    \
+                        _mm256_madd_epi16(dot1, scale1));                             \
+                    (accum_b)[bp] = _mm256_add_epi32((accum_b)[bp],                    \
+                        _mm256_madd_epi16(dot2, scale2));                             \
+                }                                                                      \
+            } while (0)
+
+            DS4_IQ2_PANEL2_ACCUM(q20, sumi01, sumi02);
+            DS4_IQ2_PANEL2_ACCUM(q21, sumi11, sumi12);
+
+#undef DS4_IQ2_PANEL2_ACCUM
+        }
+
+        for (int p = 0; p < 2; p++) {
+            accum0[p] = ds4_mm256_fmadd_ps(_mm256_set1_ps(x0d * ys[p][i].d),
+                                           _mm256_cvtepi32_ps(_mm256_add_epi32(sumi01[p], sumi02[p])),
+                                           accum0[p]);
+            accum1[p] = ds4_mm256_fmadd_ps(_mm256_set1_ps(x1d * ys[p][i].d),
+                                           _mm256_cvtepi32_ps(_mm256_add_epi32(sumi11[p], sumi12[p])),
+                                           accum1[p]);
+        }
+    }
+
+    for (int p = 0; p < 2; p++) {
+        out0[p] = 0.125f * ds4_hsum_float_8(accum0[p]);
+        out1[p] = 0.125f * ds4_hsum_float_8(accum1[p]);
+    }
+#else
+    ds4_vec_dot_iq2_xxs_pair_q8_K(n, out0 + 0, out1 + 0, x0, x1, y0);
+    ds4_vec_dot_iq2_xxs_pair_q8_K(n, out0 + 1, out1 + 1, x0, x1, y1);
 #endif
 }
 
@@ -5415,6 +5621,35 @@ static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t
             }
         }
 
+        for (; i + 1 < end; i += 2) {
+            const uint32_t pair_id0 = ctx->pair_ids[i + 0];
+            const uint32_t pair_id1 = ctx->pair_ids[i + 1];
+            const block_q8_K *xq0 = ctx->xq + (uint64_t)(pair_id0 / DS4_N_EXPERT_USED) * ctx->xq_blocks;
+            const block_q8_K *xq1 = ctx->xq + (uint64_t)(pair_id1 / DS4_N_EXPERT_USED) * ctx->xq_blocks;
+            float gate[2];
+            float up[2];
+
+            ds4_vec_dot_iq2_xxs_pair_panel2_q8_K((int)ctx->in_dim,
+                                                 gate,
+                                                 up,
+                                                 gate_row,
+                                                 up_row,
+                                                 xq0,
+                                                 xq1);
+
+            const uint32_t pair_ids[2] = { pair_id0, pair_id1 };
+            for (uint32_t k = 0; k < 2; k++) {
+                if (ctx->clamp > 1.0e-6f) {
+                    if (gate[k] > ctx->clamp) gate[k] = ctx->clamp;
+                    if (up[k] > ctx->clamp) up[k] = ctx->clamp;
+                    if (up[k] < -ctx->clamp) up[k] = -ctx->clamp;
+                }
+                const uint32_t pair_id = pair_ids[k];
+                ctx->mid[(uint64_t)pair_id * ctx->out_dim + row] =
+                    silu(gate[k]) * up[k] * ctx->pair_weight[pair_id];
+            }
+        }
+
         for (; i < end; i++) {
             const uint32_t pair_id = ctx->pair_ids[i];
             const uint32_t token = pair_id / DS4_N_EXPERT_USED;
@@ -5554,6 +5789,26 @@ static void matvec_q2_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint6
 
                 const uint32_t pair_ids[4] = { pair_id0, pair_id1, pair_id2, pair_id3 };
                 for (uint32_t k = 0; k < 4; k++) {
+                    const uint32_t token = pair_ids[k] / DS4_N_EXPERT_USED;
+                    ctx->moe[(uint64_t)token * ctx->out_dim + row] += v[k];
+                }
+            }
+
+            for (; i + 1 < end; i += 2) {
+                const uint32_t pair_id0 = ctx->pair_ids[i + 0];
+                const uint32_t pair_id1 = ctx->pair_ids[i + 1];
+                const block_q8_K *xq0 = ctx->midq + (uint64_t)pair_id0 * ctx->midq_blocks;
+                const block_q8_K *xq1 = ctx->midq + (uint64_t)pair_id1 * ctx->midq_blocks;
+                float v[2];
+
+                ds4_vec_dot_q2_K_panel2_q8_K((int)ctx->in_dim,
+                                             v,
+                                             br,
+                                             xq0,
+                                             xq1);
+
+                const uint32_t pair_ids[2] = { pair_id0, pair_id1 };
+                for (uint32_t k = 0; k < 2; k++) {
                     const uint32_t token = pair_ids[k] / DS4_N_EXPERT_USED;
                     ctx->moe[(uint64_t)token * ctx->out_dim + row] += v[k];
                 }
@@ -5714,6 +5969,38 @@ typedef struct {
 
 static ds4_cpu_moe_timing_stats g_cpu_moe_timing;
 
+typedef struct {
+    uint64_t calls;
+    uint64_t pairs;
+    uint64_t expert_groups;
+    uint64_t panel4_groups;
+    uint64_t rem_groups[4];
+    uint64_t current_scalar_tail_pairs;
+    uint64_t panel2_candidate_pairs;
+    uint64_t scalar_tail_pairs_after_panel2;
+} ds4_cpu_moe_tail_stats;
+
+static ds4_cpu_moe_tail_stats g_cpu_moe_tail[2];
+
+static void ds4_cpu_moe_record_tail_profile(bool selected_pairs, const uint32_t *expert_offset) {
+    if (getenv("DS4_CPU_MOE_TAIL_PROFILE") == NULL) return;
+
+    ds4_cpu_moe_tail_stats *stats = &g_cpu_moe_tail[selected_pairs ? 1 : 0];
+    stats->calls++;
+    for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+        const uint32_t n = expert_offset[expert + 1] - expert_offset[expert];
+        if (n == 0) continue;
+        const uint32_t rem = n & 3u;
+        stats->pairs += n;
+        stats->expert_groups++;
+        stats->panel4_groups += n >> 2;
+        stats->rem_groups[rem]++;
+        stats->current_scalar_tail_pairs += rem;
+        stats->panel2_candidate_pairs += rem >= 2 ? 2u : 0u;
+        stats->scalar_tail_pairs_after_panel2 += rem & 1u;
+    }
+}
+
 static void ds4_cpu_moe_record_timing(
         bool     selected_pairs,
         uint64_t pairs,
@@ -5747,7 +6034,29 @@ static void ds4_cpu_moe_print_timing(void) {
             g_cpu_moe_timing.gate_up_seconds,
             g_cpu_moe_timing.midq_seconds,
             g_cpu_moe_timing.down_seconds);
+    for (uint32_t i = 0; i < 2; i++) {
+        const ds4_cpu_moe_tail_stats *stats = &g_cpu_moe_tail[i];
+        if (stats->calls == 0) continue;
+        const double pct = stats->pairs ?
+            100.0 * (double)stats->panel2_candidate_pairs / (double)stats->pairs : 0.0;
+        fprintf(stderr,
+                "ds4: CPU-MoE tail profile %s: calls=%llu pairs=%llu expert_groups=%llu panel4_groups=%llu rem0=%llu rem1=%llu rem2=%llu rem3=%llu scalar_tail_pairs=%llu panel2_candidate_pairs=%llu scalar_after_panel2=%llu candidate_pct=%.3f%%\n",
+                i ? "selected-pair" : "batch",
+                (unsigned long long)stats->calls,
+                (unsigned long long)stats->pairs,
+                (unsigned long long)stats->expert_groups,
+                (unsigned long long)stats->panel4_groups,
+                (unsigned long long)stats->rem_groups[0],
+                (unsigned long long)stats->rem_groups[1],
+                (unsigned long long)stats->rem_groups[2],
+                (unsigned long long)stats->rem_groups[3],
+                (unsigned long long)stats->current_scalar_tail_pairs,
+                (unsigned long long)stats->panel2_candidate_pairs,
+                (unsigned long long)stats->scalar_tail_pairs_after_panel2,
+                pct);
+    }
     memset(&g_cpu_moe_timing, 0, sizeof(g_cpu_moe_timing));
+    memset(&g_cpu_moe_tail, 0, sizeof(g_cpu_moe_tail));
 }
 
 typedef struct {
@@ -6329,6 +6638,7 @@ static void layer_routed_moe_selected_batch_prealloc(
         const uint32_t expert = (uint32_t)selected_rows[pair_id];
         pair_ids[cursor[expert]++] = pair_id;
     }
+    ds4_cpu_moe_record_tail_profile(false, counts);
     const double setup_seconds = now_sec() - setup_t0;
 
 #ifdef DS4_USE_BLIS
@@ -6582,6 +6892,7 @@ static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
         const uint32_t expert = (uint32_t)selected_rows[pair_id];
         pair_ids[cursor[expert]++] = pair_id;
     }
+    ds4_cpu_moe_record_tail_profile(true, counts);
     const double setup_seconds = now_sec() - setup_t0;
 
 #ifdef DS4_USE_BLIS

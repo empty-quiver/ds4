@@ -235,6 +235,21 @@ static double bench_panel4(
                     up_out[(uint64_t)r * pairs + p + k] = u[k];
                 }
             }
+            for (; p + 1 < pairs; p += 2) {
+                float g[2];
+                float u[2];
+                ds4_vec_dot_iq2_xxs_pair_panel2_q8_K((int)(blocks * QK_K),
+                                                      g,
+                                                      u,
+                                                      gate_row,
+                                                      up_row,
+                                                      xq + (uint64_t)(p + 0) * blocks,
+                                                      xq + (uint64_t)(p + 1) * blocks);
+                for (uint32_t k = 0; k < 2; k++) {
+                    gate_out[(uint64_t)r * pairs + p + k] = g[k];
+                    up_out[(uint64_t)r * pairs + p + k] = u[k];
+                }
+            }
             for (; p < pairs; p++) {
                 ds4_vec_dot_iq2_xxs_pair_q8_K((int)(blocks * QK_K),
                                               gate_out + (uint64_t)r * pairs + p,
@@ -320,7 +335,7 @@ int main(int argc, char **argv) {
     );
     printf("correctness max_abs_diff=%.9g checksum=%.9f\n", max_abs, checksum);
     printf("baseline seconds=%.6f dots_per_s=%.3f\n", tb, dots / tb);
-    printf("panel4   seconds=%.6f dots_per_s=%.3f speedup=%.3fx\n", tp, dots / tp, tb / tp);
+    printf("panel4+2 seconds=%.6f dots_per_s=%.3f speedup=%.3fx\n", tp, dots / tp, tb / tp);
 
     free(panel_u);
     free(panel_g);
