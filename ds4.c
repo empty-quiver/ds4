@@ -13390,19 +13390,27 @@ static bool metal_graph_cpu_moe_handoff(
     const bool cuda_backend = g->backend == DS4_BACKEND_CUDA;
     const bool cuda_decode = decode && cuda_backend;
     const double handoff_t0 = cuda_decode ? now_sec() : 0.0;
-    const double sync_t0 = cuda_backend ? now_sec() : 0.0;
-    if (ds4_gpu_end_commands() == 0) return false;
-    if (cuda_backend) {
-        const double sync_seconds = now_sec() - sync_t0;
-        if (decode) {
-            g->hybrid_decode_handoffs++;
-            g->hybrid_decode_sync_seconds += sync_seconds;
-        } else {
-            g->hybrid_prefill_syncs++;
-            g->hybrid_prefill_sync_seconds += sync_seconds;
+    /* CUDA decode immediately reads router outputs back to host. That D2H copy
+     * is the dependency wait we actually need, so avoid a broader upfront
+     * cudaDeviceSynchronize unless staged model ranges must be released first. */
+    const bool need_explicit_sync = !cuda_decode || g->layerwise_staged_active;
+    if (need_explicit_sync) {
+        const double sync_t0 = cuda_backend ? now_sec() : 0.0;
+        if (ds4_gpu_end_commands() == 0) return false;
+        if (cuda_backend) {
+            const double sync_seconds = now_sec() - sync_t0;
+            if (decode) {
+                g->hybrid_decode_sync_seconds += sync_seconds;
+            } else {
+                g->hybrid_prefill_syncs++;
+                g->hybrid_prefill_sync_seconds += sync_seconds;
+            }
         }
     }
-    if (cuda_backend) {
+    if (cuda_decode) {
+        g->hybrid_decode_handoffs++;
+    }
+    if (cuda_backend && g->layerwise_staged_active) {
         metal_graph_layerwise_prefill_release_staged(g, model);
     }
 
