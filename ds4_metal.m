@@ -3950,6 +3950,10 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
     return 1;
 }
 
+int ds4_gpu_begin_transfer_from_compute(void) {
+    return 1;
+}
+
 int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     return ds4_gpu_tensor_write(tensor, offset, data, bytes);
 }
