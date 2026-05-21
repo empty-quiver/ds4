@@ -2601,6 +2601,108 @@ static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const bl
 #endif
 }
 
+static void ds4_vec_dot_q2_K_panel4_q8_K(
+        int n,
+        float out[4],
+        const block_q2_K *x,
+        const block_q8_K *y0,
+        const block_q8_K *y1,
+        const block_q8_K *y2,
+        const block_q8_K *y3) {
+#if defined(__AVX2__)
+    const int nb = n / QK_K;
+    const block_q8_K *ys[4] = { y0, y1, y2, y3 };
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    __m256 acc[4] = {
+        _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps(),
+    };
+
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *q2 = x[i].qs;
+        const __m128i mins_and_scales = _mm_loadu_si128((const __m128i *)x[i].scales);
+        const __m128i scales8 = _mm_and_si128(mins_and_scales, m4);
+        const __m128i mins8 = _mm_and_si128(_mm_srli_epi16(mins_and_scales, 4), m4);
+        const __m256i mins = _mm256_cvtepi8_epi16(mins8);
+        const __m256i all_scales = _mm256_cvtepi8_epi16(scales8);
+        const __m128i l_scales = _mm256_extracti128_si256(all_scales, 0);
+        const __m128i h_scales = _mm256_extracti128_si256(all_scales, 1);
+        const __m256i scales[2] = {
+            DS4_MM256_SET_M128I(l_scales, l_scales),
+            DS4_MM256_SET_M128I(h_scales, h_scales),
+        };
+        __m256i sumi[4] = {
+            _mm256_setzero_si256(), _mm256_setzero_si256(),
+            _mm256_setzero_si256(), _mm256_setzero_si256(),
+        };
+        const float xd = f16_to_f32(x[i].d);
+        const float xmin = f16_to_f32(x[i].dmin);
+
+        for (int p = 0; p < 4; p++) {
+            const float dmin = -ys[p][i].d * xmin;
+            const __m256i min_prod = _mm256_madd_epi16(
+                    mins, _mm256_loadu_si256((const __m256i *)ys[p][i].bsums));
+            acc[p] = ds4_mm256_fmadd_ps(_mm256_broadcast_ss(&dmin),
+                                        _mm256_cvtepi32_ps(min_prod),
+                                        acc[p]);
+        }
+
+        const int8_t *q8[4] = { ys[0][i].qs, ys[1][i].qs, ys[2][i].qs, ys[3][i].qs };
+        for (int j = 0; j < QK_K / 128; j++) {
+            const __m256i q2bits = _mm256_loadu_si256((const __m256i *)q2);
+            q2 += 32;
+
+            const __m256i q2_0 = _mm256_and_si256(q2bits, m3);
+            const __m256i q2_1 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 2), m3);
+            const __m256i q2_2 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 4), m3);
+            const __m256i q2_3 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 6), m3);
+            const __m256i s0 = _mm256_shuffle_epi8(scales[j], ds4_q2_k_scale_shuffle(0));
+            const __m256i s1 = _mm256_shuffle_epi8(scales[j], ds4_q2_k_scale_shuffle(1));
+            const __m256i s2 = _mm256_shuffle_epi8(scales[j], ds4_q2_k_scale_shuffle(2));
+            const __m256i s3 = _mm256_shuffle_epi8(scales[j], ds4_q2_k_scale_shuffle(3));
+
+            for (int p = 0; p < 4; p++) {
+                const __m256i q8_0 = _mm256_loadu_si256((const __m256i *)q8[p]); q8[p] += 32;
+                const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8[p]); q8[p] += 32;
+                const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8[p]); q8[p] += 32;
+                const __m256i q8_3 = _mm256_loadu_si256((const __m256i *)q8[p]); q8[p] += 32;
+
+                __m256i p0 = _mm256_maddubs_epi16(q2_0, q8_0);
+                __m256i p1 = _mm256_maddubs_epi16(q2_1, q8_1);
+                __m256i p2 = _mm256_maddubs_epi16(q2_2, q8_2);
+                __m256i p3 = _mm256_maddubs_epi16(q2_3, q8_3);
+
+                p0 = _mm256_madd_epi16(s0, p0);
+                p1 = _mm256_madd_epi16(s1, p1);
+                p2 = _mm256_madd_epi16(s2, p2);
+                p3 = _mm256_madd_epi16(s3, p3);
+
+                p0 = _mm256_add_epi32(p0, p1);
+                p2 = _mm256_add_epi32(p2, p3);
+                sumi[p] = _mm256_add_epi32(sumi[p], _mm256_add_epi32(p0, p2));
+            }
+        }
+
+        for (int p = 0; p < 4; p++) {
+            const float d = ys[p][i].d * xd;
+            acc[p] = ds4_mm256_fmadd_ps(_mm256_broadcast_ss(&d),
+                                        _mm256_cvtepi32_ps(sumi[p]),
+                                        acc[p]);
+        }
+    }
+
+    for (int p = 0; p < 4; p++) {
+        out[p] = ds4_hsum_float_8(acc[p]);
+    }
+#else
+    ds4_vec_dot_q2_K_q8_K(n, out + 0, x, y0);
+    ds4_vec_dot_q2_K_q8_K(n, out + 1, x, y1);
+    ds4_vec_dot_q2_K_q8_K(n, out + 2, x, y2);
+    ds4_vec_dot_q2_K_q8_K(n, out + 3, x, y3);
+#endif
+}
+
 static DS4_MAYBE_UNUSED void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const block_q8_K *y) {
     const int nb = n / QK_K;
 
@@ -5430,7 +5532,34 @@ static void matvec_q2_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint6
             const uint32_t end = ctx->expert_offset[expert + 1];
             const block_q2_K *br = (const block_q2_K *)(ctx->base[expert] + row * ctx->row_bytes[expert]);
 
-            for (uint32_t i = begin; i < end; i++) {
+            uint32_t i = begin;
+            for (; i + 3 < end; i += 4) {
+                const uint32_t pair_id0 = ctx->pair_ids[i + 0];
+                const uint32_t pair_id1 = ctx->pair_ids[i + 1];
+                const uint32_t pair_id2 = ctx->pair_ids[i + 2];
+                const uint32_t pair_id3 = ctx->pair_ids[i + 3];
+                const block_q8_K *xq0 = ctx->midq + (uint64_t)pair_id0 * ctx->midq_blocks;
+                const block_q8_K *xq1 = ctx->midq + (uint64_t)pair_id1 * ctx->midq_blocks;
+                const block_q8_K *xq2 = ctx->midq + (uint64_t)pair_id2 * ctx->midq_blocks;
+                const block_q8_K *xq3 = ctx->midq + (uint64_t)pair_id3 * ctx->midq_blocks;
+                float v[4];
+
+                ds4_vec_dot_q2_K_panel4_q8_K((int)ctx->in_dim,
+                                             v,
+                                             br,
+                                             xq0,
+                                             xq1,
+                                             xq2,
+                                             xq3);
+
+                const uint32_t pair_ids[4] = { pair_id0, pair_id1, pair_id2, pair_id3 };
+                for (uint32_t k = 0; k < 4; k++) {
+                    const uint32_t token = pair_ids[k] / DS4_N_EXPERT_USED;
+                    ctx->moe[(uint64_t)token * ctx->out_dim + row] += v[k];
+                }
+            }
+
+            for (; i < end; i++) {
                 const uint32_t pair_id = ctx->pair_ids[i];
                 const uint32_t token = pair_id / DS4_N_EXPERT_USED;
                 const block_q8_K *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;

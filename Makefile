@@ -42,7 +42,7 @@ CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression gateup-microbench
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression gateup-microbench down-microbench
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval
@@ -179,6 +179,12 @@ tests/cpu_moe_gateup_microbench: tests/cpu_moe_gateup_microbench.c ds4.c ds4.h
 gateup-microbench: tests/cpu_moe_gateup_microbench
 	./tests/cpu_moe_gateup_microbench
 
+tests/cpu_moe_down_microbench: tests/cpu_moe_down_microbench.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -I. -o $@ tests/cpu_moe_down_microbench.c $(LDLIBS)
+
+down-microbench: tests/cpu_moe_down_microbench
+	./tests/cpu_moe_down_microbench
+
 ds4_test: ds4_test.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -190,4 +196,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cpu_moe_gateup_microbench
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cpu_moe_gateup_microbench tests/cpu_moe_down_microbench
