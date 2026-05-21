@@ -11622,11 +11622,23 @@ typedef struct {
     uint64_t hybrid_prefill_cpu_pairs;
     uint64_t hybrid_prefill_gpu_pairs;
     uint64_t hybrid_prefill_syncs;
+    uint64_t hybrid_decode_handoffs;
+    uint64_t hybrid_decode_hot_handoffs;
+    uint64_t hybrid_decode_full_cpu_handoffs;
+    uint64_t hybrid_decode_cpu_slots;
     double layerwise_staging_copy_seconds;
     double layerwise_staging_sync_seconds;
     double hybrid_prefill_cpu_seconds;
     double hybrid_prefill_gpu_enqueue_seconds;
     double hybrid_prefill_sync_seconds;
+    double hybrid_decode_total_seconds;
+    double hybrid_decode_sync_seconds;
+    double hybrid_decode_read_seconds;
+    double hybrid_decode_maintenance_seconds;
+    double hybrid_decode_hot_enqueue_seconds;
+    double hybrid_decode_cpu_seconds;
+    double hybrid_decode_upload_seconds;
+    double hybrid_decode_add_seconds;
     uint64_t hot_expert_prefill_batches;
     uint64_t hot_expert_prefill_slots;
     uint64_t cold_expert_prefill_slots;
@@ -13106,7 +13118,7 @@ static bool metal_graph_cuda_cpu_moe_hot_decode(
         const float            *xs,
         const int32_t          *sel,
         const float            *w) {
-    if (!g || !model || !layer || !ffn_norm || !routed_out || !xs || !sel || !w) return false;
+    if (!g || !model || !layer || !ffn_norm || !routed_out || !sel || !w) return false;
     if (g->backend != DS4_BACKEND_CUDA || !g->hot_experts_enabled || il >= DS4_N_LAYER) return false;
     if (!(layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
           layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
@@ -13145,23 +13157,19 @@ static bool metal_graph_cuda_cpu_moe_hot_decode(
     const uint32_t out_dim = (uint32_t)layer->ffn_down_exps->dim[1];
 
     if (n_cold != 0) {
-        layer_routed_moe_selected_one_n_prealloc(g->cpu_moe_out_host,
-                                                 g->cpu_model,
-                                                 layer,
-                                                 xs,
-                                                 cold_sel,
-                                                 cold_w,
-                                                 n_cold,
-                                                 DS4_SWIGLU_CLAMP_EXP,
-                                                 g->cpu_moe_mid,
-                                                 g->cpu_moe_xq,
-                                                 g->cpu_moe_midq);
-        if (ds4_gpu_tensor_write(g->cpu_moe_cold_out, 0, g->cpu_moe_out_host,
-                                 (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
-            return false;
+        if (!xs) {
+            const double read_t0 = now_sec();
+            if (ds4_gpu_tensor_read(ffn_norm, 0, g->cpu_moe_ffn_norm_host,
+                                    (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
+                return false;
+            }
+            g->hybrid_decode_read_seconds += now_sec() - read_t0;
+            xs = g->cpu_moe_ffn_norm_host;
         }
+        if (!xs) return false;
     }
 
+    const double hot_t0 = now_sec();
     if (ds4_gpu_tensor_write(g->hot_router_weights, 0, hot_w,
                              (uint64_t)n_hot * sizeof(float)) == 0) {
         return false;
@@ -13190,15 +13198,46 @@ static bool metal_graph_cuda_cpu_moe_hot_decode(
                                                      n_hot,
                                                      DS4_SWIGLU_CLAMP_EXP,
                                                      ffn_norm) == 0) {
+        (void)ds4_gpu_end_commands();
         return false;
     }
-    if (n_cold != 0 &&
-        ds4_gpu_add_tensor(routed_out, routed_out, g->cpu_moe_cold_out, DS4_N_EMBD) == 0) {
-        return false;
+    g->hybrid_decode_hot_enqueue_seconds += now_sec() - hot_t0;
+
+    if (n_cold != 0) {
+        const double cpu_t0 = now_sec();
+        layer_routed_moe_selected_one_n_prealloc(g->cpu_moe_out_host,
+                                                 g->cpu_model,
+                                                 layer,
+                                                 xs,
+                                                 cold_sel,
+                                                 cold_w,
+                                                 n_cold,
+                                                 DS4_SWIGLU_CLAMP_EXP,
+                                                 g->cpu_moe_mid,
+                                                 g->cpu_moe_xq,
+                                                 g->cpu_moe_midq);
+        g->hybrid_decode_cpu_seconds += now_sec() - cpu_t0;
+
+        const double upload_t0 = now_sec();
+        if (ds4_gpu_tensor_write(g->cpu_moe_cold_out, 0, g->cpu_moe_out_host,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
+            (void)ds4_gpu_end_commands();
+            return false;
+        }
+        g->hybrid_decode_upload_seconds += now_sec() - upload_t0;
+
+        const double add_t0 = now_sec();
+        if (ds4_gpu_add_tensor(routed_out, routed_out, g->cpu_moe_cold_out, DS4_N_EMBD) == 0) {
+            (void)ds4_gpu_end_commands();
+            return false;
+        }
+        g->hybrid_decode_add_seconds += now_sec() - add_t0;
     }
     g->hot_expert_decode_layers++;
     g->hot_expert_decode_slots += n_hot;
     g->cold_expert_decode_slots += n_cold;
+    g->hybrid_decode_hot_handoffs++;
+    g->hybrid_decode_cpu_slots += n_cold;
     return true;
 }
 
@@ -13348,13 +13387,22 @@ static bool metal_graph_cpu_moe_handoff(
     if (!metal_graph_ensure_cpu_moe_scratch(g, n_tokens)) {
         return false;
     }
-    const double sync_t0 = (!decode && g->backend == DS4_BACKEND_CUDA) ? now_sec() : 0.0;
+    const bool cuda_backend = g->backend == DS4_BACKEND_CUDA;
+    const bool cuda_decode = decode && cuda_backend;
+    const double handoff_t0 = cuda_decode ? now_sec() : 0.0;
+    const double sync_t0 = cuda_backend ? now_sec() : 0.0;
     if (ds4_gpu_end_commands() == 0) return false;
-    if (!decode && g->backend == DS4_BACKEND_CUDA) {
-        g->hybrid_prefill_syncs++;
-        g->hybrid_prefill_sync_seconds += now_sec() - sync_t0;
+    if (cuda_backend) {
+        const double sync_seconds = now_sec() - sync_t0;
+        if (decode) {
+            g->hybrid_decode_handoffs++;
+            g->hybrid_decode_sync_seconds += sync_seconds;
+        } else {
+            g->hybrid_prefill_syncs++;
+            g->hybrid_prefill_sync_seconds += sync_seconds;
+        }
     }
-    if (g->backend == DS4_BACKEND_CUDA) {
+    if (cuda_backend) {
         metal_graph_layerwise_prefill_release_staged(g, model);
     }
 
@@ -13368,17 +13416,28 @@ static bool metal_graph_cpu_moe_handoff(
     const uint64_t sel_bytes = pair_count * sizeof(int32_t);
     const uint64_t weight_bytes = pair_count * sizeof(float);
 
-    if (g->backend == DS4_BACKEND_CUDA) {
+    if (cuda_backend) {
         if (!g->cpu_moe_ffn_norm_host || !g->cpu_moe_selected_host ||
             !g->cpu_moe_weight_host || !g->cpu_moe_out_host) {
             return false;
         }
-        if (ds4_gpu_tensor_read(ffn_norm, 0, g->cpu_moe_ffn_norm_host, x_bytes) == 0 ||
-            ds4_gpu_tensor_read(router_selected, 0, g->cpu_moe_selected_host, sel_bytes) == 0 ||
-            ds4_gpu_tensor_read(router_weights, 0, g->cpu_moe_weight_host, weight_bytes) == 0) {
-            return false;
+        const double read_t0 = cuda_decode ? now_sec() : 0.0;
+        if (decode) {
+            if (ds4_gpu_tensor_read(router_selected, 0, g->cpu_moe_selected_host, sel_bytes) == 0 ||
+                ds4_gpu_tensor_read(router_weights, 0, g->cpu_moe_weight_host, weight_bytes) == 0) {
+                return false;
+            }
+        } else {
+            if (ds4_gpu_tensor_read(ffn_norm, 0, g->cpu_moe_ffn_norm_host, x_bytes) == 0 ||
+                ds4_gpu_tensor_read(router_selected, 0, g->cpu_moe_selected_host, sel_bytes) == 0 ||
+                ds4_gpu_tensor_read(router_weights, 0, g->cpu_moe_weight_host, weight_bytes) == 0) {
+                return false;
+            }
+            xs = g->cpu_moe_ffn_norm_host;
         }
-        xs = g->cpu_moe_ffn_norm_host;
+        if (cuda_decode) {
+            g->hybrid_decode_read_seconds += now_sec() - read_t0;
+        }
         sel = g->cpu_moe_selected_host;
         w = g->cpu_moe_weight_host;
         out = g->cpu_moe_out_host;
@@ -13389,8 +13448,9 @@ static bool metal_graph_cpu_moe_handoff(
         out = (float *)        ds4_gpu_tensor_contents(routed_out);
     }
 
-    if (!xs || !sel || !w || !out) return false;
+    if ((!decode && !xs) || !sel || !w || !out) return false;
 
+    const double maintenance_t0 = cuda_decode ? now_sec() : 0.0;
     metal_graph_record_route_profile(g, il, sel, n_tokens, decode);
     const bool dynamic_observe_eager =
         g->dynamic_expert_eager ||
@@ -13399,12 +13459,20 @@ static bool metal_graph_cpu_moe_handoff(
         metal_graph_dynamic_expert_observe(g, il, sel, n_tokens, decode);
     }
     metal_graph_dynamic_expert_maintenance(g, model, layer, il, sel, n_tokens, decode);
+    if (cuda_decode) {
+        g->hybrid_decode_maintenance_seconds += now_sec() - maintenance_t0;
+    }
 
     if (decode && n_tokens == 1 &&
         metal_graph_cuda_cpu_moe_hot_decode(g, model, layer, il, ffn_norm,
                                             routed_out, xs, sel, w)) {
+        const double after_t0 = cuda_decode ? now_sec() : 0.0;
         metal_graph_dynamic_expert_after_layer(g, model, il, sel,
                                                n_tokens, decode);
+        if (cuda_decode) {
+            g->hybrid_decode_maintenance_seconds += now_sec() - after_t0;
+            g->hybrid_decode_total_seconds += now_sec() - handoff_t0;
+        }
         return ds4_gpu_begin_commands() != 0;
     }
     if (!decode &&
@@ -13415,7 +13483,17 @@ static bool metal_graph_cpu_moe_handoff(
         return ds4_gpu_begin_commands() != 0;
     }
 
-    const double cpu_t0 = (!decode && g->backend == DS4_BACKEND_CUDA) ? now_sec() : 0.0;
+    if (cuda_decode && !xs) {
+        const double read_t0 = now_sec();
+        if (ds4_gpu_tensor_read(ffn_norm, 0, g->cpu_moe_ffn_norm_host, x_bytes) == 0) {
+            return false;
+        }
+        g->hybrid_decode_read_seconds += now_sec() - read_t0;
+        xs = g->cpu_moe_ffn_norm_host;
+    }
+    if (!xs) return false;
+
+    const double cpu_t0 = cuda_backend ? now_sec() : 0.0;
     cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer, il,
                                           xs, sel, w, out,
                                           n_tokens, DS4_SWIGLU_CLAMP_EXP,
@@ -13423,17 +13501,34 @@ static bool metal_graph_cpu_moe_handoff(
                                           g->cpu_moe_xq,
                                           g->cpu_moe_midq,
                                           g->cpu_moe_pair_ids);
-    if (!decode && g->backend == DS4_BACKEND_CUDA) {
-        metal_graph_hybrid_record_prefill_cpu(g, pair_count, now_sec() - cpu_t0);
+    if (cuda_backend) {
+        const double cpu_seconds = now_sec() - cpu_t0;
+        if (decode) {
+            g->hybrid_decode_full_cpu_handoffs++;
+            g->hybrid_decode_cpu_slots += pair_count;
+            g->hybrid_decode_cpu_seconds += cpu_seconds;
+        } else {
+            metal_graph_hybrid_record_prefill_cpu(g, pair_count, cpu_seconds);
+        }
     }
 
-    if (g->backend == DS4_BACKEND_CUDA &&
-        ds4_gpu_tensor_write(routed_out, 0, out, x_bytes) == 0) {
-        return false;
+    if (cuda_backend) {
+        const double upload_t0 = cuda_decode ? now_sec() : 0.0;
+        if (ds4_gpu_tensor_write(routed_out, 0, out, x_bytes) == 0) {
+            return false;
+        }
+        if (cuda_decode) {
+            g->hybrid_decode_upload_seconds += now_sec() - upload_t0;
+        }
     }
 
+    const double after_t0 = cuda_decode ? now_sec() : 0.0;
     metal_graph_dynamic_expert_after_layer(g, model, il, sel,
                                            n_tokens, decode);
+    if (cuda_decode) {
+        g->hybrid_decode_maintenance_seconds += now_sec() - after_t0;
+        g->hybrid_decode_total_seconds += now_sec() - handoff_t0;
+    }
     return ds4_gpu_begin_commands() != 0;
 }
 
@@ -13488,6 +13583,22 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         if (g->gpu_model) {
             metal_graph_layerwise_prefill_release_staged(g, g->gpu_model);
         }
+    }
+    if (g && g->hybrid_decode_handoffs != 0) {
+        fprintf(stderr,
+                "ds4: CUDA hybrid decode timing: handoffs=%llu hot_paths=%llu full_cpu=%llu cpu_slots=%llu total=%.3f s sync=%.3f s read=%.3f s maintenance=%.3f s hot_enqueue=%.3f s cpu=%.3f s upload=%.3f s add=%.3f s\n",
+                (unsigned long long)g->hybrid_decode_handoffs,
+                (unsigned long long)g->hybrid_decode_hot_handoffs,
+                (unsigned long long)g->hybrid_decode_full_cpu_handoffs,
+                (unsigned long long)g->hybrid_decode_cpu_slots,
+                g->hybrid_decode_total_seconds,
+                g->hybrid_decode_sync_seconds,
+                g->hybrid_decode_read_seconds,
+                g->hybrid_decode_maintenance_seconds,
+                g->hybrid_decode_hot_enqueue_seconds,
+                g->hybrid_decode_cpu_seconds,
+                g->hybrid_decode_upload_seconds,
+                g->hybrid_decode_add_seconds);
     }
     if (g && (g->dynamic_experts_enabled ||
               g->dynamic_expert_used_bytes != 0 ||
