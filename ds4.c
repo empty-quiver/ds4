@@ -684,6 +684,8 @@ static ds4_thread_pool g_pool;
 static __thread int g_parallel_depth;
 static uint32_t g_requested_threads;
 
+static void ds4_cpu_moe_print_timing(void);
+
 static DS4_MAYBE_UNUSED bool ds4_env_enabled_default(const char *name, bool def) {
     const char *env = getenv(name);
     if (!env || !env[0]) return def;
@@ -820,6 +822,8 @@ static void ds4_threads_init(void) {
 
 static void ds4_threads_shutdown(void) {
     if (!g_pool.initialized) return;
+
+    ds4_cpu_moe_print_timing();
 
     pthread_mutex_lock(&g_pool.mutex);
     g_pool.shutdown = true;
@@ -5413,6 +5417,55 @@ static uint32_t ds4_cpu_moe_row_chunk(void) {
 }
 
 typedef struct {
+    uint64_t batch_calls;
+    uint64_t pair_calls;
+    uint64_t batch_pairs;
+    uint64_t pair_pairs;
+    double setup_seconds;
+    double gate_up_seconds;
+    double midq_seconds;
+    double down_seconds;
+} ds4_cpu_moe_timing_stats;
+
+static ds4_cpu_moe_timing_stats g_cpu_moe_timing;
+
+static void ds4_cpu_moe_record_timing(
+        bool     selected_pairs,
+        uint64_t pairs,
+        double   setup_seconds,
+        double   gate_up_seconds,
+        double   midq_seconds,
+        double   down_seconds) {
+    if (selected_pairs) {
+        g_cpu_moe_timing.pair_calls++;
+        g_cpu_moe_timing.pair_pairs += pairs;
+    } else {
+        g_cpu_moe_timing.batch_calls++;
+        g_cpu_moe_timing.batch_pairs += pairs;
+    }
+    g_cpu_moe_timing.setup_seconds += setup_seconds;
+    g_cpu_moe_timing.gate_up_seconds += gate_up_seconds;
+    g_cpu_moe_timing.midq_seconds += midq_seconds;
+    g_cpu_moe_timing.down_seconds += down_seconds;
+}
+
+static void ds4_cpu_moe_print_timing(void) {
+    const uint64_t calls = g_cpu_moe_timing.batch_calls + g_cpu_moe_timing.pair_calls;
+    if (calls == 0) return;
+    fprintf(stderr,
+            "ds4: CPU-MoE selected timing: batch_calls=%llu pair_calls=%llu batch_pairs=%llu pair_pairs=%llu setup=%.3f s gate_up=%.3f s midq=%.3f s down=%.3f s\n",
+            (unsigned long long)g_cpu_moe_timing.batch_calls,
+            (unsigned long long)g_cpu_moe_timing.pair_calls,
+            (unsigned long long)g_cpu_moe_timing.batch_pairs,
+            (unsigned long long)g_cpu_moe_timing.pair_pairs,
+            g_cpu_moe_timing.setup_seconds,
+            g_cpu_moe_timing.gate_up_seconds,
+            g_cpu_moe_timing.midq_seconds,
+            g_cpu_moe_timing.down_seconds);
+    memset(&g_cpu_moe_timing, 0, sizeof(g_cpu_moe_timing));
+}
+
+typedef struct {
     uint16_t active_idx;
     uint16_t row0;
     uint16_t row1;
@@ -5961,6 +6014,7 @@ static void layer_routed_moe_selected_batch_prealloc(
     }
 
     const uint32_t total_pairs = n_tok * DS4_N_EXPERT_USED;
+    const double setup_t0 = now_sec();
     uint32_t counts[DS4_N_EXPERT + 1] = {0};
     uint32_t cursor[DS4_N_EXPERT] = {0};
     uint32_t active_expert[DS4_N_EXPERT];
@@ -5990,27 +6044,33 @@ static void layer_routed_moe_selected_batch_prealloc(
         const uint32_t expert = (uint32_t)selected_rows[pair_id];
         pair_ids[cursor[expert]++] = pair_id;
     }
+    const double setup_seconds = now_sec() - setup_t0;
 
 #ifdef DS4_USE_BLIS
-    if (!is_q4 &&
-        layer_routed_moe_iq2_q2_blis_grouped(moe,
-                                             model,
-                                             layer,
-                                             norm,
-                                             weight_rows,
-                                             n_tok,
-                                             clamp,
-                                             mid,
-                                             pair_ids,
-                                             counts,
-                                             active_expert,
-                                             n_active)) {
-        return;
+    if (!is_q4) {
+        const double blis_t0 = now_sec();
+        if (layer_routed_moe_iq2_q2_blis_grouped(moe,
+                                                 model,
+                                                 layer,
+                                                 norm,
+                                                 weight_rows,
+                                                 n_tok,
+                                                 clamp,
+                                                 mid,
+                                                 pair_ids,
+                                                 counts,
+                                                 active_expert,
+                                                 n_active)) {
+            ds4_cpu_moe_record_timing(false, total_pairs, setup_seconds,
+                                      now_sec() - blis_t0, 0.0, 0.0);
+            return;
+        }
     }
 #else
     (void)ds4_cpu_moe_blis_enabled();
 #endif
 
+    const double gate_up_t0 = now_sec();
     if (is_q4) {
         matvec_q4_k_batch_mid_ctx mid_ctx = {
             .mid = mid,
@@ -6082,7 +6142,9 @@ static void layer_routed_moe_selected_batch_prealloc(
                                           matvec_iq2_xxs_batch_mid_expert_rows,
                                           &mid_ctx);
     }
+    const double gate_up_seconds = now_sec() - gate_up_t0;
 
+    const double midq_t0 = now_sec();
     const uint64_t midq_blocks = down_in_dim / QK_K;
     quantize_mid_pairs_ctx quant_ctx = {
         .mid = mid,
@@ -6091,7 +6153,9 @@ static void layer_routed_moe_selected_batch_prealloc(
         .down_blocks = midq_blocks,
     };
     ds4_parallel_for(total_pairs, quantize_mid_pairs_worker, &quant_ctx);
+    const double midq_seconds = now_sec() - midq_t0;
 
+    const double down_t0 = now_sec();
     if (is_q4) {
         matvec_q4_k_batch_accum_rows_ctx down_ctx = {
             .moe = moe,
@@ -6151,6 +6215,9 @@ static void layer_routed_moe_selected_batch_prealloc(
                                           ds4_cpu_moe_row_chunk(),
                                           512);
     }
+    const double down_seconds = now_sec() - down_t0;
+    ds4_cpu_moe_record_timing(false, total_pairs, setup_seconds,
+                              gate_up_seconds, midq_seconds, down_seconds);
 }
 
 static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
@@ -6191,8 +6258,12 @@ static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
         ds4_die("CPU-MoE selected pair unsupported routed expert quantization");
     }
 
+    const double setup_t0 = now_sec();
     memset(moe, 0, (size_t)((uint64_t)n_tok * down_out_dim) * sizeof(moe[0]));
-    if (n_pairs == 0) return;
+    if (n_pairs == 0) {
+        ds4_cpu_moe_record_timing(true, 0, now_sec() - setup_t0, 0.0, 0.0, 0.0);
+        return;
+    }
 
     const uint32_t total_pairs = n_tok * DS4_N_EXPERT_USED;
     uint32_t counts[DS4_N_EXPERT + 1] = {0};
@@ -6226,27 +6297,33 @@ static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
         const uint32_t expert = (uint32_t)selected_rows[pair_id];
         pair_ids[cursor[expert]++] = pair_id;
     }
+    const double setup_seconds = now_sec() - setup_t0;
 
 #ifdef DS4_USE_BLIS
-    if (!is_q4 &&
-        layer_routed_moe_iq2_q2_blis_grouped(moe,
-                                             model,
-                                             layer,
-                                             norm,
-                                             weight_rows,
-                                             n_tok,
-                                             clamp,
-                                             mid,
-                                             pair_ids,
-                                             counts,
-                                             active_expert,
-                                             n_active)) {
-        return;
+    if (!is_q4) {
+        const double blis_t0 = now_sec();
+        if (layer_routed_moe_iq2_q2_blis_grouped(moe,
+                                                 model,
+                                                 layer,
+                                                 norm,
+                                                 weight_rows,
+                                                 n_tok,
+                                                 clamp,
+                                                 mid,
+                                                 pair_ids,
+                                                 counts,
+                                                 active_expert,
+                                                 n_active)) {
+            ds4_cpu_moe_record_timing(true, n_pairs, setup_seconds,
+                                      now_sec() - blis_t0, 0.0, 0.0);
+            return;
+        }
     }
 #else
     (void)ds4_cpu_moe_blis_enabled();
 #endif
 
+    const double gate_up_t0 = now_sec();
     if (is_q4) {
         matvec_q4_k_batch_mid_ctx mid_ctx = {
             .mid = mid,
@@ -6318,7 +6395,9 @@ static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
                                           matvec_iq2_xxs_batch_mid_expert_rows,
                                           &mid_ctx);
     }
+    const double gate_up_seconds = now_sec() - gate_up_t0;
 
+    const double midq_t0 = now_sec();
     const uint64_t midq_blocks = down_in_dim / QK_K;
     quantize_selected_mid_pairs_ctx quant_ctx = {
         .mid = mid,
@@ -6328,7 +6407,9 @@ static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
         .down_blocks = midq_blocks,
     };
     ds4_parallel_for(n_pairs, quantize_selected_mid_pairs_worker, &quant_ctx);
+    const double midq_seconds = now_sec() - midq_t0;
 
+    const double down_t0 = now_sec();
     if (is_q4) {
         matvec_q4_k_batch_accum_rows_ctx down_ctx = {
             .moe = moe,
@@ -6388,6 +6469,9 @@ static DS4_MAYBE_UNUSED void layer_routed_moe_selected_pairs_prealloc(
                                           ds4_cpu_moe_row_chunk(),
                                           512);
     }
+    const double down_seconds = now_sec() - down_t0;
+    ds4_cpu_moe_record_timing(true, n_pairs, setup_seconds,
+                              gate_up_seconds, midq_seconds, down_seconds);
 }
 
 /* =========================================================================
@@ -7870,7 +7954,6 @@ static void layer_routed_moe_batch(
         const uint32_t e = (uint32_t)selected[p];
         pair_ids[cursor[e]++] = p;
     }
-
     float *mid = xmalloc((size_t)total_pairs * expert_out_dim * sizeof(mid[0]));
 
     matvec_iq2_xxs_batch_mid_ctx mid_ctx = {
