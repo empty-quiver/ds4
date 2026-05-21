@@ -6217,6 +6217,18 @@ static ds4_cpu_moe_timing_stats g_cpu_moe_timing;
 
 typedef struct {
     uint64_t calls;
+    uint64_t experts;
+    double setup_seconds;
+    double xq_seconds;
+    double gate_up_seconds;
+    double midq_seconds;
+    double down_seconds;
+} ds4_cpu_moe_decode_timing_stats;
+
+static ds4_cpu_moe_decode_timing_stats g_cpu_moe_decode_timing;
+
+typedef struct {
+    uint64_t calls;
     uint64_t pairs;
     uint64_t expert_groups;
     uint64_t panel4_groups;
@@ -6267,19 +6279,56 @@ static void ds4_cpu_moe_record_timing(
     g_cpu_moe_timing.down_seconds += down_seconds;
 }
 
+static void ds4_cpu_moe_record_decode_timing(
+        uint64_t experts,
+        double   setup_seconds,
+        double   xq_seconds,
+        double   gate_up_seconds,
+        double   midq_seconds,
+        double   down_seconds) {
+    g_cpu_moe_decode_timing.calls++;
+    g_cpu_moe_decode_timing.experts += experts;
+    g_cpu_moe_decode_timing.setup_seconds += setup_seconds;
+    g_cpu_moe_decode_timing.xq_seconds += xq_seconds;
+    g_cpu_moe_decode_timing.gate_up_seconds += gate_up_seconds;
+    g_cpu_moe_decode_timing.midq_seconds += midq_seconds;
+    g_cpu_moe_decode_timing.down_seconds += down_seconds;
+}
+
+static bool ds4_cpu_moe_decode_timing_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("DS4_CPU_MOE_DECODE_TIMING") ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 static void ds4_cpu_moe_print_timing(void) {
     const uint64_t calls = g_cpu_moe_timing.batch_calls + g_cpu_moe_timing.pair_calls;
-    if (calls == 0) return;
-    fprintf(stderr,
-            "ds4: CPU-MoE selected timing: batch_calls=%llu pair_calls=%llu batch_pairs=%llu pair_pairs=%llu setup=%.3f s gate_up=%.3f s midq=%.3f s down=%.3f s\n",
-            (unsigned long long)g_cpu_moe_timing.batch_calls,
-            (unsigned long long)g_cpu_moe_timing.pair_calls,
-            (unsigned long long)g_cpu_moe_timing.batch_pairs,
-            (unsigned long long)g_cpu_moe_timing.pair_pairs,
-            g_cpu_moe_timing.setup_seconds,
-            g_cpu_moe_timing.gate_up_seconds,
-            g_cpu_moe_timing.midq_seconds,
-            g_cpu_moe_timing.down_seconds);
+    if (calls != 0) {
+        fprintf(stderr,
+                "ds4: CPU-MoE selected timing: batch_calls=%llu pair_calls=%llu batch_pairs=%llu pair_pairs=%llu setup=%.3f s gate_up=%.3f s midq=%.3f s down=%.3f s\n",
+                (unsigned long long)g_cpu_moe_timing.batch_calls,
+                (unsigned long long)g_cpu_moe_timing.pair_calls,
+                (unsigned long long)g_cpu_moe_timing.batch_pairs,
+                (unsigned long long)g_cpu_moe_timing.pair_pairs,
+                g_cpu_moe_timing.setup_seconds,
+                g_cpu_moe_timing.gate_up_seconds,
+                g_cpu_moe_timing.midq_seconds,
+                g_cpu_moe_timing.down_seconds);
+    }
+    if (g_cpu_moe_decode_timing.calls != 0) {
+        fprintf(stderr,
+                "ds4: CPU-MoE decode timing: calls=%llu experts=%llu setup=%.3f s xq=%.3f s gate_up=%.3f s midq=%.3f s down=%.3f s\n",
+                (unsigned long long)g_cpu_moe_decode_timing.calls,
+                (unsigned long long)g_cpu_moe_decode_timing.experts,
+                g_cpu_moe_decode_timing.setup_seconds,
+                g_cpu_moe_decode_timing.xq_seconds,
+                g_cpu_moe_decode_timing.gate_up_seconds,
+                g_cpu_moe_decode_timing.midq_seconds,
+                g_cpu_moe_decode_timing.down_seconds);
+    }
+    if (calls == 0 && g_cpu_moe_decode_timing.calls == 0) return;
     for (uint32_t i = 0; i < 2; i++) {
         const ds4_cpu_moe_tail_stats *stats = &g_cpu_moe_tail[i];
         if (stats->calls == 0) continue;
@@ -8591,6 +8640,8 @@ static void layer_routed_moe_selected_one_n_prealloc(
     const uint64_t expert_out_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t down_out_dim = layer->ffn_down_exps->dim[1];
+    const bool record_timing = ds4_cpu_moe_decode_timing_enabled();
+    const double setup_t0 = record_timing ? now_sec() : 0.0;
 
     if (expert_in_dim % QK_K != 0) ds4_die("CPU-MoE selected one expert input is not QK_K aligned");
     if (down_in_dim % QK_K != 0) ds4_die("CPU-MoE selected one down input is not QK_K aligned");
@@ -8620,9 +8671,20 @@ static void layer_routed_moe_selected_one_n_prealloc(
     }
 
     memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
-    if (n_selected == 0) return;
-    ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
+    if (n_selected == 0) {
+        if (record_timing) {
+            ds4_cpu_moe_record_decode_timing(0, now_sec() - setup_t0,
+                                             0.0, 0.0, 0.0, 0.0);
+        }
+        return;
+    }
+    const double setup_seconds = record_timing ? now_sec() - setup_t0 : 0.0;
 
+    const double xq_t0 = record_timing ? now_sec() : 0.0;
+    ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
+    const double xq_seconds = record_timing ? now_sec() - xq_t0 : 0.0;
+
+    const double gate_up_t0 = record_timing ? now_sec() : 0.0;
     if (is_q4) {
         matvec_q4_k_experts_mid_prequant(mid_all, model,
                                          layer->ffn_gate_exps,
@@ -8642,17 +8704,29 @@ static void layer_routed_moe_selected_one_n_prealloc(
                                             (int)n_selected,
                                             clamp);
     }
+    const double gate_up_seconds = record_timing ? now_sec() - gate_up_t0 : 0.0;
 
+    const double midq_t0 = record_timing ? now_sec() : 0.0;
     for (uint32_t i = 0; i < n_selected; i++) {
         ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
                               midq + (uint64_t)i * (down_in_dim / QK_K),
                               (int64_t)down_in_dim);
     }
+    const double midq_seconds = record_timing ? now_sec() - midq_t0 : 0.0;
 
+    const double down_t0 = record_timing ? now_sec() : 0.0;
     if (is_q4) {
         matvec_q4_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, (int)n_selected);
     } else {
         matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, (int)n_selected);
+    }
+    if (record_timing) {
+        ds4_cpu_moe_record_decode_timing(n_selected,
+                                         setup_seconds,
+                                         xq_seconds,
+                                         gate_up_seconds,
+                                         midq_seconds,
+                                         now_sec() - down_t0);
     }
 }
 
