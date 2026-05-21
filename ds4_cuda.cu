@@ -84,8 +84,9 @@ static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static cudaStream_t g_tensor_transfer_stream;
-static cudaEvent_t g_tensor_transfer_ready_event;
+static cudaEvent_t g_tensor_transfer_ready_event[4];
 static cudaEvent_t g_tensor_transfer_done_event;
+static uint32_t g_tensor_transfer_ready_next;
 static int g_tensor_transfer_active;
 static int g_tensor_transfer_done_recorded;
 static cublasHandle_t g_cublas;
@@ -1668,14 +1669,17 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaEventDestroy(g_tensor_transfer_done_event);
         g_tensor_transfer_done_event = NULL;
     }
-    if (g_tensor_transfer_ready_event) {
-        (void)cudaEventDestroy(g_tensor_transfer_ready_event);
-        g_tensor_transfer_ready_event = NULL;
+    for (size_t i = 0; i < sizeof(g_tensor_transfer_ready_event) / sizeof(g_tensor_transfer_ready_event[0]); i++) {
+        if (g_tensor_transfer_ready_event[i]) {
+            (void)cudaEventDestroy(g_tensor_transfer_ready_event[i]);
+            g_tensor_transfer_ready_event[i] = NULL;
+        }
     }
     if (g_tensor_transfer_stream) {
         (void)cudaStreamDestroy(g_tensor_transfer_stream);
         g_tensor_transfer_stream = NULL;
     }
+    g_tensor_transfer_ready_next = 0;
     g_tensor_transfer_active = 0;
     g_tensor_transfer_done_recorded = 0;
     if (g_cublas_ready) {
@@ -1851,13 +1855,15 @@ static int cuda_tensor_transfer_ensure(void) {
             return 0;
         }
     }
-    if (!g_tensor_transfer_ready_event) {
-        err = cudaEventCreateWithFlags(&g_tensor_transfer_ready_event, cudaEventDisableTiming);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA tensor transfer ready event creation failed: %s\n",
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return 0;
+    for (size_t i = 0; i < sizeof(g_tensor_transfer_ready_event) / sizeof(g_tensor_transfer_ready_event[0]); i++) {
+        if (!g_tensor_transfer_ready_event[i]) {
+            err = cudaEventCreateWithFlags(&g_tensor_transfer_ready_event[i], cudaEventDisableTiming);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "ds4: CUDA tensor transfer ready event creation failed: %s\n",
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                return 0;
+            }
         }
     }
     if (!g_tensor_transfer_done_event) {
@@ -1901,9 +1907,12 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
 
 extern "C" int ds4_gpu_begin_transfer_from_compute(void) {
     if (!cuda_tensor_transfer_ensure()) return 0;
-    cudaError_t err = cudaEventRecord(g_tensor_transfer_ready_event, 0);
+    const size_t n_ready = sizeof(g_tensor_transfer_ready_event) / sizeof(g_tensor_transfer_ready_event[0]);
+    cudaEvent_t ready = g_tensor_transfer_ready_event[g_tensor_transfer_ready_next % n_ready];
+    g_tensor_transfer_ready_next++;
+    cudaError_t err = cudaEventRecord(ready, 0);
     if (!cuda_ok(err, "tensor transfer ready event")) return 0;
-    err = cudaStreamWaitEvent(g_tensor_transfer_stream, g_tensor_transfer_ready_event, 0);
+    err = cudaStreamWaitEvent(g_tensor_transfer_stream, ready, 0);
     if (!cuda_ok(err, "tensor transfer stream wait")) return 0;
     g_tensor_transfer_active = 1;
     return 1;
@@ -1939,6 +1948,7 @@ extern "C" int ds4_gpu_tensor_read_async(const ds4_gpu_tensor *tensor, uint64_t 
 extern "C" int ds4_gpu_wait_transfer(void) {
     if (!g_tensor_transfer_done_recorded) {
         g_tensor_transfer_active = 0;
+        g_tensor_transfer_ready_next = 0;
         return 1;
     }
     const int ok = cuda_ok(cudaEventSynchronize(g_tensor_transfer_done_event),
@@ -1946,6 +1956,7 @@ extern "C" int ds4_gpu_wait_transfer(void) {
     if (ok) {
         g_tensor_transfer_active = 0;
         g_tensor_transfer_done_recorded = 0;
+        g_tensor_transfer_ready_next = 0;
     }
     return ok;
 }

@@ -13390,14 +13390,12 @@ typedef struct {
     double read_t0;
 } metal_graph_cpu_moe_decode_handoff;
 
-static bool metal_graph_cpu_moe_handoff_decode_begin(
+static bool metal_graph_cpu_moe_handoff_decode_begin_norm(
         ds4_gpu_graph                   *g,
         const ds4_model                 *model,
         ds4_gpu_tensor                  *ffn_norm,
-        ds4_gpu_tensor                  *router_selected,
-        ds4_gpu_tensor                  *router_weights,
         metal_graph_cpu_moe_decode_handoff *handoff) {
-    if (!g || !model || !ffn_norm || !router_selected || !router_weights || !handoff) return false;
+    if (!g || !model || !ffn_norm || !handoff) return false;
     memset(handoff, 0, sizeof(*handoff));
     if (g->backend != DS4_BACKEND_CUDA) return false;
     if (!metal_graph_ensure_cpu_moe_scratch(g, 1)) return false;
@@ -13420,18 +13418,31 @@ static bool metal_graph_cpu_moe_handoff_decode_begin(
 
     handoff->read_t0 = now_sec();
     if (ds4_gpu_begin_transfer_from_compute() == 0 ||
-        ds4_gpu_tensor_read_async(router_selected, 0,
-                                  g->cpu_moe_selected_host,
-                                  DS4_N_EXPERT_USED * sizeof(int32_t)) == 0 ||
-        ds4_gpu_tensor_read_async(router_weights, 0,
-                                  g->cpu_moe_weight_host,
-                                  DS4_N_EXPERT_USED * sizeof(float)) == 0 ||
         ds4_gpu_tensor_read_async(ffn_norm, 0,
                                   g->cpu_moe_ffn_norm_host,
                                   (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
         return false;
     }
     handoff->active = true;
+    return true;
+}
+
+static bool metal_graph_cpu_moe_handoff_decode_read_router(
+        ds4_gpu_graph                   *g,
+        ds4_gpu_tensor                  *router_selected,
+        ds4_gpu_tensor                  *router_weights,
+        metal_graph_cpu_moe_decode_handoff *handoff) {
+    if (!g || !router_selected || !router_weights || !handoff || !handoff->active) return false;
+    if (!g->cpu_moe_selected_host || !g->cpu_moe_weight_host) return false;
+    if (ds4_gpu_begin_transfer_from_compute() == 0 ||
+        ds4_gpu_tensor_read_async(router_selected, 0,
+                                  g->cpu_moe_selected_host,
+                                  DS4_N_EXPERT_USED * sizeof(int32_t)) == 0 ||
+        ds4_gpu_tensor_read_async(router_weights, 0,
+                                  g->cpu_moe_weight_host,
+                                  DS4_N_EXPERT_USED * sizeof(float)) == 0) {
+        return false;
+    }
     return true;
 }
 
@@ -13454,7 +13465,7 @@ static bool metal_graph_cpu_moe_handoff_decode_finish(
     float *out = g->cpu_moe_out_host;
     if (!xs || !sel || !w || !out) return false;
 
-    const double maintenance_t0 = now_sec();
+    double maintenance_t0 = now_sec();
     metal_graph_record_route_profile(g, il, sel, 1, true);
     const bool dynamic_observe_eager =
         g->dynamic_expert_eager ||
@@ -13462,14 +13473,14 @@ static bool metal_graph_cpu_moe_handoff_decode_finish(
     if (dynamic_observe_eager) {
         metal_graph_dynamic_expert_observe(g, il, sel, 1, true);
     }
-    metal_graph_dynamic_expert_maintenance(g, model, layer, il, sel, 1, true);
     g->hybrid_decode_maintenance_seconds += now_sec() - maintenance_t0;
 
     if (metal_graph_cuda_cpu_moe_hot_decode(g, model, layer, il, ffn_norm,
                                             routed_out, xs, sel, w)) {
-        const double after_t0 = now_sec();
+        maintenance_t0 = now_sec();
+        metal_graph_dynamic_expert_maintenance(g, model, layer, il, sel, 1, true);
         metal_graph_dynamic_expert_after_layer(g, model, il, sel, 1, true);
-        g->hybrid_decode_maintenance_seconds += now_sec() - after_t0;
+        g->hybrid_decode_maintenance_seconds += now_sec() - maintenance_t0;
         g->hybrid_decode_total_seconds += now_sec() - handoff->handoff_t0;
         return ds4_gpu_begin_commands() != 0;
     }
@@ -13493,9 +13504,10 @@ static bool metal_graph_cpu_moe_handoff_decode_finish(
     }
     g->hybrid_decode_upload_seconds += now_sec() - upload_t0;
 
-    const double after_t0 = now_sec();
+    maintenance_t0 = now_sec();
+    metal_graph_dynamic_expert_maintenance(g, model, layer, il, sel, 1, true);
     metal_graph_dynamic_expert_after_layer(g, model, il, sel, 1, true);
-    g->hybrid_decode_maintenance_seconds += now_sec() - after_t0;
+    g->hybrid_decode_maintenance_seconds += now_sec() - maintenance_t0;
     g->hybrid_decode_total_seconds += now_sec() - handoff->handoff_t0;
     return ds4_gpu_begin_commands() != 0;
 }
@@ -15357,6 +15369,16 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
     }
+    const bool cuda_cpu_moe_overlap =
+        ok && !force_metal_moe && g->cpu_moe_layer[il] &&
+        g->backend == DS4_BACKEND_CUDA;
+    metal_graph_cpu_moe_decode_handoff cpu_moe_handoff = {0};
+    if (cuda_cpu_moe_overlap) {
+        ok = metal_graph_cpu_moe_handoff_decode_begin_norm(g,
+                                                           model,
+                                                           g->ffn_norm,
+                                                           &cpu_moe_handoff);
+    }
     const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
@@ -15381,17 +15403,11 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
-    const bool cuda_cpu_moe_overlap =
-        ok && !force_metal_moe && g->cpu_moe_layer[il] &&
-        g->backend == DS4_BACKEND_CUDA;
-    metal_graph_cpu_moe_decode_handoff cpu_moe_handoff = {0};
-    if (cuda_cpu_moe_overlap) {
-        ok = metal_graph_cpu_moe_handoff_decode_begin(g,
-                                                      model,
-                                                      g->ffn_norm,
-                                                      g->router_selected,
-                                                      g->router_weights,
-                                                      &cpu_moe_handoff);
+    if (ok && cuda_cpu_moe_overlap) {
+        ok = metal_graph_cpu_moe_handoff_decode_read_router(g,
+                                                            g->router_selected,
+                                                            g->router_weights,
+                                                            &cpu_moe_handoff);
     }
     if (ok && cuda_cpu_moe_overlap) {
         ok = metal_graph_decode_shared_ffn_out(g, model, layer, shared_dim);
