@@ -11630,6 +11630,7 @@ typedef struct {
     double layerwise_staging_sync_seconds;
     double hybrid_prefill_cpu_seconds;
     double hybrid_prefill_gpu_enqueue_seconds;
+    double hybrid_prefill_read_seconds;
     double hybrid_prefill_sync_seconds;
     double hybrid_decode_total_seconds;
     double hybrid_decode_sync_seconds;
@@ -12816,6 +12817,20 @@ static void metal_graph_layerwise_prefill_release_staged(
     g->layerwise_staged_bytes = 0;
 }
 
+static bool metal_graph_layerwise_prefill_release_needs_sync(
+        const ds4_gpu_graph *g) {
+    if (!g || !g->layerwise_staged_active) return false;
+    for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+        if (!g->layerwise_staged_expert[expert]) continue;
+        if (g->layerwise_staged_gate_owned[expert] ||
+            g->layerwise_staged_up_owned[expert] ||
+            g->layerwise_staged_down_owned[expert]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool metal_graph_cuda_expert_gpu_resident(
         ds4_gpu_graph          *g,
         const ds4_model        *model,
@@ -13401,7 +13416,8 @@ static bool metal_graph_cpu_moe_handoff_decode_begin_norm(
     if (!metal_graph_ensure_cpu_moe_scratch(g, 1)) return false;
 
     handoff->handoff_t0 = now_sec();
-    const bool need_explicit_sync = g->layerwise_staged_active;
+    const bool need_explicit_sync =
+        metal_graph_layerwise_prefill_release_needs_sync(g);
     if (need_explicit_sync) {
         const double sync_t0 = now_sec();
         if (ds4_gpu_end_commands() == 0) return false;
@@ -13530,10 +13546,12 @@ static bool metal_graph_cpu_moe_handoff(
     const bool cuda_backend = g->backend == DS4_BACKEND_CUDA;
     const bool cuda_decode = decode && cuda_backend;
     const double handoff_t0 = cuda_decode ? now_sec() : 0.0;
-    /* CUDA decode immediately reads router outputs back to host. That D2H copy
-     * is the dependency wait we actually need, so avoid a broader upfront
-     * cudaDeviceSynchronize unless staged model ranges must be released first. */
-    const bool need_explicit_sync = !cuda_decode || g->layerwise_staged_active;
+    /* CUDA handoff reads the required producer tensors back to pinned host
+     * buffers. That scoped D2H transfer is the dependency wait we actually
+     * need, so avoid a broad cudaDeviceSynchronize unless non-sticky staged
+     * ranges are about to be freed. */
+    const bool need_explicit_sync =
+        !cuda_backend || metal_graph_layerwise_prefill_release_needs_sync(g);
     if (need_explicit_sync) {
         const double sync_t0 = cuda_backend ? now_sec() : 0.0;
         if (ds4_gpu_end_commands() == 0) return false;
@@ -13569,7 +13587,7 @@ static bool metal_graph_cpu_moe_handoff(
             !g->cpu_moe_weight_host || !g->cpu_moe_out_host) {
             return false;
         }
-        const double read_t0 = cuda_decode ? now_sec() : 0.0;
+        const double read_t0 = now_sec();
         if (decode) {
             if (ds4_gpu_tensor_read_async(router_selected, 0, g->cpu_moe_selected_host, sel_bytes) == 0 ||
                 ds4_gpu_tensor_read_async(router_weights, 0, g->cpu_moe_weight_host, weight_bytes) == 0 ||
@@ -13577,15 +13595,19 @@ static bool metal_graph_cpu_moe_handoff(
                 return false;
             }
         } else {
-            if (ds4_gpu_tensor_read(ffn_norm, 0, g->cpu_moe_ffn_norm_host, x_bytes) == 0 ||
-                ds4_gpu_tensor_read(router_selected, 0, g->cpu_moe_selected_host, sel_bytes) == 0 ||
-                ds4_gpu_tensor_read(router_weights, 0, g->cpu_moe_weight_host, weight_bytes) == 0) {
+            if (ds4_gpu_begin_transfer_from_compute() == 0 ||
+                ds4_gpu_tensor_read_async(ffn_norm, 0, g->cpu_moe_ffn_norm_host, x_bytes) == 0 ||
+                ds4_gpu_tensor_read_async(router_selected, 0, g->cpu_moe_selected_host, sel_bytes) == 0 ||
+                ds4_gpu_tensor_read_async(router_weights, 0, g->cpu_moe_weight_host, weight_bytes) == 0 ||
+                ds4_gpu_wait_transfer() == 0) {
                 return false;
             }
             xs = g->cpu_moe_ffn_norm_host;
         }
         if (cuda_decode) {
             g->hybrid_decode_read_seconds += now_sec() - read_t0;
+        } else {
+            g->hybrid_prefill_read_seconds += now_sec() - read_t0;
         }
         sel = g->cpu_moe_selected_host;
         w = g->cpu_moe_weight_host;
@@ -13774,11 +13796,12 @@ static void metal_graph_free(ds4_gpu_graph *g) {
                 (unsigned long long)g->layerwise_staging_failures,
                 (unsigned long long)g->layerwise_staging_budget_skips);
         fprintf(stderr,
-                "ds4: CUDA hybrid prefill timing: cpu=%.3f s/%llu pairs gpu_enqueue=%.3f s/%llu pairs handoff_sync=%.3f s/%llu syncs\n",
+                "ds4: CUDA hybrid prefill timing: cpu=%.3f s/%llu pairs gpu_enqueue=%.3f s/%llu pairs handoff_read=%.3f s handoff_sync=%.3f s/%llu syncs\n",
                 g->hybrid_prefill_cpu_seconds,
                 (unsigned long long)g->hybrid_prefill_cpu_pairs,
                 g->hybrid_prefill_gpu_enqueue_seconds,
                 (unsigned long long)g->hybrid_prefill_gpu_pairs,
+                g->hybrid_prefill_read_seconds,
                 g->hybrid_prefill_sync_seconds,
                 (unsigned long long)g->hybrid_prefill_syncs);
         if (g->gpu_model) {
