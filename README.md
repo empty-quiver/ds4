@@ -884,6 +884,13 @@ separate CUDA upload stream and waits for them only after CPU-MoE has computed
 the remaining cold pairs. This is experimental; it is useful for measuring
 whether staging copy time is on the critical path.
 
+The compact routed-expert metadata cache experiment was removed. Server-shaped
+decode showed that prewarming larger IQ2/Q2 metadata blocks turned into extra
+memory traffic on the hot CPU-MoE dot path and dropped throughput sharply. Keep
+the raw GGUF block path plus the panelized AVX2 kernels as the CPU default until
+a future packed representation changes the loop shape enough to pay for its
+bytes.
+
 For 4090-class hybrid runs, add `DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1` to fail
 startup if any non-routed dense candidate cannot be cached in VRAM. This still
 allows optional routed expert candidates to be skipped when the VRAM budget is
@@ -908,6 +915,37 @@ Useful controls:
 * `DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAINTENANCE_INTERVAL`
 * `DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAX_PROMOTIONS`
 * `DS4_CUDA_DYNAMIC_EXPERT_DECODE_GROUP_SIZE`
+
+Known-good 4090 hybrid decode baseline for the long server fixture:
+
+```sh
+DS4_CPU_AFFINITY=1 \
+DS4_CPU_AFFINITY_LIST=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+DS4_CPU_MOE_ROW_CHUNK=8 \
+DS4_CUDA_DIRECT_MODEL=1 \
+DS4_CUDA_PARTIAL_WEIGHT_CACHE=1 \
+DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=10 \
+DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1 \
+DS4_CUDA_DYNAMIC_EXPERTS=1 \
+DS4_CUDA_DYNAMIC_EXPERT_CACHE_GB=2 \
+DS4_CUDA_DYNAMIC_EXPERT_POLICY=lru \
+DS4_CUDA_DYNAMIC_EXPERT_MAX_EVICTIONS=64 \
+DS4_CUDA_DYNAMIC_EXPERT_RESERVE_MB=1024 \
+DS4_CUDA_DYNAMIC_EXPERT_GROUP_SIZE=4 \
+DS4_CUDA_DYNAMIC_EXPERT_GROUP_EVICTION=1 \
+DS4_CUDA_DYNAMIC_EXPERT_DECODE_EAGER=1 \
+DS4_CUDA_DYNAMIC_EXPERT_DECODE_EVICT=0 \
+DS4_CUDA_DYNAMIC_EXPERT_DECODE_MIN_SCORE=8 \
+DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAINTENANCE_INTERVAL=1 \
+DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAX_PROMOTIONS=4 \
+DS4_CUDA_DYNAMIC_EXPERT_DECODE_GROUP_SIZE=4 \
+DS4_CUDA_LAYERWISE_PREFILL_STAGING=1 \
+DS4_CUDA_LAYERWISE_PREFILL_STAGING_STICKY=1 \
+DS4_CUDA_LAYERWISE_PREFILL_STAGING_OVERLAP=1 \
+DS4_CUDA_LAYERWISE_PREFILL_STAGING_MB=512 \
+DS4_CUDA_LAYERWISE_PREFILL_STAGING_MIN_PAIRS=16 \
+DS4_CUDA_LAYERWISE_PREFILL_STAGING_MAX_EXPERTS=2
+```
 
 For server-shaped cache-policy tests, use
 `scripts/bench_server_decode_cache.py`. It launches `ds4-server`, sends related

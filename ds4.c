@@ -409,6 +409,38 @@ static inline DS4_MAYBE_UNUSED __m256 ds4_mm256_fmadd_ps(__m256 a, __m256 b, __m
 #endif
 }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+#if defined(__AVX512VNNI__)
+#define DS4_HAVE_AVX512_VNNI 1
+#endif
+
+static inline DS4_MAYBE_UNUSED __m512i ds4_mm512_from_m256i(__m256i lo, __m256i hi) {
+    return _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+}
+
+#if defined(DS4_HAVE_AVX512_VNNI)
+static inline DS4_MAYBE_UNUSED __m512i ds4_mm512_sign_epi8(__m512i x, __m512i sign) {
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i neg = _mm512_sub_epi8(zero, x);
+    const __mmask64 neg_mask = _mm512_cmpgt_epi8_mask(zero, sign);
+    return _mm512_mask_blend_epi8(neg_mask, x, neg);
+}
+#endif
+
+static inline DS4_MAYBE_UNUSED float ds4_hsum_float_16(__m512 x) {
+    return ds4_hsum_float_8(_mm256_add_ps(_mm512_castps512_ps256(x),
+                                          _mm512_extractf32x8_ps(x, 1)));
+}
+
+static inline DS4_MAYBE_UNUSED __m512 ds4_mm512_fmadd_ps(__m512 a, __m512 b, __m512 c) {
+#if defined(__FMA__)
+    return _mm512_fmadd_ps(a, b, c);
+#else
+    return _mm512_add_ps(_mm512_mul_ps(a, b), c);
+#endif
+}
+#endif
+
 static inline DS4_MAYBE_UNUSED int64_t ds4_load_i8x8_as_i64(const int8_t v[8]) {
     int64_t r;
     memcpy(&r, v, sizeof(r));
@@ -3145,6 +3177,74 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
 
     *s0 = 0.25f * total0;
     *s1 = 0.25f * total1;
+#elif defined(DS4_HAVE_AVX512_VNNI)
+    const int nb = n / QK_K;
+    __m512 accum0 = _mm512_setzero_ps();
+    __m512 accum1 = _mm512_setzero_ps();
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = f16_to_f32(x0[i].d) * y[i].d;
+        const float d1 = f16_to_f32(x1[i].d) * y[i].d;
+        const uint16_t *q20 = x0[i].qs;
+        const uint16_t *q21 = x1[i].qs;
+        const int8_t *q8 = y[i].qs;
+        __m512i sumi0 = _mm512_setzero_si512();
+        __m512i sumi1 = _mm512_setzero_si512();
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m512i q8z = ds4_mm512_from_m256i(q8_1, q8_2);
+
+#define DS4_IQ2_AVX512_VNNI_ACCUM(q2_ptr, accum) do {                                  \
+                uint32_t aux32[4];                                                     \
+                memcpy(aux32, (q2_ptr), sizeof(aux32));                                \
+                (q2_ptr) += 8;                                                         \
+                const uint8_t *aux8 = (const uint8_t *)aux32;                          \
+                const __m256i q2_1 = _mm256_set_epi64x(                                \
+                    iq2xxs_grid[aux8[3]], iq2xxs_grid[aux8[2]],                       \
+                    iq2xxs_grid[aux8[1]], iq2xxs_grid[aux8[0]]);                      \
+                const __m256i q2_2 = _mm256_set_epi64x(                                \
+                    iq2xxs_grid[aux8[11]], iq2xxs_grid[aux8[10]],                     \
+                    iq2xxs_grid[aux8[9]],  iq2xxs_grid[aux8[8]]);                     \
+                const __m256i s2_1 = _mm256_set_epi64x(                                \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >> 21) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >> 14) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >>  7) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[1] >>  0) & 127]));       \
+                const __m256i s2_2 = _mm256_set_epi64x(                                \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >> 21) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >> 14) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >>  7) & 127]),        \
+                    ds4_load_i8x8_as_i64(iq2xxs_signs[(aux32[3] >>  0) & 127]));       \
+                const uint16_t ls1 = (uint16_t)(aux32[1] >> 28);                       \
+                const uint16_t ls2 = (uint16_t)(aux32[3] >> 28);                       \
+                const __m512i q2z = ds4_mm512_from_m256i(q2_1, q2_2);                  \
+                const __m512i s2z = ds4_mm512_from_m256i(s2_1, s2_2);                  \
+                const __m512i scale = ds4_mm512_from_m256i(                            \
+                    _mm256_set1_epi32((int)(2 * ls1 + 1)),                             \
+                    _mm256_set1_epi32((int)(2 * ls2 + 1)));                            \
+                const __m512i dot = _mm512_dpbusd_epi32(                               \
+                    _mm512_setzero_si512(), q2z, ds4_mm512_sign_epi8(q8z, s2z));       \
+                (accum) = _mm512_add_epi32((accum), _mm512_mullo_epi32(dot, scale));   \
+            } while (0)
+
+            DS4_IQ2_AVX512_VNNI_ACCUM(q20, sumi0);
+            DS4_IQ2_AVX512_VNNI_ACCUM(q21, sumi1);
+
+#undef DS4_IQ2_AVX512_VNNI_ACCUM
+        }
+
+        accum0 = ds4_mm512_fmadd_ps(_mm512_set1_ps(d0),
+                                    _mm512_cvtepi32_ps(sumi0),
+                                    accum0);
+        accum1 = ds4_mm512_fmadd_ps(_mm512_set1_ps(d1),
+                                    _mm512_cvtepi32_ps(sumi1),
+                                    accum1);
+    }
+
+    *s0 = 0.125f * ds4_hsum_float_16(accum0);
+    *s1 = 0.125f * ds4_hsum_float_16(accum1);
 #elif defined(__AVX2__)
     const int nb = n / QK_K;
     __m256 accum0 = _mm256_setzero_ps();
@@ -5225,22 +5325,55 @@ typedef struct {
 static void matvec_iq2_xxs_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
     matvec_iq2_xxs_mid_ctx *ctx = vctx;
 
-    for (uint64_t idx = row0; idx < row1; idx++) {
-        const int slot = (int)(idx / ctx->out_dim);
-        const uint64_t row = idx - (uint64_t)slot * ctx->out_dim;
-        float gate = 0.0f;
-        float up = 0.0f;
+    for (uint64_t task = row0; task < row1; task++) {
+        const int slot = (int)((task / ctx->out_dim) * 2);
+        const uint64_t row = task % ctx->out_dim;
+        if (slot + 1 < ctx->n_expert) {
+            const block_iq2_xxs *gate0 =
+                (const block_iq2_xxs *)(ctx->gate_base[slot + 0] + row * ctx->gate_row_bytes[slot + 0]);
+            const block_iq2_xxs *up0 =
+                (const block_iq2_xxs *)(ctx->up_base[slot + 0] + row * ctx->up_row_bytes[slot + 0]);
+            const block_iq2_xxs *gate1 =
+                (const block_iq2_xxs *)(ctx->gate_base[slot + 1] + row * ctx->gate_row_bytes[slot + 1]);
+            const block_iq2_xxs *up1 =
+                (const block_iq2_xxs *)(ctx->up_base[slot + 1] + row * ctx->up_row_bytes[slot + 1]);
+            float gate[2];
+            float up[2];
 
-        const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot]);
-        const block_iq2_xxs *up_row = (const block_iq2_xxs *)(ctx->up_base[slot] + row * ctx->up_row_bytes[slot]);
-        ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate, &up, gate_row, up_row, ctx->xq);
+            ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate[0], &up[0],
+                                          gate0, up0, ctx->xq);
+            ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate[1], &up[1],
+                                          gate1, up1, ctx->xq);
 
-        if (ctx->clamp > 1.0e-6f) {
-            if (gate > ctx->clamp) gate = ctx->clamp;
-            if (up > ctx->clamp) up = ctx->clamp;
-            if (up < -ctx->clamp) up = -ctx->clamp;
+            for (int k = 0; k < 2; k++) {
+                if (ctx->clamp > 1.0e-6f) {
+                    if (gate[k] > ctx->clamp) gate[k] = ctx->clamp;
+                    if (up[k] > ctx->clamp) up[k] = ctx->clamp;
+                    if (up[k] < -ctx->clamp) up[k] = -ctx->clamp;
+                }
+                const int s = slot + k;
+                ctx->mid[(uint64_t)s * ctx->out_dim + row] =
+                    silu(gate[k]) * up[k] * ctx->expert_weight[s];
+            }
+        } else {
+            float gate = 0.0f;
+            float up = 0.0f;
+            const block_iq2_xxs *gate_row =
+                (const block_iq2_xxs *)(ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot]);
+            const block_iq2_xxs *up_row =
+                (const block_iq2_xxs *)(ctx->up_base[slot] + row * ctx->up_row_bytes[slot]);
+
+            ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate, &up,
+                                          gate_row, up_row, ctx->xq);
+
+            if (ctx->clamp > 1.0e-6f) {
+                if (gate > ctx->clamp) gate = ctx->clamp;
+                if (up > ctx->clamp) up = ctx->clamp;
+                if (up < -ctx->clamp) up = -ctx->clamp;
+            }
+            ctx->mid[(uint64_t)slot * ctx->out_dim + row] =
+                silu(gate) * up * ctx->expert_weight[slot];
         }
-        ctx->mid[idx] = silu(gate) * up * ctx->expert_weight[slot];
     }
 }
 
@@ -5290,7 +5423,9 @@ static void matvec_iq2_xxs_experts_mid_prequant(
 
     ctx.in_dim = in_dim0;
     ctx.out_dim = out_dim0;
-    ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_iq2_xxs_mid_worker, &ctx);
+    ds4_parallel_for(((uint64_t)n_expert + 1) / 2 * out_dim0,
+                     matvec_iq2_xxs_mid_worker,
+                     &ctx);
 }
 
 typedef struct {
@@ -8521,7 +8656,8 @@ static void layer_routed_moe_one(
                                   midq + (uint64_t)i * (down_in_dim / QK_K),
                                   (int64_t)down_in_dim);
         }
-        matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
+        matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps,
+                                           midq, selected, DS4_N_EXPERT_USED);
     } else {
         for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
             const uint32_t expert = (uint32_t)selected[i];
@@ -8583,6 +8719,7 @@ static void layer_routed_moe_one_prealloc(
         float              * mid_all,
         block_q8_K         * xq,
         block_q8_K         * midq) {
+    (void)il;
     int selected[DS4_N_EXPERT_USED];
     float expert_weight[DS4_N_EXPERT_USED];
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
@@ -8615,9 +8752,8 @@ static void layer_routed_moe_one_prealloc(
                               midq + (uint64_t)i * (down_in_dim / QK_K),
                               (int64_t)down_in_dim);
     }
-    matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
-
-    (void)il;
+    matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps,
+                                       midq, selected, DS4_N_EXPERT_USED);
 }
 
 /* Single-token CPU-MoE handoff when GPU already produced the routed expert
@@ -8684,8 +8820,8 @@ static void layer_routed_moe_selected_one_n_prealloc(
     ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
     const double xq_seconds = record_timing ? now_sec() - xq_t0 : 0.0;
 
-    const double gate_up_t0 = record_timing ? now_sec() : 0.0;
     if (is_q4) {
+        const double gate_up_t0 = record_timing ? now_sec() : 0.0;
         matvec_q4_k_experts_mid_prequant(mid_all, model,
                                          layer->ffn_gate_exps,
                                          layer->ffn_up_exps,
@@ -8694,7 +8830,28 @@ static void layer_routed_moe_selected_one_n_prealloc(
                                          weight_rows,
                                          (int)n_selected,
                                          clamp);
+        const double gate_up_seconds = record_timing ? now_sec() - gate_up_t0 : 0.0;
+
+        const double midq_t0 = record_timing ? now_sec() : 0.0;
+        for (uint32_t i = 0; i < n_selected; i++) {
+            ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
+                                  midq + (uint64_t)i * (down_in_dim / QK_K),
+                                  (int64_t)down_in_dim);
+        }
+        const double midq_seconds = record_timing ? now_sec() - midq_t0 : 0.0;
+
+        const double down_t0 = record_timing ? now_sec() : 0.0;
+        matvec_q4_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, (int)n_selected);
+        if (record_timing) {
+            ds4_cpu_moe_record_decode_timing(n_selected,
+                                             setup_seconds,
+                                             xq_seconds,
+                                             gate_up_seconds,
+                                             midq_seconds,
+                                             now_sec() - down_t0);
+        }
     } else {
+        const double gate_up_t0 = record_timing ? now_sec() : 0.0;
         matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
                                             layer->ffn_gate_exps,
                                             layer->ffn_up_exps,
@@ -8703,30 +8860,27 @@ static void layer_routed_moe_selected_one_n_prealloc(
                                             weight_rows,
                                             (int)n_selected,
                                             clamp);
-    }
-    const double gate_up_seconds = record_timing ? now_sec() - gate_up_t0 : 0.0;
+        const double gate_up_seconds = record_timing ? now_sec() - gate_up_t0 : 0.0;
 
-    const double midq_t0 = record_timing ? now_sec() : 0.0;
-    for (uint32_t i = 0; i < n_selected; i++) {
-        ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
-                              midq + (uint64_t)i * (down_in_dim / QK_K),
-                              (int64_t)down_in_dim);
-    }
-    const double midq_seconds = record_timing ? now_sec() - midq_t0 : 0.0;
+        const double midq_t0 = record_timing ? now_sec() : 0.0;
+        for (uint32_t i = 0; i < n_selected; i++) {
+            ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
+                                  midq + (uint64_t)i * (down_in_dim / QK_K),
+                                  (int64_t)down_in_dim);
+        }
+        const double midq_seconds = record_timing ? now_sec() - midq_t0 : 0.0;
 
-    const double down_t0 = record_timing ? now_sec() : 0.0;
-    if (is_q4) {
-        matvec_q4_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, (int)n_selected);
-    } else {
-        matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, (int)n_selected);
-    }
-    if (record_timing) {
-        ds4_cpu_moe_record_decode_timing(n_selected,
-                                         setup_seconds,
-                                         xq_seconds,
-                                         gate_up_seconds,
-                                         midq_seconds,
-                                         now_sec() - down_t0);
+        const double down_t0 = record_timing ? now_sec() : 0.0;
+        matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps,
+                                           midq, selected, (int)n_selected);
+        if (record_timing) {
+            ds4_cpu_moe_record_decode_timing(n_selected,
+                                             setup_seconds,
+                                             xq_seconds,
+                                             gate_up_seconds,
+                                             midq_seconds,
+                                             now_sec() - down_t0);
+        }
     }
 }
 

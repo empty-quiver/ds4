@@ -265,7 +265,8 @@ static void bench_selected_one_profile(
     if (is_q4) {
         matvec_q4_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, (int)n_selected);
     } else {
-        matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, (int)n_selected);
+        matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps,
+                                           midq, selected, (int)n_selected);
     }
     stats->down_seconds += now_sec() - down_t0;
     stats->total_seconds += now_sec() - total_t0;
@@ -438,19 +439,6 @@ int main(int argc, char **argv) {
                                                  xq,
                                                  midq);
     }
-    bench_selected_one_profile(profile_out,
-                               model,
-                               layer,
-                               x,
-                               selected,
-                               weights,
-                               n_selected,
-                               mid,
-                               xq,
-                               midq,
-                               &(decode_stage_stats){0});
-    const double max_abs = bench_max_abs_diff(prod_out, profile_out, DS4_N_EMBD);
-
     const double prod_seconds = bench_production_loop(prod_out,
                                                       model,
                                                       layer,
@@ -473,6 +461,7 @@ int main(int argc, char **argv) {
                                                  xq,
                                                  midq,
                                                  iters);
+    const double max_abs = bench_max_abs_diff(prod_out, profile_out, DS4_N_EMBD);
 
     ds4_threads_init();
     const uint32_t active_threads = g_pool.n_threads ? g_pool.n_threads : 1;
@@ -481,17 +470,23 @@ int main(int argc, char **argv) {
     const double checksum = bench_checksum(prod_out, DS4_N_EMBD) +
                             bench_checksum(profile_out, DS4_N_EMBD);
 
-    printf("decode-selected-one source=%s layer=%u experts=%u threads=%u iters=%u warmup=%u avx2=%s\n",
+    printf("decode-selected-one source=%s layer=%u experts=%u threads=%u iters=%u warmup=%u cpu_isa=%s\n",
            model_path ? "model" : "synthetic",
            layer_id,
            n_selected,
            active_threads,
            iters,
            warmup,
-#if defined(__AVX2__)
-           "yes"
+#if defined(DS4_HAVE_AVX512_VNNI)
+           "avx512_vnni"
+#elif defined(__AVX2__)
+           "avx2"
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+           "neon_dotprod"
+#elif defined(__ARM_NEON)
+           "neon"
 #else
-           "no"
+           "scalar"
 #endif
     );
     printf("selected=");
