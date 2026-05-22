@@ -425,6 +425,42 @@ static uint64_t cuda_parse_mib_env(const char *name, int *present) {
     return (uint64_t)v * 1048576ull;
 }
 
+static uint64_t cuda_parse_gib_env(const char *name, int *present) {
+    const char *env = getenv(name);
+    if (present) *present = 0;
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(env, &end, 10);
+    if (end == env || *end != '\0') return 0;
+    if (present) *present = 1;
+    if (v > UINT64_MAX / 1073741824ull) return UINT64_MAX;
+    return (uint64_t)v * 1073741824ull;
+}
+
+static uint64_t cuda_env_bytes_default(const char *gb_name,
+                                       const char *mb_name,
+                                       uint64_t    def) {
+    int present = 0;
+    uint64_t v = gb_name ? cuda_parse_gib_env(gb_name, &present) : 0;
+    if (present) return v;
+    v = mb_name ? cuda_parse_mib_env(mb_name, &present) : 0;
+    return present ? v : def;
+}
+
+static int cuda_env_enabled_default(const char *name, int def) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return def;
+    if (!strcmp(env, "1") || !strcasecmp(env, "true") ||
+        !strcasecmp(env, "yes") || !strcasecmp(env, "on")) {
+        return 1;
+    }
+    if (!strcmp(env, "0") || !strcasecmp(env, "false") ||
+        !strcasecmp(env, "no") || !strcasecmp(env, "off")) {
+        return 0;
+    }
+    return def;
+}
+
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
     int present = 0;
     const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
@@ -446,7 +482,36 @@ static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
      * last few GiB on 96 GiB cards. */
     const uint64_t min_reserve = 4096ull * 1048576ull;
     const uint64_t pct_reserve = total_bytes / 20u; /* 5% */
-    return pct_reserve > min_reserve ? pct_reserve : min_reserve;
+    uint64_t computed = pct_reserve > min_reserve ? pct_reserve : min_reserve;
+
+    if (cuda_env_enabled_default("DS4_CUDA_DYNAMIC_EXPERTS", 0)) {
+        const uint64_t dynamic_budget = cuda_env_bytes_default(
+            "DS4_CUDA_DYNAMIC_EXPERT_CACHE_GB",
+            "DS4_CUDA_DYNAMIC_EXPERT_CACHE_MB",
+            1024ull * 1048576ull);
+        const uint64_t dynamic_reserve = cuda_env_bytes_default(
+            NULL,
+            "DS4_CUDA_DYNAMIC_EXPERT_RESERVE_MB",
+            2048ull * 1048576ull);
+        const uint64_t staging_budget =
+            cuda_env_enabled_default("DS4_CUDA_LAYERWISE_PREFILL_STAGING", 0)
+                ? cuda_env_bytes_default("DS4_CUDA_LAYERWISE_PREFILL_STAGING_GB",
+                                         "DS4_CUDA_LAYERWISE_PREFILL_STAGING_MB",
+                                         1024ull * 1048576ull)
+                : 0;
+        const uint64_t dynamic_slack = 2048ull * 1048576ull;
+        uint64_t dynamic_target = dynamic_budget;
+        if (UINT64_MAX - dynamic_target > dynamic_reserve) dynamic_target += dynamic_reserve;
+        else dynamic_target = UINT64_MAX;
+        if (UINT64_MAX - dynamic_target > dynamic_slack) dynamic_target += dynamic_slack;
+        else dynamic_target = UINT64_MAX;
+        if (staging_budget > dynamic_budget &&
+            UINT64_MAX - dynamic_target > staging_budget - dynamic_budget) {
+            dynamic_target += staging_budget - dynamic_budget;
+        }
+        if (dynamic_target > computed) computed = dynamic_target;
+    }
+    return computed;
 }
 
 static void cuda_q8_f16_cache_budget_notice(
@@ -2139,6 +2204,19 @@ extern "C" int ds4_gpu_sync_model_range_uploads(void) {
 
 extern "C" int ds4_gpu_uncache_model_range(const void *model_map, uint64_t offset, uint64_t bytes) {
     return cuda_model_range_release_exact(model_map, offset, bytes);
+}
+
+extern "C" int ds4_gpu_dynamic_expert_cache_has_room(uint64_t bytes) {
+    size_t free_b = 0;
+    size_t total_b = 0;
+    cudaError_t mem_err = cudaMemGetInfo(&free_b, &total_b);
+    if (mem_err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const uint64_t free_bytes = (uint64_t)free_b;
+    const uint64_t reserve = cuda_dynamic_expert_reserve_bytes((uint64_t)total_b);
+    return free_bytes > reserve && bytes <= free_bytes - reserve;
 }
 
 extern "C" int ds4_gpu_model_range_cached(const void *model_map, uint64_t offset, uint64_t bytes) {

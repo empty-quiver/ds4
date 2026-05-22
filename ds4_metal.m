@@ -4567,6 +4567,11 @@ int ds4_gpu_uncache_model_range(const void *model_map, uint64_t offset, uint64_t
     return 0;
 }
 
+int ds4_gpu_dynamic_expert_cache_has_room(uint64_t bytes) {
+    (void)bytes;
+    return 0;
+}
+
 int ds4_gpu_set_model_fd(int fd) {
     (void)fd;
     return 1;

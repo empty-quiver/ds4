@@ -5,6 +5,10 @@
 /ds4_native
 /ds4_server_test
 /ds4_test
+/tests/cpu_moe_decode_microbench
+/tests/cpu_moe_down_microbench
+/tests/cpu_moe_down_owner_microbench
+/tests/cpu_moe_gateup_microbench
 /ds4flash.gguf
 /TODO.md
 /gguf/

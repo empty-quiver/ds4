@@ -875,9 +875,69 @@ DS4_CUDA_DYNAMIC_EXPERT_DECODE_GROUP_SIZE=4 \
 `DS4_CUDA_DYNAMIC_EXPERT_DECODE_EVICT=1` allows decode promotions to evict
 existing dynamic experts. On 4090-class hybrid runs this is usually too
 aggressive unless you are deliberately testing churn. When decode eviction is
-off and the dynamic expert cache is full, decode maintenance records
-`decode_budget_skips` instead of promotion failures and skips the candidate
-search.
+off and the dynamic expert cache is logically full, decode maintenance records
+`decode_budget_skips` instead of promotion failures. When CUDA itself runs out
+of room before the logical dynamic budget is exhausted, the runtime marks the
+device expert cache full and records `room_skips`; this avoids repeatedly
+burning decode time on uploads that are known to fail. In the medium server
+fixture, this made a 512 MiB dynamic reserve usable for decode testing
+(`~16.0-16.3 t/s`) instead of spending seconds in maintenance. The safer
+end-to-end default remains a 1024 MiB reserve because it leaves more VRAM
+headroom for the next prefill.
+
+The CPU-router decode experiment was removed. Recomputing the routed expert
+selection on CPU did reduce some GPU router/read work, but it added enough CPU
+router cost that decode fell behind the normal GPU-router handoff path. The
+current useful decode counters are `all_hot` and `mixed`: on the medium fixture,
+all-hot handoffs were rare, so the hot path is still dominated by mixed
+GPU-hot/CPU-cold layers and cold expert CPU work.
+
+Decode dynamic placement is intentionally predictive rather than immediate when
+decode eviction is disabled. The runtime records the selected cold experts for
+the current token, runs that token with the existing hot/cold placement, and
+starts no-evict CUDA uploads for likely future hits while the CPU cold experts
+are executing. The upload stream is synchronized after the CPU work, so the copy
+cost is mostly hidden when the CPU path is busy. On the medium server fixture,
+this reduced decode maintenance to noise-level (`~0.002s` across two requests)
+and moved 1024 MiB-reserve decode from roughly `15.7-15.8 t/s` to
+`~16.0-16.1 t/s`. With a 512 MiB reserve it kept the aggressive policy usable at
+`~15.9-16.2 t/s`; prefill still dominates end-to-end latency in that mode.
+
+Decode promotions are also grouped by recent route sets. For each layer, the
+runtime keeps a compact bitset of the experts selected by the latest decode
+token. If the next route set has substantial overlap, it reuses the same cache
+box; otherwise it creates a new box. This is deliberately different from
+adjacent integer groups: a box represents the weird set of experts the router
+actually chose, so group eviction can retain or remove coherent routed sets.
+
+The same route-set history is used for speculative future-layer prefetch. While
+CPU cold experts are running for layer `L`, CUDA may start one no-evict upload
+for a high-scoring cold expert from a previously seen route set in layer `L+1`
+or `L+2` before filling the upload stream with same-layer replay candidates.
+Those near-future uploads can help the very next layers in the same decode
+token, while same-layer promotions mostly help the next decode token. The upload
+is still synchronized before leaving the current handoff, so correctness does
+not depend on a future layer racing an unfinished copy. The new counters are
+`route_set_updates`, `route_set_reuses`,
+`future_prefetch_attempts`, and `future_prefetch_promotions`.
+
+On the medium 64-token server fixture, the old q8-fp16 cache reserve left too
+little routed-expert headroom for this to matter: the future route path only
+managed a couple of promotions. The optional q8-fp16 cache now automatically
+reserves the configured dynamic-expert budget, the dynamic CUDA reserve, and a
+small slack margin before filling optional q8-fp16 ranges. With the 4 GiB
+dynamic expert budget and a 512 MiB dynamic reserve, this produced a 6.5 GiB
+q8-fp16 reserve, 40 future-route promotions, and `7.32s` total decode time
+across two 64-token requests. Manually raising `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB`
+to `8192` remains a useful tuning knob; that run reached 45 future promotions,
+59 all-hot decode layers, and `7.16s` total decode time.
+
+Aggressively evicting decode experts to make room for every speculative
+promotion was a negative result. It improved hot coverage but caused promotion
+and eviction churn on nearly every handoff, dropping decode to roughly `6 t/s`.
+The current constrained policy is therefore: carve out enough VRAM for the
+dynamic cache up front, keep decode uploads no-evict by default, and skip
+promotions once the dynamic cache is full.
 
 `DS4_CUDA_LAYERWISE_PREFILL_STAGING_OVERLAP=1` issues staged expert uploads on a
 separate CUDA upload stream and waits for them only after CPU-MoE has computed
@@ -900,6 +960,7 @@ Useful controls:
 
 * `DS4_CUDA_WEIGHT_CACHE_LIMIT_GB` or `DS4_CUDA_WEIGHT_CACHE_LIMIT_MB`
 * `DS4_CUDA_WEIGHT_CACHE_RESERVE_MB`
+* `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB`
 * `DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1`
 * `DS4_CUDA_ROUTE_PROFILE=/path/to/profile.tsv`
 * `DS4_CUDA_HOT_EXPERTS_FILE=/path/to/hot-experts.txt`
@@ -915,8 +976,9 @@ Useful controls:
 * `DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAINTENANCE_INTERVAL`
 * `DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAX_PROMOTIONS`
 * `DS4_CUDA_DYNAMIC_EXPERT_DECODE_GROUP_SIZE`
+* `DS4_CUDA_DYNAMIC_EXPERT_RESERVE_MB`
 
-Known-good 4090 hybrid decode baseline for the long server fixture:
+Current 4090 hybrid decode baseline for the server-shaped fixture:
 
 ```sh
 DS4_CPU_AFFINITY=1 \
@@ -927,10 +989,10 @@ DS4_CUDA_PARTIAL_WEIGHT_CACHE=1 \
 DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=10 \
 DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1 \
 DS4_CUDA_DYNAMIC_EXPERTS=1 \
-DS4_CUDA_DYNAMIC_EXPERT_CACHE_GB=2 \
+DS4_CUDA_DYNAMIC_EXPERT_CACHE_GB=4 \
 DS4_CUDA_DYNAMIC_EXPERT_POLICY=lru \
 DS4_CUDA_DYNAMIC_EXPERT_MAX_EVICTIONS=64 \
-DS4_CUDA_DYNAMIC_EXPERT_RESERVE_MB=1024 \
+DS4_CUDA_DYNAMIC_EXPERT_RESERVE_MB=512 \
 DS4_CUDA_DYNAMIC_EXPERT_GROUP_SIZE=4 \
 DS4_CUDA_DYNAMIC_EXPERT_GROUP_EVICTION=1 \
 DS4_CUDA_DYNAMIC_EXPERT_DECODE_EAGER=1 \

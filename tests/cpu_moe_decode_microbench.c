@@ -272,6 +272,143 @@ static void bench_selected_one_profile(
     stats->total_seconds += now_sec() - total_t0;
 }
 
+static void bench_selected_batch_profile_staged(
+        float                   *out,
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        uint32_t                 il,
+        const float             *norm,
+        const int32_t           *selected_rows,
+        const float             *weight_rows,
+        uint32_t                 n_tok,
+        float                   *mid,
+        block_q8_K              *xq,
+        block_q8_K              *midq,
+        uint32_t                *pair_ids,
+        decode_stage_stats      *stats) {
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_out_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    const uint64_t down_out_dim = layer->ffn_down_exps->dim[1];
+    const double total_t0 = now_sec();
+    const double setup_t0 = total_t0;
+
+    if (layer->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
+        layer->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
+        layer->ffn_down_exps->type != DS4_TENSOR_Q2_K) {
+        ds4_die("batch microbench reference only supports IQ2_XXS/IQ2_XXS/Q2_K");
+    }
+    if (expert_in_dim % QK_K != 0 || down_in_dim % QK_K != 0 ||
+        expert_out_dim != down_in_dim || down_out_dim != DS4_N_EMBD) {
+        ds4_die("batch microbench tensor layout is unexpected");
+    }
+
+    const uint32_t total_pairs = n_tok * DS4_N_EXPERT_USED;
+    uint32_t counts[DS4_N_EXPERT + 1] = {0};
+    uint32_t cursor[DS4_N_EXPERT] = {0};
+    uint32_t active_expert[DS4_N_EXPERT];
+    uint32_t n_active = 0;
+    const uint64_t xq_blocks = expert_in_dim / QK_K;
+    const uint64_t midq_blocks = down_in_dim / QK_K;
+
+    memset(out, 0, (size_t)((uint64_t)n_tok * down_out_dim) * sizeof(out[0]));
+    for (uint32_t pair_id = 0; pair_id < total_pairs; pair_id++) {
+        const int32_t expert = selected_rows[pair_id];
+        if (expert < 0 || expert >= DS4_N_EXPERT) ds4_die("batch microbench expert id is outside range");
+        counts[(uint32_t)expert + 1]++;
+    }
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        counts[e + 1] += counts[e];
+        cursor[e] = counts[e];
+        if (counts[e + 1] != counts[e]) active_expert[n_active++] = e;
+    }
+    for (uint32_t pair_id = 0; pair_id < total_pairs; pair_id++) {
+        const uint32_t expert = (uint32_t)selected_rows[pair_id];
+        pair_ids[cursor[expert]++] = pair_id;
+    }
+    stats->setup_seconds += now_sec() - setup_t0;
+
+    const double xq_t0 = now_sec();
+    for (uint32_t t = 0; t < n_tok; t++) {
+        ds4_quantize_row_q8_K(norm + (uint64_t)t * expert_in_dim,
+                              xq + (uint64_t)t * xq_blocks,
+                              (int64_t)expert_in_dim);
+    }
+    stats->xq_seconds += now_sec() - xq_t0;
+
+    const double gate_up_t0 = now_sec();
+    matvec_iq2_xxs_batch_mid_ctx mid_ctx = {
+        .mid = mid,
+        .xq = xq,
+        .pair_ids = pair_ids,
+        .expert_offset = counts,
+        .active_expert = active_expert,
+        .pair_weight = weight_rows,
+        .clamp = DS4_SWIGLU_CLAMP_EXP,
+        .in_dim = expert_in_dim,
+        .out_dim = expert_out_dim,
+        .xq_blocks = xq_blocks,
+    };
+    for (uint32_t ai = 0; ai < n_active; ai++) {
+        const uint32_t expert = active_expert[ai];
+        uint64_t gate_in_dim, gate_out_dim;
+        uint64_t up_in_dim, up_out_dim;
+        mid_ctx.gate_base[expert] = tensor_expert_bytes(model, layer->ffn_gate_exps, expert,
+                                                        &gate_in_dim, &gate_out_dim, &mid_ctx.gate_row_bytes[expert]);
+        mid_ctx.up_base[expert] = tensor_expert_bytes(model, layer->ffn_up_exps, expert,
+                                                      &up_in_dim, &up_out_dim, &mid_ctx.up_row_bytes[expert]);
+        if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
+            gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
+            ds4_die("batch microbench gate/up tensor layout mismatch");
+        }
+    }
+    ds4_cpu_moe_parallel_expert_rows(il,
+                                      active_expert,
+                                      n_active,
+                                      expert_out_dim,
+                                      ds4_cpu_moe_row_chunk(),
+                                      matvec_iq2_xxs_batch_mid_expert_rows,
+                                      &mid_ctx);
+    stats->gate_up_seconds += now_sec() - gate_up_t0;
+
+    const double midq_t0 = now_sec();
+    quantize_mid_pairs_ctx quant_ctx = {
+        .mid = mid,
+        .midq = midq,
+        .down_in_dim = down_in_dim,
+        .down_blocks = midq_blocks,
+    };
+    ds4_parallel_for(total_pairs, quantize_mid_pairs_worker, &quant_ctx);
+    stats->midq_seconds += now_sec() - midq_t0;
+
+    const double down_t0 = now_sec();
+    matvec_q2_k_batch_accum_rows_ctx down_ctx = {
+        .moe = out,
+        .midq = midq,
+        .pair_ids = pair_ids,
+        .expert_offset = counts,
+        .active_expert = active_expert,
+        .n_active = n_active,
+        .n_pairs = total_pairs,
+        .n_tok = n_tok,
+        .in_dim = down_in_dim,
+        .out_dim = down_out_dim,
+        .midq_blocks = midq_blocks,
+    };
+    for (uint32_t ai = 0; ai < n_active; ai++) {
+        const uint32_t expert = active_expert[ai];
+        uint64_t in_dim, out_dim;
+        down_ctx.base[expert] = tensor_expert_bytes(model, layer->ffn_down_exps, expert,
+                                                    &in_dim, &out_dim, &down_ctx.row_bytes[expert]);
+        if (in_dim != down_in_dim || out_dim != down_out_dim) {
+            ds4_die("batch microbench down tensor layout mismatch");
+        }
+    }
+    matvec_q2_k_batch_accum_down_auto(&down_ctx);
+    stats->down_seconds += now_sec() - down_t0;
+    stats->total_seconds += now_sec() - total_t0;
+}
+
 static double bench_production_loop(
         float                   *out,
         const ds4_model         *model,
@@ -330,6 +467,72 @@ static decode_stage_stats bench_profile_loop(
     return stats;
 }
 
+static double bench_batch_production_loop(
+        float                   *out,
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        uint32_t                 il,
+        const float             *norm,
+        const int32_t           *selected_rows,
+        const float             *weights,
+        uint32_t                 n_tok,
+        float                   *mid,
+        block_q8_K              *xq,
+        block_q8_K              *midq,
+        uint32_t                *pair_ids,
+        uint32_t                 iters) {
+    const double t0 = now_sec();
+    for (uint32_t it = 0; it < iters; it++) {
+        layer_routed_moe_selected_batch_prealloc(out,
+                                                 model,
+                                                 layer,
+                                                 il,
+                                                 norm,
+                                                 selected_rows,
+                                                 weights,
+                                                 n_tok,
+                                                 DS4_SWIGLU_CLAMP_EXP,
+                                                 mid,
+                                                 xq,
+                                                 midq,
+                                                 pair_ids);
+    }
+    return now_sec() - t0;
+}
+
+static decode_stage_stats bench_batch_profile_loop_staged(
+        float                   *out,
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        uint32_t                 il,
+        const float             *norm,
+        const int32_t           *selected_rows,
+        const float             *weights,
+        uint32_t                 n_tok,
+        float                   *mid,
+        block_q8_K              *xq,
+        block_q8_K              *midq,
+        uint32_t                *pair_ids,
+        uint32_t                 iters) {
+    decode_stage_stats stats = {0};
+    for (uint32_t it = 0; it < iters; it++) {
+        bench_selected_batch_profile_staged(out,
+                                            model,
+                                            layer,
+                                            il,
+                                            norm,
+                                            selected_rows,
+                                            weights,
+                                            n_tok,
+                                            mid,
+                                            xq,
+                                            midq,
+                                            pair_ids,
+                                            &stats);
+    }
+    return stats;
+}
+
 static double bench_checksum(const float *a, uint64_t n) {
     double sum = 0.0;
     for (uint64_t i = 0; i < n; i++) {
@@ -354,6 +557,7 @@ int main(int argc, char **argv) {
     uint32_t iters = 64;
     uint32_t warmup = 4;
     uint32_t threads = 0;
+    uint32_t n_tok = 1;
     uint32_t synthetic_experts = DS4_N_EXPERT_USED;
     int32_t selected[DS4_N_EXPERT_USED];
     uint32_t n_selected = DS4_N_EXPERT_USED;
@@ -366,16 +570,21 @@ int main(int argc, char **argv) {
         iters = bench_parse_u32(&i, argc, argv, "--iters", iters);
         warmup = bench_parse_u32(&i, argc, argv, "--warmup", warmup);
         threads = bench_parse_u32(&i, argc, argv, "--threads", threads);
+        n_tok = bench_parse_u32(&i, argc, argv, "--tokens", n_tok);
         synthetic_experts = bench_parse_u32(&i, argc, argv, "--synthetic-experts", synthetic_experts);
         if (strcmp(argv[i], "--help") == 0) {
             fprintf(stderr,
-                    "usage: %s [--model GGUF] [--layer N] [--selected e0,e1,...] [--iters N] [--warmup N] [--threads N]\n",
+                    "usage: %s [--model GGUF] [--layer N] [--selected e0,e1,...] [--tokens N] [--iters N] [--warmup N] [--threads N]\n",
                     argv[0]);
             return 0;
         }
     }
     bench_parse_selected(selected_arg, selected, &n_selected);
     if (layer_id >= DS4_N_LAYER) ds4_die("--layer is outside DS4 layer range");
+    if (n_tok == 0) ds4_die("--tokens must be at least 1");
+    if (n_tok > 1 && n_selected != DS4_N_EXPERT_USED) {
+        ds4_die("batch microbench requires exactly DS4_N_EXPERT_USED selected experts");
+    }
     if (threads != 0) g_requested_threads = threads;
 
     uint64_t rng = UINT64_C(0x9e3779b97f4a7c15);
@@ -410,69 +619,141 @@ int main(int argc, char **argv) {
         }
     }
 
-    float *x = xmalloc((size_t)DS4_N_EMBD * sizeof(x[0]));
-    float *weights = xmalloc((size_t)n_selected * sizeof(weights[0]));
-    float *mid = xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(mid[0]));
-    block_q8_K *xq = xmalloc((size_t)(DS4_N_EMBD / QK_K) * sizeof(xq[0]));
-    block_q8_K *midq = xmalloc((size_t)(DS4_N_EXPERT_USED * (DS4_N_FF_EXP / QK_K)) * sizeof(midq[0]));
-    float *prod_out = xmalloc((size_t)DS4_N_EMBD * sizeof(prod_out[0]));
-    float *profile_out = xmalloc((size_t)DS4_N_EMBD * sizeof(profile_out[0]));
+    const bool batch_mode = n_tok > 1;
+    const uint32_t total_pairs = batch_mode ? n_tok * DS4_N_EXPERT_USED : DS4_N_EXPERT_USED;
+    const uint64_t output_elems = (uint64_t)n_tok * DS4_N_EMBD;
+    float *x = xmalloc((size_t)((uint64_t)n_tok * DS4_N_EMBD) * sizeof(x[0]));
+    float *weights = xmalloc((size_t)total_pairs * sizeof(weights[0]));
+    int32_t *selected_rows = xmalloc((size_t)total_pairs * sizeof(selected_rows[0]));
+    float *mid = xmalloc((size_t)((uint64_t)total_pairs * DS4_N_FF_EXP) * sizeof(mid[0]));
+    block_q8_K *xq = xmalloc((size_t)((uint64_t)n_tok * (DS4_N_EMBD / QK_K)) * sizeof(xq[0]));
+    block_q8_K *midq = xmalloc((size_t)((uint64_t)total_pairs * (DS4_N_FF_EXP / QK_K)) * sizeof(midq[0]));
+    uint32_t *pair_ids = xmalloc((size_t)total_pairs * sizeof(pair_ids[0]));
+    float *prod_out = xmalloc((size_t)output_elems * sizeof(prod_out[0]));
+    float *profile_out = xmalloc((size_t)output_elems * sizeof(profile_out[0]));
 
-    for (uint32_t i = 0; i < DS4_N_EMBD; i++) x[i] = bench_rng_f32(&rng);
-    float sum_w = 0.0f;
-    for (uint32_t i = 0; i < n_selected; i++) {
-        weights[i] = 0.5f + fabsf(bench_rng_f32(&rng));
-        sum_w += weights[i];
+    for (uint64_t i = 0; i < (uint64_t)n_tok * DS4_N_EMBD; i++) x[i] = bench_rng_f32(&rng);
+    if (batch_mode) {
+        for (uint32_t t = 0; t < n_tok; t++) {
+            float sum_w = 0.0f;
+            for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+                const uint32_t pair_id = t * DS4_N_EXPERT_USED + slot;
+                selected_rows[pair_id] = selected[slot];
+                weights[pair_id] = 0.5f + fabsf(bench_rng_f32(&rng));
+                sum_w += weights[pair_id];
+            }
+            for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+                weights[t * DS4_N_EXPERT_USED + slot] /= sum_w;
+            }
+        }
+    } else {
+        float sum_w = 0.0f;
+        for (uint32_t i = 0; i < n_selected; i++) {
+            weights[i] = 0.5f + fabsf(bench_rng_f32(&rng));
+            sum_w += weights[i];
+        }
+        for (uint32_t i = 0; i < n_selected; i++) weights[i] /= sum_w;
     }
-    for (uint32_t i = 0; i < n_selected; i++) weights[i] /= sum_w;
 
-    for (uint32_t i = 0; i < warmup; i++) {
-        layer_routed_moe_selected_one_n_prealloc(prod_out,
-                                                 model,
-                                                 layer,
-                                                 x,
-                                                 selected,
-                                                 weights,
-                                                 n_selected,
-                                                 DS4_SWIGLU_CLAMP_EXP,
-                                                 mid,
-                                                 xq,
-                                                 midq);
+    if (batch_mode) {
+        for (uint32_t i = 0; i < warmup; i++) {
+            layer_routed_moe_selected_batch_prealloc(prod_out,
+                                                     model,
+                                                     layer,
+                                                     layer_id,
+                                                     x,
+                                                     selected_rows,
+                                                     weights,
+                                                     n_tok,
+                                                     DS4_SWIGLU_CLAMP_EXP,
+                                                     mid,
+                                                     xq,
+                                                     midq,
+                                                     pair_ids);
+        }
+    } else {
+        for (uint32_t i = 0; i < warmup; i++) {
+            layer_routed_moe_selected_one_n_prealloc(prod_out,
+                                                     model,
+                                                     layer,
+                                                     x,
+                                                     selected,
+                                                     weights,
+                                                     n_selected,
+                                                     DS4_SWIGLU_CLAMP_EXP,
+                                                     mid,
+                                                     xq,
+                                                     midq);
+        }
     }
-    const double prod_seconds = bench_production_loop(prod_out,
-                                                      model,
-                                                      layer,
-                                                      x,
-                                                      selected,
-                                                      weights,
-                                                      n_selected,
-                                                      mid,
-                                                      xq,
-                                                      midq,
-                                                      iters);
-    decode_stage_stats prof = bench_profile_loop(profile_out,
-                                                 model,
-                                                 layer,
-                                                 x,
-                                                 selected,
-                                                 weights,
-                                                 n_selected,
-                                                 mid,
-                                                 xq,
-                                                 midq,
-                                                 iters);
-    const double max_abs = bench_max_abs_diff(prod_out, profile_out, DS4_N_EMBD);
+
+    double prod_seconds;
+    decode_stage_stats prof;
+    if (batch_mode) {
+        prod_seconds = bench_batch_production_loop(prod_out,
+                                                   model,
+                                                   layer,
+                                                   layer_id,
+                                                   x,
+                                                   selected_rows,
+                                                   weights,
+                                                   n_tok,
+                                                   mid,
+                                                   xq,
+                                                   midq,
+                                                   pair_ids,
+                                                   iters);
+        prof = bench_batch_profile_loop_staged(profile_out,
+                                               model,
+                                               layer,
+                                               layer_id,
+                                               x,
+                                               selected_rows,
+                                               weights,
+                                               n_tok,
+                                               mid,
+                                               xq,
+                                               midq,
+                                               pair_ids,
+                                               iters);
+    } else {
+        prod_seconds = bench_production_loop(prod_out,
+                                             model,
+                                             layer,
+                                             x,
+                                             selected,
+                                             weights,
+                                             n_selected,
+                                             mid,
+                                             xq,
+                                             midq,
+                                             iters);
+        prof = bench_profile_loop(profile_out,
+                                  model,
+                                  layer,
+                                  x,
+                                  selected,
+                                  weights,
+                                  n_selected,
+                                  mid,
+                                  xq,
+                                  midq,
+                                  iters);
+    }
+    const double max_abs = bench_max_abs_diff(prod_out, profile_out, output_elems);
 
     ds4_threads_init();
     const uint32_t active_threads = g_pool.n_threads ? g_pool.n_threads : 1;
     const double prod_us = 1.0e6 * prod_seconds / (double)iters;
     const double prof_us = 1.0e6 * prof.total_seconds / (double)iters;
-    const double checksum = bench_checksum(prod_out, DS4_N_EMBD) +
-                            bench_checksum(profile_out, DS4_N_EMBD);
+    const double checksum = bench_checksum(prod_out, output_elems) +
+                            bench_checksum(profile_out, output_elems);
 
-    printf("decode-selected-one source=%s layer=%u experts=%u threads=%u iters=%u warmup=%u cpu_isa=%s\n",
+    printf("%s source=%s layer=%u tokens=%u experts=%u threads=%u iters=%u warmup=%u cpu_isa=%s\n",
+           batch_mode ? "decode-selected-batch" : "decode-selected-one",
            model_path ? "model" : "synthetic",
            layer_id,
+           n_tok,
            n_selected,
            active_threads,
            iters,
@@ -499,10 +780,20 @@ int main(int argc, char **argv) {
            prod_seconds,
            prod_us,
            (double)iters / prod_seconds);
+    if (batch_mode) {
+        printf("production us_per_token=%.3f tokens_per_s=%.3f\n",
+               prod_us / (double)n_tok,
+               (double)(iters * n_tok) / prod_seconds);
+    }
     printf("profiled seconds=%.6f us_per_call=%.3f calls_per_s=%.3f\n",
            prof.total_seconds,
            prof_us,
            (double)iters / prof.total_seconds);
+    if (batch_mode) {
+        printf("profiled us_per_token=%.3f tokens_per_s=%.3f\n",
+               prof_us / (double)n_tok,
+               (double)(iters * n_tok) / prof.total_seconds);
+    }
     printf("stage_us_per_call setup=%.3f xq=%.3f gate_up=%.3f midq=%.3f down=%.3f\n",
            1.0e6 * prof.setup_seconds / (double)iters,
            1.0e6 * prof.xq_seconds / (double)iters,
@@ -519,9 +810,11 @@ int main(int argc, char **argv) {
     ds4_threads_shutdown();
     free(profile_out);
     free(prod_out);
+    free(pair_ids);
     free(midq);
     free(xq);
     free(mid);
+    free(selected_rows);
     free(weights);
     free(x);
     if (model_path) {
