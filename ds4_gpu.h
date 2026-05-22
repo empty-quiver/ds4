@@ -53,6 +53,7 @@ int ds4_gpu_set_model_map_ranges(const void *model_map, uint64_t model_size,
                                  const uint64_t *map_offsets, const uint64_t *map_sizes,
                                  uint32_t n_ranges);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+int ds4_gpu_cache_model_range_device(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_model_range_releasable(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_model_range_releasable_async(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_sync_model_range_uploads(void);

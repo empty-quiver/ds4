@@ -66,6 +66,8 @@ typedef struct {
     int n_threads;
     int mtp_draft_tokens;
     float mtp_margin;
+    bool cache_mtp_weights;
+    bool mtp_cpu;
     const char *directional_steering_file;
     float directional_steering_attn;
     float directional_steering_ffn;
@@ -93,6 +95,29 @@ typedef struct {
     uint64_t len;
     uint64_t cap;
 } ds4_session_snapshot;
+
+typedef struct {
+    uint64_t attempts;
+    uint64_t strict_attempts;
+    uint64_t fast_attempts;
+    uint64_t no_draft_available;
+    uint64_t first_draft_hit;
+    uint64_t first_draft_miss;
+    uint64_t draft_tokens;
+    uint64_t accepted_draft_tokens;
+    uint64_t full_accepts;
+    uint64_t partial_accepts;
+    uint64_t zero_accepts;
+    uint64_t margin_skips;
+    uint64_t micro_verifier;
+    uint64_t exact_decode2_verifier;
+    uint64_t sequential_verifier;
+    uint64_t sequential_fallback;
+    uint64_t draft_failures;
+    uint64_t verifier_failures;
+    uint64_t prefix1_commits;
+    uint64_t exact_replays;
+} ds4_mtp_stats;
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
@@ -181,6 +206,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+void ds4_session_mtp_stats(ds4_session *s, ds4_mtp_stats *out);
+void ds4_session_mtp_stats_reset(ds4_session *s);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

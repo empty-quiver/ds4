@@ -90,6 +90,10 @@ static void usage(FILE *fp) {
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F\n"
         "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
+        "  --mtp-gpu\n"
+        "      Cache the MTP support GGUF tensor weights in CUDA device memory.\n"
+        "  --mtp-cpu\n"
+        "      Run the MTP drafter on CPU using pinned host memory for CUDA handoff.\n"
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
@@ -1275,6 +1279,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
+        } else if (!strcmp(arg, "--mtp-gpu")) {
+            c.engine.cache_mtp_weights = true;
+        } else if (!strcmp(arg, "--mtp-cpu")) {
+            c.engine.mtp_cpu = true;
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {

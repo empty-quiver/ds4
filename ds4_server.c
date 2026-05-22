@@ -10094,6 +10094,73 @@ static void log_flags(char *buf, size_t len, bool responses_protocol,
 #undef ADD_FLAG
 }
 
+static ds4_mtp_stats mtp_stats_delta(const ds4_mtp_stats *before,
+                                     const ds4_mtp_stats *after) {
+    ds4_mtp_stats d = {0};
+#define DELTA_FIELD(name) do { \
+    d.name = after->name >= before->name ? after->name - before->name : after->name; \
+} while (0)
+    DELTA_FIELD(attempts);
+    DELTA_FIELD(strict_attempts);
+    DELTA_FIELD(fast_attempts);
+    DELTA_FIELD(no_draft_available);
+    DELTA_FIELD(first_draft_hit);
+    DELTA_FIELD(first_draft_miss);
+    DELTA_FIELD(draft_tokens);
+    DELTA_FIELD(accepted_draft_tokens);
+    DELTA_FIELD(full_accepts);
+    DELTA_FIELD(partial_accepts);
+    DELTA_FIELD(zero_accepts);
+    DELTA_FIELD(margin_skips);
+    DELTA_FIELD(micro_verifier);
+    DELTA_FIELD(exact_decode2_verifier);
+    DELTA_FIELD(sequential_verifier);
+    DELTA_FIELD(sequential_fallback);
+    DELTA_FIELD(draft_failures);
+    DELTA_FIELD(verifier_failures);
+    DELTA_FIELD(prefix1_commits);
+    DELTA_FIELD(exact_replays);
+#undef DELTA_FIELD
+    return d;
+}
+
+static bool mtp_stats_any(const ds4_mtp_stats *st) {
+    return st &&
+           (st->attempts || st->draft_tokens || st->accepted_draft_tokens ||
+            st->first_draft_hit || st->first_draft_miss ||
+            st->draft_failures || st->verifier_failures);
+}
+
+static void log_mtp_stats(req_kind kind, const char *ctx_span, int completion,
+                          const ds4_mtp_stats *st) {
+    if (!mtp_stats_any(st)) return;
+    server_log(DS4_LOG_GENERATION,
+               "ds4-server: %s ctx=%s gen=%d mtp attempts=%llu strict=%llu fast=%llu no_draft=%llu first_hit=%llu first_miss=%llu drafted=%llu accepted=%llu full=%llu partial=%llu zero=%llu margin_skip=%llu micro=%llu exact2=%llu seq=%llu seq_fallback=%llu draft_fail=%llu verify_fail=%llu prefix1=%llu exact_replay=%llu",
+               kind == REQ_CHAT ? "chat" : "completion",
+               ctx_span,
+               completion,
+               (unsigned long long)st->attempts,
+               (unsigned long long)st->strict_attempts,
+               (unsigned long long)st->fast_attempts,
+               (unsigned long long)st->no_draft_available,
+               (unsigned long long)st->first_draft_hit,
+               (unsigned long long)st->first_draft_miss,
+               (unsigned long long)st->draft_tokens,
+               (unsigned long long)st->accepted_draft_tokens,
+               (unsigned long long)st->full_accepts,
+               (unsigned long long)st->partial_accepts,
+               (unsigned long long)st->zero_accepts,
+               (unsigned long long)st->margin_skips,
+               (unsigned long long)st->micro_verifier,
+               (unsigned long long)st->exact_decode2_verifier,
+               (unsigned long long)st->sequential_verifier,
+               (unsigned long long)st->sequential_fallback,
+               (unsigned long long)st->draft_failures,
+               (unsigned long long)st->verifier_failures,
+               (unsigned long long)st->prefix1_commits,
+               (unsigned long long)st->exact_replays);
+}
+
 static void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
                                 bool responses_protocol,
                                 bool tools, bool thinking,
@@ -10862,6 +10929,8 @@ static void generate_job(server *s, job *j) {
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
+    ds4_mtp_stats mtp_stats_before = {0};
+    ds4_session_mtp_stats(s->session, &mtp_stats_before);
     thinking_state thinking = thinking_state_from_prompt(&j->req);
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
@@ -11220,6 +11289,11 @@ static void generate_job(server *s, job *j) {
     } else if (!parsed_calls.len) {
         thinking_live_clear(s);
     }
+
+    ds4_mtp_stats mtp_stats_after = {0};
+    ds4_session_mtp_stats(s->session, &mtp_stats_after);
+    ds4_mtp_stats mtp_delta = mtp_stats_delta(&mtp_stats_before, &mtp_stats_after);
+    log_mtp_stats(j->req.kind, ctx_span, completion, &mtp_delta);
 
     if (j->req.stream) {
         bool response_ok = true;
@@ -11781,6 +11855,10 @@ static void usage(FILE *fp) {
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F\n"
         "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
+        "  --mtp-gpu\n"
+        "      Cache the MTP support GGUF tensor weights in CUDA device memory.\n"
+        "  --mtp-cpu\n"
+        "      Run the MTP drafter on CPU using pinned host memory for CUDA handoff.\n"
         "  -c, --ctx N\n"
         "      Context size allocated at startup. Default: 32768\n"
         "  -n, --tokens N\n"
@@ -11918,6 +11996,10 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
+        } else if (!strcmp(arg, "--mtp-gpu")) {
+            c.engine.cache_mtp_weights = true;
+        } else if (!strcmp(arg, "--mtp-cpu")) {
+            c.engine.mtp_cpu = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {

@@ -1594,13 +1594,27 @@ static int cuda_model_range_release_exact(
         uint64_t offset,
         uint64_t bytes) {
     if (!model_map || bytes == 0) return 1;
+    size_t idx = SIZE_MAX;
     auto it = g_model_range_by_offset.find(offset);
-    if (it == g_model_range_by_offset.end()) return 0;
-    if (it->second >= g_model_ranges.size()) {
+    if (it != g_model_range_by_offset.end() && it->second >= g_model_ranges.size()) {
         g_model_range_by_offset.erase(it);
-        return 0;
+        it = g_model_range_by_offset.end();
     }
-    cuda_model_range &r = g_model_ranges[it->second];
+    if (it != g_model_range_by_offset.end()) {
+        const cuda_model_range &r = g_model_ranges[it->second];
+        if (r.host_base == model_map && r.offset == offset && r.bytes == bytes) idx = it->second;
+    }
+    if (idx == SIZE_MAX) {
+        for (size_t i = 0; i < g_model_ranges.size(); i++) {
+            const cuda_model_range &r = g_model_ranges[i];
+            if (r.host_base == model_map && r.offset == offset && r.bytes == bytes) {
+                idx = i;
+                break;
+            }
+        }
+    }
+    if (idx == SIZE_MAX) return 0;
+    cuda_model_range &r = g_model_ranges[idx];
     if (r.host_base != model_map || r.offset != offset || r.bytes != bytes ||
         r.host_registered || r.arena_allocated || !r.device_ptr) {
         return 0;
@@ -1610,7 +1624,9 @@ static int cuda_model_range_release_exact(
     if (g_model_range_bytes >= r.bytes) g_model_range_bytes -= r.bytes;
     else g_model_range_bytes = 0;
     r = {};
-    g_model_range_by_offset.erase(it);
+    if (it != g_model_range_by_offset.end() && it->second == idx) {
+        g_model_range_by_offset.erase(it);
+    }
     return 1;
 }
 
@@ -2203,6 +2219,15 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
     if (!ptr) return 0;
     if (force_device_cache) return cuda_model_range_is_device_cached(model_map, offset, bytes);
     return cuda_model_range_lookup_cached(model_map, offset, bytes) != NULL;
+}
+
+extern "C" int ds4_gpu_cache_model_range_device(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+    if (!model_map || bytes == 0) return 1;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+    const char *cache_label = label ? label : "model_tensor";
+    const char *ptr = cuda_model_range_cache_device(model_map, model_size, offset, bytes, cache_label);
+    if (!ptr) return 0;
+    return cuda_model_range_is_device_cached(model_map, offset, bytes);
 }
 
 extern "C" int ds4_gpu_cache_model_range_releasable(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
