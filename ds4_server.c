@@ -41,6 +41,7 @@ static volatile sig_atomic_t g_listen_fd = -1;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
+#define DS4_SERVER_CANCEL_POLL_MS 100
 
 static void stop_signal_handler(int sig) {
     (void)sig;
@@ -7663,10 +7664,31 @@ struct job {
     int fd;
     request req;
     bool done;
+    bool cancelled;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
 };
+
+static bool job_is_cancelled(job *j) {
+    if (!j) return false;
+    pthread_mutex_lock(&j->mu);
+    bool cancelled = j->cancelled;
+    pthread_mutex_unlock(&j->mu);
+    return cancelled;
+}
+
+static bool job_mark_cancelled(job *j) {
+    if (!j) return false;
+    pthread_mutex_lock(&j->mu);
+    bool changed = false;
+    if (!j->done && !j->cancelled) {
+        j->cancelled = true;
+        changed = true;
+    }
+    pthread_mutex_unlock(&j->mu);
+    return changed;
+}
 
 /* =========================================================================
  * Tool Call Text Memory.
@@ -10194,6 +10216,26 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
     *last_completion = completion;
 }
 
+static void log_cancelled_generation(req_kind kind, const char *ctx_span,
+                                     int completion,
+                                     bool responses_protocol,
+                                     bool tools, bool thinking,
+                                     bool dsml_start, bool dsml_end,
+                                     bool invalidated, double t0) {
+    char flags[80];
+    log_flags(flags, sizeof(flags), responses_protocol,
+              tools, thinking, dsml_start, dsml_end);
+    server_log(DS4_LOG_GENERATION,
+               "ds4-server: %s ctx=%s gen=%d%s%s finish=cancelled invalidated=%d %.3fs",
+               kind == REQ_CHAT ? "chat" : "completion",
+               ctx_span,
+               completion,
+               flags[0] ? " " : "",
+               flags,
+               invalidated ? 1 : 0,
+               now_sec() - t0);
+}
+
 typedef struct {
     bool inside;
     char tail[8]; /* Long enough for "</think>". */
@@ -10570,6 +10612,8 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
 static void generate_job(server *s, job *j) {
+    if (job_is_cancelled(j)) return;
+
     char err[160];
     err[0] = '\0';
     const int old_pos = ds4_session_pos(s->session);
@@ -10846,6 +10890,20 @@ static void generate_job(server *s, job *j) {
                req_flags[0] ? " " : "",
                req_flags,
                now_sec() - t0);
+    if (job_is_cancelled(j)) {
+        responses_live_clear(s);
+        anthropic_live_clear(s);
+        thinking_live_clear(s);
+        trace_event(s, trace_id, "request cancelled after prefill before decode");
+        tool_calls empty_calls = {0};
+        trace_finish(s, trace_id, &j->req, "cancelled", 0, false, false,
+                     "", NULL, &empty_calls, now_sec() - t0);
+        log_cancelled_generation(j->req.kind, ctx_span, 0,
+                                 responses_protocol, j->req.has_tools,
+                                 false, false, false, false, t0);
+        ds4_tokens_free(&effective_prompt);
+        return;
+    }
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, cold_store_len);
@@ -10937,8 +10995,10 @@ static void generate_job(server *s, job *j) {
         thinking_gates_tool_markers && thinking.inside;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
+    bool cancelled = false;
+    bool sampled_session_tail = false;
 
-    while (!g_stop_requested && completion < max_tokens &&
+    while (!g_stop_requested && !job_is_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
@@ -10983,6 +11043,7 @@ static void generate_job(server *s, job *j) {
                 finish = "error";
                 break;
             }
+            if (ntok > 0) sampled_session_tail = true;
         } else {
             if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
                 finish = "error";
@@ -10990,11 +11051,18 @@ static void generate_job(server *s, job *j) {
             }
             toks[0] = token;
             ntok = 1;
+            sampled_session_tail = true;
         }
 
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             token = toks[ti];
+            if (job_is_cancelled(j)) {
+                cancelled = true;
+                finish = "cancelled";
+                stop_decode = true;
+                break;
+            }
             if (token == ds4_token_eos(s->engine)) {
                 finish = "stop";
                 stop_decode = true;
@@ -11031,7 +11099,9 @@ static void generate_job(server *s, job *j) {
                 bool ok = sse_chunk(j->fd, &j->req, id, delta, NULL);
                 free(delta);
                 if (!ok) {
-                    finish = "error";
+                    job_mark_cancelled(j);
+                    cancelled = true;
+                    finish = "cancelled";
                     snprintf(err, sizeof(err), "client stream write failed");
                     free(piece);
                     stop_decode = true;
@@ -11043,7 +11113,9 @@ static void generate_job(server *s, job *j) {
                 !anthropic_sse_stream_update(j->fd, s, &j->req, id,
                                              &anthropic_live, text.ptr, stream_len,
                                              false)) {
-                finish = "error";
+                job_mark_cancelled(j);
+                cancelled = true;
+                finish = "cancelled";
                 snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
                 stop_decode = true;
@@ -11053,7 +11125,9 @@ static void generate_job(server *s, job *j) {
                 !openai_sse_stream_update(j->fd, s, &j->req, id,
                                           &openai_live, text.ptr, stream_len,
                                           false)) {
-                finish = "error";
+                job_mark_cancelled(j);
+                cancelled = true;
+                finish = "cancelled";
                 snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
                 stop_decode = true;
@@ -11063,7 +11137,9 @@ static void generate_job(server *s, job *j) {
                 !responses_sse_stream_update(j->fd, &j->req,
                                              &responses_live, text.ptr, stream_len,
                                              false)) {
-                finish = "error";
+                job_mark_cancelled(j);
+                cancelled = true;
+                finish = "cancelled";
                 snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
                 stop_decode = true;
@@ -11152,6 +11228,10 @@ static void generate_job(server *s, job *j) {
         }
         if (stop_decode) break;
     }
+    if (!cancelled && job_is_cancelled(j)) {
+        cancelled = true;
+        finish = "cancelled";
+    }
 
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
@@ -11178,6 +11258,35 @@ static void generate_job(server *s, job *j) {
                             decode_t0,
                             &last_decode_log_t,
                             &last_decode_log_completion);
+    }
+
+    if (cancelled) {
+        if (sampled_session_tail) ds4_session_invalidate(s->session);
+        responses_live_clear(s);
+        anthropic_live_clear(s);
+        thinking_live_clear(s);
+        trace_event(s, trace_id,
+                    "request cancelled during decode: gen=%d invalidated=%d",
+                    completion, sampled_session_tail ? 1 : 0);
+        tool_calls empty_calls = {0};
+        trace_finish(s, trace_id, &j->req, "cancelled", completion,
+                     saw_tool_start, saw_tool_end,
+                     text.ptr ? text.ptr : "", NULL, &empty_calls,
+                     now_sec() - t0);
+        ds4_mtp_stats mtp_stats_after = {0};
+        ds4_session_mtp_stats(s->session, &mtp_stats_after);
+        ds4_mtp_stats mtp_delta = mtp_stats_delta(&mtp_stats_before, &mtp_stats_after);
+        log_mtp_stats(j->req.kind, ctx_span, completion, &mtp_delta);
+        log_cancelled_generation(j->req.kind, ctx_span, completion,
+                                 responses_protocol, j->req.has_tools,
+                                 thinking.inside, saw_tool_start, saw_tool_end,
+                                 sampled_session_tail, t0);
+        anthropic_stream_free(&anthropic_live);
+        openai_stream_free(&openai_live);
+        responses_stream_free(&responses_live);
+        buf_free(&text);
+        ds4_tokens_free(&effective_prompt);
+        return;
     }
 
     if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
@@ -11621,6 +11730,45 @@ static void client_done(server *s) {
 
 static void set_client_socket_nonblocking(int fd);
 
+static void cancel_wait_deadline(struct timespec *ts) {
+    clock_gettime(CLOCK_REALTIME, ts);
+    ts->tv_nsec += (long)DS4_SERVER_CANCEL_POLL_MS * 1000000L;
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec += ts->tv_nsec / 1000000000L;
+        ts->tv_nsec %= 1000000000L;
+    }
+}
+
+static bool client_socket_disconnected(int fd) {
+    struct pollfd pfd = {
+        .fd = fd,
+        .events = POLLIN,
+    };
+#ifdef POLLRDHUP
+    pfd.events |= POLLRDHUP;
+#endif
+    int rc;
+    do {
+        rc = poll(&pfd, 1, 0);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) return true;
+    if (rc == 0) return false;
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return true;
+#ifdef POLLRDHUP
+    if (pfd.revents & POLLRDHUP) return true;
+#endif
+    if (pfd.revents & POLLIN) {
+        char c;
+        ssize_t n;
+        do {
+            n = recv(fd, &c, 1, MSG_PEEK);
+        } while (n < 0 && errno == EINTR);
+        if (n == 0) return true;
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return true;
+    }
+    return false;
+}
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -11700,7 +11848,21 @@ static void *client_main(void *arg) {
         request_free(&j.req);
         goto done;
     }
-    while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
+    while (!j.done) {
+        struct timespec deadline;
+        cancel_wait_deadline(&deadline);
+        (void)pthread_cond_timedwait(&j.cv, &j.mu, &deadline);
+        bool done = j.done;
+        bool cancelled = j.cancelled;
+        pthread_mutex_unlock(&j.mu);
+        if (!done && !cancelled && client_socket_disconnected(fd)) {
+            if (job_mark_cancelled(&j)) {
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: client disconnected; cancelling in-flight request");
+            }
+        }
+        pthread_mutex_lock(&j.mu);
+    }
     pthread_mutex_unlock(&j.mu);
 
     pthread_cond_destroy(&j.cv);
