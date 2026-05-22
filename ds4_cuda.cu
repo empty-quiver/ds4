@@ -8869,6 +8869,24 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
     if (tid == 0) yb->d = 1.0f / iscale_s;
 }
 
+extern "C" int ds4_gpu_q8_K_quantize_tensor(
+        ds4_gpu_tensor *out_q8,
+        const ds4_gpu_tensor *x,
+        uint32_t in_dim,
+        uint32_t n_rows) {
+    if (!out_q8 || !x || in_dim == 0 || n_rows == 0 || in_dim % CUDA_QK_K != 0) return 0;
+    const uint64_t x_bytes = (uint64_t)n_rows * in_dim * sizeof(float);
+    const uint64_t q8_bytes = (uint64_t)n_rows * (in_dim / CUDA_QK_K) * sizeof(cuda_block_q8_K);
+    if (x->bytes < x_bytes || out_q8->bytes < q8_bytes) return 0;
+
+    dim3 grid(in_dim / CUDA_QK_K, n_rows, 1);
+    q8_K_quantize_kernel<<<grid, 256>>>((cuda_block_q8_K *)out_q8->ptr,
+                                        (const float *)x->ptr,
+                                        in_dim,
+                                        n_rows);
+    return cuda_ok(cudaGetLastError(), "q8_K activation quantize launch");
+}
+
 __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_kernel(
         float *gate_out,
         float *up_out,

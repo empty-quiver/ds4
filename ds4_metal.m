@@ -3990,6 +3990,17 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     return 1;
 }
 
+int ds4_gpu_q8_K_quantize_tensor(ds4_gpu_tensor *out_q8,
+                                  const ds4_gpu_tensor *x,
+                                  uint32_t in_dim,
+                                  uint32_t n_rows) {
+    (void)out_q8;
+    (void)x;
+    (void)in_dim;
+    (void)n_rows;
+    return 0;
+}
+
 int ds4_gpu_begin_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return 0;

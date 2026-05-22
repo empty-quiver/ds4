@@ -36,6 +36,10 @@ int ds4_gpu_wait_transfer(void);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+int ds4_gpu_q8_K_quantize_tensor(ds4_gpu_tensor *out_q8,
+                                  const ds4_gpu_tensor *x,
+                                  uint32_t in_dim,
+                                  uint32_t n_rows);
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
