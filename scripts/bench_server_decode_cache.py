@@ -156,7 +156,12 @@ def main() -> int:
         k: v for k, v in sorted(os.environ.items())
         if k.startswith("DS4_CUDA_DYNAMIC_EXPERT") or
            k.startswith("DS4_CUDA_LAYERWISE_PREFILL") or
-           k.startswith("DS4_CUDA_HOT_EXPERT")
+           k.startswith("DS4_CUDA_HOT_EXPERT") or
+           k.startswith("DS4_CUDA_Q8_F16") or
+           k.startswith("DS4_CUDA_PARTIAL_WEIGHT_CACHE") or
+           k.startswith("DS4_CUDA_WEIGHT_CACHE") or
+           k.startswith("DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE") or
+           k.startswith("DS4_CPU_")
     }
     print(json.dumps({"event": "env", "values": env_snapshot}), flush=True)
 

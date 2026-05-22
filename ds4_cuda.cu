@@ -447,6 +447,35 @@ static uint64_t cuda_env_bytes_default(const char *gb_name,
     return present ? v : def;
 }
 
+static uint64_t cuda_u64_add_sat(uint64_t a, uint64_t b) {
+    return UINT64_MAX - a < b ? UINT64_MAX : a + b;
+}
+
+static uint64_t cuda_dynamic_expert_budget_bytes(void) {
+    return cuda_env_bytes_default(
+        "DS4_CUDA_DYNAMIC_EXPERT_CACHE_GB",
+        "DS4_CUDA_DYNAMIC_EXPERT_CACHE_MB",
+        1024ull * 1048576ull);
+}
+
+static uint64_t cuda_dynamic_expert_configured_reserve_bytes(uint64_t total_bytes) {
+    int present = 0;
+    const uint64_t reserve =
+        cuda_parse_mib_env("DS4_CUDA_DYNAMIC_EXPERT_RESERVE_MB", &present);
+    if (present) return reserve;
+
+    /* Dynamic expert caching is allowed to occupy a known budget.  The reserve
+     * here is only the allocator's last-ditch free-memory guard, not the Q8
+     * cache headroom.  A 2 GiB guard leaves a 24 GiB card under-filled; scale
+     * the default with device size while keeping a conservative floor. */
+    const uint64_t min_reserve = 512ull * 1048576ull;
+    const uint64_t max_reserve = 2048ull * 1048576ull;
+    uint64_t scaled = total_bytes / 64u;
+    if (scaled < min_reserve) scaled = min_reserve;
+    if (scaled > max_reserve) scaled = max_reserve;
+    return scaled;
+}
+
 static int cuda_env_enabled_default(const char *name, int def) {
     const char *env = getenv(name);
     if (!env || !env[0]) return def;
@@ -469,45 +498,41 @@ static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
 
 static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
     int present = 0;
-    const uint64_t reserve = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", &present);
-    if (present) return reserve;
-
-    if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
-        return 512ull * 1048576ull;
+    uint64_t computed = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", &present);
+    if (!present) {
+        if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
+            computed = 512ull * 1048576ull;
+        } else {
+            /* The expanded Q8->F16 cache is only an acceleration path.  Keep enough
+             * device memory free for cuBLAS workspaces, transient graph buffers, and
+             * driver bookkeeping instead of letting optional cached weights consume the
+             * last few GiB on 96 GiB cards. */
+            const uint64_t min_reserve = 4096ull * 1048576ull;
+            const uint64_t pct_reserve = total_bytes / 20u; /* 5% */
+            computed = pct_reserve > min_reserve ? pct_reserve : min_reserve;
+        }
     }
 
-    /* The expanded Q8->F16 cache is only an acceleration path.  Keep enough
-     * device memory free for cuBLAS workspaces, transient graph buffers, and
-     * driver bookkeeping instead of letting optional cached weights consume the
-     * last few GiB on 96 GiB cards. */
-    const uint64_t min_reserve = 4096ull * 1048576ull;
-    const uint64_t pct_reserve = total_bytes / 20u; /* 5% */
-    uint64_t computed = pct_reserve > min_reserve ? pct_reserve : min_reserve;
-
+    /* Dynamic experts are promoted after Q8 cache warmup, so Q8 must reserve
+     * the expert budget in addition to its normal free-memory floor. */
     if (cuda_env_enabled_default("DS4_CUDA_DYNAMIC_EXPERTS", 0)) {
-        const uint64_t dynamic_budget = cuda_env_bytes_default(
-            "DS4_CUDA_DYNAMIC_EXPERT_CACHE_GB",
-            "DS4_CUDA_DYNAMIC_EXPERT_CACHE_MB",
-            1024ull * 1048576ull);
-        const uint64_t dynamic_reserve = cuda_env_bytes_default(
-            NULL,
-            "DS4_CUDA_DYNAMIC_EXPERT_RESERVE_MB",
-            2048ull * 1048576ull);
+        const uint64_t dynamic_budget = cuda_dynamic_expert_budget_bytes();
+        const uint64_t dynamic_reserve =
+            cuda_dynamic_expert_configured_reserve_bytes(total_bytes);
         const uint64_t staging_budget =
             cuda_env_enabled_default("DS4_CUDA_LAYERWISE_PREFILL_STAGING", 0)
                 ? cuda_env_bytes_default("DS4_CUDA_LAYERWISE_PREFILL_STAGING_GB",
                                          "DS4_CUDA_LAYERWISE_PREFILL_STAGING_MB",
                                          1024ull * 1048576ull)
                 : 0;
-        const uint64_t dynamic_slack = 2048ull * 1048576ull;
-        uint64_t dynamic_target = dynamic_budget;
-        if (UINT64_MAX - dynamic_target > dynamic_reserve) dynamic_target += dynamic_reserve;
-        else dynamic_target = UINT64_MAX;
-        if (UINT64_MAX - dynamic_target > dynamic_slack) dynamic_target += dynamic_slack;
-        else dynamic_target = UINT64_MAX;
-        if (staging_budget > dynamic_budget &&
-            UINT64_MAX - dynamic_target > staging_budget - dynamic_budget) {
-            dynamic_target += staging_budget - dynamic_budget;
+
+        uint64_t dynamic_target = cuda_u64_add_sat(dynamic_budget, computed);
+        const uint64_t min_dynamic_target =
+            cuda_u64_add_sat(dynamic_budget, dynamic_reserve);
+        if (min_dynamic_target > dynamic_target) dynamic_target = min_dynamic_target;
+        if (staging_budget > dynamic_budget) {
+            dynamic_target =
+                cuda_u64_add_sat(dynamic_target, staging_budget - dynamic_budget);
         }
         if (dynamic_target > computed) computed = dynamic_target;
     }
@@ -1466,11 +1491,7 @@ static const char *cuda_model_range_cache_device(
 }
 
 static uint64_t cuda_dynamic_expert_reserve_bytes(uint64_t total_bytes) {
-    int present = 0;
-    const uint64_t reserve = cuda_parse_mib_env("DS4_CUDA_DYNAMIC_EXPERT_RESERVE_MB", &present);
-    if (present) return reserve;
-    (void)total_bytes;
-    return 2048ull * 1048576ull;
+    return cuda_dynamic_expert_configured_reserve_bytes(total_bytes);
 }
 
 static const char *cuda_model_range_cache_releasable_impl(

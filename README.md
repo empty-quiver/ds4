@@ -928,16 +928,21 @@ reserves the configured dynamic-expert budget, the dynamic CUDA reserve, and a
 small slack margin before filling optional q8-fp16 ranges. With the 4 GiB
 dynamic expert budget and a 512 MiB dynamic reserve, this produced a 6.5 GiB
 q8-fp16 reserve, 40 future-route promotions, and `7.32s` total decode time
-across two 64-token requests. Manually raising `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB`
-to `8192` remains a useful tuning knob; that run reached 45 future promotions,
-59 all-hot decode layers, and `7.16s` total decode time.
+across two 64-token requests. Later decode-tier tuning changed the memory
+contract: the Q8->F16 cache now reserves the dynamic expert budget before it
+warms, even when `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB` is set explicitly. On a
+4090, the dynamic expert allocator's default free-memory guard also scales down
+to 512 MiB instead of a flat 2 GiB, which lets a declared 4 GiB expert cache
+actually fill.
 
 Aggressively evicting decode experts to make room for every speculative
 promotion was a negative result. It improved hot coverage but caused promotion
 and eviction churn on nearly every handoff, dropping decode to roughly `6 t/s`.
-The current constrained policy is therefore: carve out enough VRAM for the
-dynamic cache up front, keep decode uploads no-evict by default, and skip
-promotions once the dynamic cache is full.
+The current policy is therefore: reserve enough VRAM for the dynamic cache up
+front, keep decode uploads no-evict except inside the bounded decode tier, and
+let decode-score replacement adapt to the prompt. Naive prefill-score seeding
+was also tested and removed because it added churn without improving first
+request elapsed.
 
 `DS4_CUDA_LAYERWISE_PREFILL_STAGING_OVERLAP=1` issues staged expert uploads on a
 separate CUDA upload stream and waits for them only after CPU-MoE has computed
@@ -976,38 +981,38 @@ Useful controls:
 * `DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAINTENANCE_INTERVAL`
 * `DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAX_PROMOTIONS`
 * `DS4_CUDA_DYNAMIC_EXPERT_DECODE_GROUP_SIZE`
+* `DS4_CUDA_DYNAMIC_EXPERT_DECODE_TIER=0|1`
 * `DS4_CUDA_DYNAMIC_EXPERT_RESERVE_MB`
 
-Current 4090 hybrid decode baseline for the server-shaped fixture:
+Current 4090 dynamic decode-tier A/B fixture:
 
 ```sh
 DS4_CPU_AFFINITY=1 \
 DS4_CPU_AFFINITY_LIST=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
 DS4_CPU_MOE_ROW_CHUNK=8 \
+DS4_CPU_MOE_DECODE_TIMING=1 \
 DS4_CUDA_DIRECT_MODEL=1 \
 DS4_CUDA_PARTIAL_WEIGHT_CACHE=1 \
 DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=10 \
 DS4_CUDA_REQUIRE_DENSE_WEIGHT_CACHE=1 \
+DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=4096 \
 DS4_CUDA_DYNAMIC_EXPERTS=1 \
 DS4_CUDA_DYNAMIC_EXPERT_CACHE_GB=4 \
 DS4_CUDA_DYNAMIC_EXPERT_POLICY=lru \
 DS4_CUDA_DYNAMIC_EXPERT_MAX_EVICTIONS=64 \
-DS4_CUDA_DYNAMIC_EXPERT_RESERVE_MB=512 \
 DS4_CUDA_DYNAMIC_EXPERT_GROUP_SIZE=4 \
 DS4_CUDA_DYNAMIC_EXPERT_GROUP_EVICTION=1 \
 DS4_CUDA_DYNAMIC_EXPERT_DECODE_EAGER=1 \
 DS4_CUDA_DYNAMIC_EXPERT_DECODE_EVICT=0 \
 DS4_CUDA_DYNAMIC_EXPERT_DECODE_MIN_SCORE=8 \
 DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAINTENANCE_INTERVAL=1 \
-DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAX_PROMOTIONS=4 \
+DS4_CUDA_DYNAMIC_EXPERT_DECODE_MAX_PROMOTIONS=64 \
 DS4_CUDA_DYNAMIC_EXPERT_DECODE_GROUP_SIZE=4 \
-DS4_CUDA_LAYERWISE_PREFILL_STAGING=1 \
-DS4_CUDA_LAYERWISE_PREFILL_STAGING_STICKY=1 \
-DS4_CUDA_LAYERWISE_PREFILL_STAGING_OVERLAP=1 \
-DS4_CUDA_LAYERWISE_PREFILL_STAGING_MB=512 \
-DS4_CUDA_LAYERWISE_PREFILL_STAGING_MIN_PAIRS=16 \
-DS4_CUDA_LAYERWISE_PREFILL_STAGING_MAX_EXPERTS=2
+DS4_CUDA_LAYERWISE_PREFILL_STAGING=0
 ```
+
+Leave `DS4_CUDA_DYNAMIC_EXPERT_RESERVE_MB` unset for the default adaptive guard.
+Set it only when deliberately testing allocator headroom.
 
 For server-shaped cache-policy tests, use
 `scripts/bench_server_decode_cache.py`. It launches `ds4-server`, sends related
