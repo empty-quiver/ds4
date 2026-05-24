@@ -44,6 +44,7 @@
 #endif
 
 #include "ds4.h"
+#include "ds4_warm.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -22794,6 +22795,107 @@ struct ds4_engine {
     bool hot_experts_enabled;
     bool hot_expert[DS4_N_LAYER][DS4_N_EXPERT];
 };
+
+static uint64_t ds4_warm_tensor_expert_bytes(const ds4_tensor *t) {
+    if (!t || t->ndim != 3 || t->dim[2] == 0) return 0;
+    const gguf_type_info *info = tensor_type(t->type);
+    if (!info || info->block_elems == 0) return 0;
+    const uint64_t blocks = (t->dim[0] + info->block_elems - 1) / info->block_elems;
+    if (blocks > UINT64_MAX / info->block_bytes) return 0;
+    const uint64_t row_bytes = blocks * info->block_bytes;
+    if (t->dim[1] > UINT64_MAX / row_bytes) return 0;
+    return t->dim[1] * row_bytes;
+}
+
+static uint64_t ds4_warm_model_fingerprint(const ds4_model *m) {
+    /* Cheap identity for HELLO compatibility checks. This is not a content
+     * hash; it catches obvious model/layout mismatches without scanning a
+     * 100+ GiB GGUF at worker startup. */
+    uint64_t h = UINT64_C(1469598103934665603);
+#define DS4_WARM_HASH_U64(v_) do { \
+        uint64_t x_ = (uint64_t)(v_); \
+        for (uint32_t b_ = 0; b_ < 8; b_++) { \
+            h ^= (uint8_t)(x_ >> (b_ * 8)); \
+            h *= UINT64_C(1099511628211); \
+        } \
+    } while (0)
+    DS4_WARM_HASH_U64(m->size);
+    DS4_WARM_HASH_U64(m->tensor_data_pos);
+    DS4_WARM_HASH_U64(m->n_tensors);
+    DS4_WARM_HASH_U64(m->n_kv);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        DS4_WARM_HASH_U64(ds4_layer_compress_ratio(il));
+    }
+#undef DS4_WARM_HASH_U64
+    return h;
+}
+
+int ds4_engine_warm_model_info(ds4_engine *e, ds4_warm_model_info *out) {
+    if (!e || !out) return -1;
+    memset(out, 0, sizeof(*out));
+
+    const ds4_layer_weights *l = &e->weights.layer[0];
+    out->n_layer = DS4_N_LAYER;
+    out->n_embd = DS4_N_EMBD;
+    out->n_expert = DS4_N_EXPERT;
+    out->n_expert_used = DS4_N_EXPERT_USED;
+    out->n_ff_exp = DS4_N_FF_EXP;
+    out->gate_type = l->ffn_gate_exps ? l->ffn_gate_exps->type : 0;
+    out->up_type = l->ffn_up_exps ? l->ffn_up_exps->type : 0;
+    out->down_type = l->ffn_down_exps ? l->ffn_down_exps->type : 0;
+    out->gate_expert_bytes = ds4_warm_tensor_expert_bytes(l->ffn_gate_exps);
+    out->up_expert_bytes = ds4_warm_tensor_expert_bytes(l->ffn_up_exps);
+    out->down_expert_bytes = ds4_warm_tensor_expert_bytes(l->ffn_down_exps);
+    out->model_size = e->model.size;
+    out->model_fingerprint = ds4_warm_model_fingerprint(&e->model);
+    return 0;
+}
+
+int ds4_engine_warm_run_layer_f32(
+        ds4_engine    *e,
+        uint32_t       layer,
+        const float   *x,
+        uint32_t       n_tok,
+        const int32_t *selected,
+        const float   *weights,
+        uint32_t       n_selected,
+        float         *out) {
+    if (!e || !x || !selected || !weights || !out) return -1;
+    if (layer >= DS4_N_LAYER || n_selected > DS4_N_EXPERT_USED) return -1;
+    if (n_tok == 0) return 0;
+
+    const ds4_layer_weights *l = &e->weights.layer[layer];
+    const uint64_t expert_mid = l->ffn_gate_exps->dim[1];
+    const uint64_t down_in = l->ffn_down_exps->dim[0];
+    if (expert_mid != down_in || expert_mid != DS4_N_FF_EXP) return -1;
+    if ((l->ffn_gate_exps->dim[0] % QK_K) != 0 || (down_in % QK_K) != 0) return -1;
+
+    float *mid = xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(mid[0]));
+    block_q8_K *xq = xmalloc((size_t)(l->ffn_gate_exps->dim[0] / QK_K) * sizeof(xq[0]));
+    block_q8_K *midq = xmalloc((size_t)DS4_N_EXPERT_USED *
+                               (size_t)(down_in / QK_K) *
+                               sizeof(midq[0]));
+
+    for (uint32_t t = 0; t < n_tok; t++) {
+        layer_routed_moe_selected_one_n_prealloc(
+                out + (uint64_t)t * DS4_N_EMBD,
+                &e->model,
+                l,
+                x + (uint64_t)t * DS4_N_EMBD,
+                selected + (uint64_t)t * n_selected,
+                weights + (uint64_t)t * n_selected,
+                n_selected,
+                DS4_SWIGLU_CLAMP_EXP,
+                mid,
+                xq,
+                midq);
+    }
+
+    free(midq);
+    free(xq);
+    free(mid);
+    return 0;
+}
 
 #ifndef DS4_NO_GPU
 static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine *e) {
