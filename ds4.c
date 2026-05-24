@@ -12907,6 +12907,8 @@ typedef struct {
     bool warm_worker_failed;
     bool warm_prefill_adaptive_disabled;
     bool warm_expert[DS4_N_LAYER][DS4_N_EXPERT];
+    bool warm_layer_resident[DS4_N_LAYER];
+    bool warm_layer_load_capacity_full;
     uint32_t warm_box_id[DS4_N_LAYER][DS4_N_EXPERT];
     uint32_t warm_next_box_id;
     ds4_warm_client *warm_client;
@@ -12922,7 +12924,7 @@ typedef struct {
     uint32_t warm_prefill_load_resp_accepted;
     uint32_t warm_prefill_load_candidate_rows;
     uint32_t warm_prefill_load_candidate_slots;
-    ds4_warm_expert_id warm_prefill_load_ids[16];
+    ds4_warm_expert_id warm_prefill_load_ids[DS4_N_EXPERT];
     uint64_t warm_prefill_requests;
     uint64_t warm_prefill_slots;
     uint64_t warm_prefill_thin_skips;
@@ -12933,6 +12935,9 @@ typedef struct {
     uint64_t warm_prefill_load_experts;
     uint64_t warm_prefill_box_loads;
     uint64_t warm_prefill_box_experts;
+    uint64_t warm_prefill_layer_loads;
+    uint64_t warm_prefill_layer_load_experts;
+    uint64_t warm_prefill_layer_load_capacity_skips;
     uint64_t warm_prefill_load_async_launches;
     uint64_t warm_prefill_cuda_first_promotions;
     uint64_t warm_prefill_cuda_first_skips;
@@ -15422,6 +15427,8 @@ enum {
     DS4_WARM_PREFILL_MIN_SLOTS = DS4_PLACEMENT_PREFILL_MIN_SLOTS,
     DS4_WARM_PREFILL_MIN_ROW_WARM_SLOTS = DS4_PLACEMENT_MIN_ROW_SLOTS,
     DS4_WARM_PREFILL_BOX_EXPERTS = DS4_PLACEMENT_BOX_EXPERTS,
+    DS4_WARM_PREFILL_LAYER_EXPERTS = DS4_N_EXPERT,
+    DS4_WARM_PREFILL_LAYER_CACHE_LIMIT = 6,
 };
 
 static void metal_graph_warm_close(ds4_gpu_graph *g) {
@@ -15460,7 +15467,7 @@ static bool metal_graph_warm_ensure_client(
     const char *port = getenv("DS4_WARM_WORKER_PORT");
     if (!port || !port[0]) port = "9044";
     const int timeout_ms =
-        (int)ds4_env_u64_default("DS4_WARM_WORKER_TIMEOUT_MS", 2000);
+        (int)ds4_env_u64_default("DS4_WARM_WORKER_TIMEOUT_MS", 30000);
 
     ds4_warm_client *client = NULL;
     if (ds4_warm_client_connect(&client, host, port, timeout_ms) != 0) {
@@ -15485,12 +15492,14 @@ static bool metal_graph_warm_ensure_client(
     g->warm_client = client;
     fprintf(stderr,
             "ds4: warm worker connected host=%s port=%s timeout_ms=%d "
-            "min_rows=%u min_slots=%u min_row_warm_slots=%u box_experts=%u\n",
+            "min_rows=%u min_slots=%u min_row_warm_slots=%u box_experts=%u "
+            "layer_cache_limit=%u\n",
             host, port, timeout_ms,
             DS4_WARM_PREFILL_MIN_ROWS,
             DS4_WARM_PREFILL_MIN_SLOTS,
             DS4_WARM_PREFILL_MIN_ROW_WARM_SLOTS,
-            DS4_WARM_PREFILL_BOX_EXPERTS);
+            DS4_WARM_PREFILL_BOX_EXPERTS,
+            DS4_WARM_PREFILL_LAYER_CACHE_LIMIT);
     return true;
 }
 
@@ -15502,7 +15511,7 @@ static bool metal_graph_warm_prefill_load_is_active(ds4_gpu_graph *g) {
     return active;
 }
 
-static bool metal_graph_warm_mark_loaded_box(
+static bool metal_graph_warm_mark_loaded_ids(
         ds4_gpu_graph             *g,
         const ds4_warm_expert_id  *ids,
         uint32_t                   id_count,
@@ -15510,8 +15519,13 @@ static bool metal_graph_warm_mark_loaded_box(
         uint32_t                   box_id) {
     if (!g || !ids || id_count == 0 || accepted != id_count || box_id == 0) return false;
     uint32_t marked = 0;
+    bool one_layer = id_count == DS4_N_EXPERT;
+    uint32_t layer = one_layer ? ids[0].layer : DS4_N_LAYER;
     for (uint32_t i = 0; i < id_count && i < accepted; i++) {
         if (ids[i].layer >= DS4_N_LAYER || ids[i].expert >= DS4_N_EXPERT) continue;
+        if (one_layer && (ids[i].layer != layer || ids[i].expert != i)) {
+            one_layer = false;
+        }
         if (!g->warm_expert[ids[i].layer][ids[i].expert]) {
             g->warm_expert[ids[i].layer][ids[i].expert] = true;
             g->warm_box_id[ids[i].layer][ids[i].expert] = box_id;
@@ -15522,7 +15536,12 @@ static bool metal_graph_warm_mark_loaded_box(
         g->warm_prefill_box_loads++;
         g->warm_prefill_box_experts += marked;
     }
-    return marked != 0;
+    if (one_layer && layer < DS4_N_LAYER) {
+        g->warm_layer_resident[layer] = true;
+        g->warm_prefill_layer_loads++;
+        g->warm_prefill_layer_load_experts += id_count;
+    }
+    return marked != 0 || one_layer;
 }
 
 static uint64_t metal_graph_cuda_box_missing_bytes(
@@ -15552,7 +15571,7 @@ static uint64_t metal_graph_cuda_box_missing_bytes(
     return total;
 }
 
-static uint32_t metal_graph_cuda_try_promote_box_async(
+static DS4_MAYBE_UNUSED uint32_t metal_graph_cuda_try_promote_box_async(
         ds4_gpu_graph             *g,
         const ds4_model           *model,
         const ds4_layer_weights   *layer,
@@ -15677,7 +15696,7 @@ static bool metal_graph_warm_evict_one_box(
     return found && metal_graph_warm_evict_local_box(g, best_box);
 }
 
-static uint32_t metal_graph_warm_build_dense_prefill_box(
+static DS4_MAYBE_UNUSED uint32_t metal_graph_warm_build_dense_prefill_box(
         ds4_gpu_graph   *g,
         const ds4_model *model,
         const ds4_layer_weights *layer,
@@ -15701,6 +15720,26 @@ static uint32_t metal_graph_warm_build_dense_prefill_box(
                                                     ids,
                                                     candidate_rows_out,
                                                     candidate_slots_out);
+}
+
+static uint32_t metal_graph_warm_next_prefill_layer_to_load(ds4_gpu_graph *g) {
+    if (!g || g->warm_layer_load_capacity_full) return DS4_N_LAYER;
+    uint32_t limit = (uint32_t)DS4_WARM_PREFILL_LAYER_CACHE_LIMIT;
+    if (limit > (uint32_t)DS4_N_LAYER) limit = (uint32_t)DS4_N_LAYER;
+    for (uint32_t il = 0; il < limit; il++) {
+        if (!g->warm_layer_resident[il]) return il;
+    }
+    return DS4_N_LAYER;
+}
+
+static uint32_t metal_graph_warm_build_prefill_layer_ids(
+        uint32_t              il,
+        ds4_warm_expert_id    ids[DS4_WARM_PREFILL_LAYER_EXPERTS]) {
+    if (!ids || il >= DS4_N_LAYER) return 0;
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        ids[e] = (ds4_warm_expert_id){ .layer = il, .expert = e };
+    }
+    return DS4_N_EXPERT;
 }
 
 static void *metal_graph_warm_prefill_load_thread_main(void *arg) {
@@ -15740,7 +15779,7 @@ static bool metal_graph_warm_reap_prefill_load(ds4_gpu_graph *g, bool wait) {
     const uint32_t accepted = g->warm_prefill_load_resp_accepted;
     const uint32_t id_count = g->warm_prefill_load_id_count;
     const uint32_t box_id = g->warm_prefill_load_box_id;
-    ds4_warm_expert_id ids[DS4_WARM_PREFILL_BOX_EXPERTS];
+    ds4_warm_expert_id ids[DS4_WARM_PREFILL_LAYER_EXPERTS];
     memcpy(ids, g->warm_prefill_load_ids, sizeof(ids));
     g->warm_prefill_load_active = false;
     g->warm_prefill_load_done = false;
@@ -15761,7 +15800,7 @@ static bool metal_graph_warm_reap_prefill_load(ds4_gpu_graph *g, bool wait) {
     }
     g->warm_prefill_loads++;
     g->warm_prefill_load_experts += accepted;
-    if (!metal_graph_warm_mark_loaded_box(g, ids, id_count, accepted, box_id)) {
+    if (!metal_graph_warm_mark_loaded_ids(g, ids, id_count, accepted, box_id)) {
         if (accepted != 0) {
             ds4_warm_expert_list_response evict_resp = {0};
             (void)ds4_warm_client_evict_experts(g->warm_client, ids,
@@ -15769,7 +15808,12 @@ static bool metal_graph_warm_reap_prefill_load(ds4_gpu_graph *g, bool wait) {
                                                 &evict_resp);
         }
         g->warm_prefill_load_partial_rejects++;
-        (void)metal_graph_warm_evict_one_box(g, box_id);
+        if (id_count == DS4_WARM_PREFILL_LAYER_EXPERTS) {
+            g->warm_layer_load_capacity_full = true;
+            g->warm_prefill_layer_load_capacity_skips++;
+        } else {
+            (void)metal_graph_warm_evict_one_box(g, box_id);
+        }
     }
     return true;
 }
@@ -15781,6 +15825,9 @@ static bool metal_graph_warm_start_prefill_load(
         uint32_t                il,
         const int32_t          *sel,
         uint32_t                n_tokens) {
+    (void)layer;
+    (void)il;
+    (void)sel;
     if (!g || !model || !layer || !sel ||
         !g->warm_worker_enabled ||
         g->warm_worker_failed ||
@@ -15799,55 +15846,33 @@ static bool metal_graph_warm_start_prefill_load(
 
     if (!metal_graph_warm_ensure_client(g, model)) return false;
 
-    ds4_warm_expert_id ids[DS4_WARM_PREFILL_BOX_EXPERTS] = {0};
-    uint32_t candidate_rows = 0;
-    uint32_t candidate_slots = 0;
-    const uint32_t id_count =
-        metal_graph_warm_build_dense_prefill_box(g, model, layer, il, sel, n_tokens,
-                                                 ids,
-                                                 &candidate_rows,
-                                                 &candidate_slots);
-    if (candidate_rows != 0 || candidate_slots != 0) {
-        g->warm_prefill_load_candidate_row_total += candidate_rows;
-        g->warm_prefill_load_candidate_slot_total += candidate_slots;
-    }
-    if (id_count == 0) {
+    if (n_tokens < DS4_WARM_PREFILL_MIN_ROWS) {
         g->warm_prefill_load_thin_skips++;
         return false;
     }
 
-    bool box_created = false;
-    uint32_t box_id =
-        metal_graph_dynamic_expert_current_box(g, il,
-                                               DS4_WARM_PREFILL_BOX_EXPERTS,
-                                               &box_created);
-    if (box_id == 0) {
-        box_created = true;
-        box_id = metal_graph_dynamic_expert_new_box(g);
-    }
+    const uint32_t target_layer = metal_graph_warm_next_prefill_layer_to_load(g);
+    if (target_layer >= DS4_N_LAYER) return false;
 
-    const uint32_t cuda_promoted =
-        metal_graph_cuda_try_promote_box_async(g, model, layer, ids, id_count,
-                                               box_id);
-    if (cuda_promoted == id_count) {
-        g->warm_prefill_cuda_first_skips++;
-        if (box_created) g->dynamic_expert_box_creations++;
-        return false;
-    }
-    if (cuda_promoted != 0) {
-        for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
-            if (g->dynamic_expert_box_id[il][e] == box_id) {
-                metal_graph_dynamic_expert_release_owned(g, model, il, e);
-            }
-        }
-        return false;
-    }
+    ds4_warm_expert_id ids[DS4_WARM_PREFILL_LAYER_EXPERTS] = {0};
+    const uint32_t id_count =
+        metal_graph_warm_build_prefill_layer_ids(target_layer, ids);
+    const uint32_t candidate_rows = n_tokens;
+    const uint32_t candidate_slots = n_tokens * DS4_N_EXPERT_USED;
+    g->warm_prefill_load_candidate_row_total += candidate_rows;
+    g->warm_prefill_load_candidate_slot_total += candidate_slots;
+    if (id_count != DS4_WARM_PREFILL_LAYER_EXPERTS) return false;
+
+    bool box_created = false;
+    const uint32_t box_id = metal_graph_dynamic_expert_new_box(g);
+    if (box_id == 0) return false;
+    box_created = true;
 
     pthread_mutex_lock(&g->warm_prefill_load_mutex);
     g->warm_prefill_load_active = true;
     g->warm_prefill_load_done = false;
     g->warm_prefill_load_ok = false;
-    g->warm_prefill_load_layer = il;
+    g->warm_prefill_load_layer = target_layer;
     g->warm_prefill_load_box_id = box_id;
     g->warm_prefill_load_id_count = id_count;
     g->warm_prefill_load_resp_accepted = 0;
@@ -15868,6 +15893,7 @@ static bool metal_graph_warm_start_prefill_load(
         g->warm_prefill_failures++;
         return false;
     }
+    if (box_created) g->dynamic_expert_box_creations++;
     g->warm_prefill_load_async_launches++;
     return true;
 }
@@ -16507,6 +16533,8 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
         !g->warm_worker_failed &&
         !g->warm_prefill_adaptive_disabled &&
         !metal_graph_warm_prefill_load_is_active(g);
+    const bool warm_layer_available =
+        warm_client_available && g->warm_layer_resident[il];
 
     uint32_t n_hot = 0;
     uint32_t n_warm = 0;
@@ -16534,7 +16562,7 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
                 row_hot_count++;
             } else if (warm_client_available &&
                        g->warm_expert[il][e] &&
-                       g->warm_box_id[il][e] != 0) {
+                       (warm_layer_available || g->warm_box_id[il][e] != 0)) {
                 row_warm[slot] = 1;
                 row_warm_count++;
             }
@@ -16544,7 +16572,9 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
             full_hot_rows++;
         }
         const bool admit_warm_row =
-            row_warm_count >= DS4_WARM_PREFILL_MIN_ROW_WARM_SLOTS;
+            warm_layer_available
+                ? row_warm_count != 0
+                : row_warm_count >= DS4_WARM_PREFILL_MIN_ROW_WARM_SLOTS;
         if (admit_warm_row) {
             warm_candidate_rows++;
             warm_candidate_slots += row_warm_count;
@@ -16569,7 +16599,8 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
         g->warm_prefill_group_skips++;
         g->warm_prefill_group_skip_slots += warm_rejected_slots;
     }
-    if (n_warm != 0 &&
+    if (!warm_layer_available &&
+        n_warm != 0 &&
         (warm_candidate_rows < DS4_WARM_PREFILL_MIN_ROWS ||
          warm_candidate_slots < DS4_WARM_PREFILL_MIN_SLOTS)) {
         g->warm_prefill_group_skips++;
@@ -16579,7 +16610,8 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
         }
         n_warm = 0;
     }
-    if (n_warm != 0 && n_warm < DS4_WARM_PREFILL_MIN_SLOTS) {
+    if (!warm_layer_available &&
+        n_warm != 0 && n_warm < DS4_WARM_PREFILL_MIN_SLOTS) {
         g->warm_prefill_thin_skips++;
         g->warm_prefill_thin_slots += n_warm;
         for (uint32_t i = 0; i < n_warm; i++) {
@@ -16758,23 +16790,32 @@ static bool metal_graph_cuda_cpu_moe_hot_prefill(
                                                        xq_host)) {
                 return false;
             }
-        } else if (n_cold >= DS4_WARM_PREFILL_MIN_SLOTS &&
-                   n_warm >= DS4_WARM_PREFILL_MIN_SLOTS &&
-                   cpu_seconds > 0.0 &&
+        } else if (n_warm >= DS4_WARM_PREFILL_MIN_SLOTS &&
                    warm_wall_seconds > 0.0) {
-            const double cpu_per_slot = cpu_seconds / (double)n_cold;
+            double cpu_per_slot = 0.0;
+            uint64_t cpu_reference_slots = 0;
+            if (n_cold >= DS4_WARM_PREFILL_MIN_SLOTS && cpu_seconds > 0.0) {
+                cpu_per_slot = cpu_seconds / (double)n_cold;
+                cpu_reference_slots = n_cold;
+            } else if (g->hybrid_prefill_cpu_pairs >= DS4_WARM_PREFILL_MIN_SLOTS &&
+                       g->hybrid_prefill_cpu_seconds > 0.0) {
+                cpu_per_slot =
+                    g->hybrid_prefill_cpu_seconds /
+                    (double)g->hybrid_prefill_cpu_pairs;
+                cpu_reference_slots = g->hybrid_prefill_cpu_pairs;
+            }
             const double warm_per_slot = warm_wall_seconds / (double)n_warm;
-            if (warm_per_slot > cpu_per_slot * 1.25) {
+            if (cpu_per_slot > 0.0 && warm_per_slot > cpu_per_slot * 1.25) {
                 g->warm_prefill_adaptive_disabled = true;
                 g->warm_prefill_adaptive_disables++;
                 fprintf(stderr,
                         "ds4: warm worker prefill disabled adaptively: "
                         "warm_per_slot=%.6f ms cpu_per_slot=%.6f ms "
-                        "warm_slots=%u cold_slots=%u\n",
+                        "warm_slots=%u cpu_reference_slots=%llu\n",
                         warm_per_slot * 1000.0,
                         cpu_per_slot * 1000.0,
                         n_warm,
-                        n_cold);
+                        (unsigned long long)cpu_reference_slots);
                 metal_graph_warm_close(g);
             }
         }
@@ -17880,7 +17921,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
               g->warm_prefill_loads != 0 ||
               g->warm_prefill_failures != 0)) {
         fprintf(stderr,
-                "ds4: warm worker prefill: requests=%llu slots=%llu thin_skips=%llu thin_slots=%llu group_skips=%llu group_skip_slots=%llu loads=%llu load_experts=%llu box_loads=%llu box_experts=%llu box_evictions=%llu load_async=%llu cuda_first_promotions=%llu cuda_first_skips=%llu load_busy_skips=%llu load_thin_skips=%llu load_partial_rejects=%llu load_candidate_rows=%llu load_candidate_slots=%llu run_async=%llu cpu_fallback_slots=%llu adaptive_disables=%llu failures=%llu load=%.3f s load_join=%.3f s remote=%.3f s accum=%.3f s join=%.3f s wall=%.3f s\n",
+                "ds4: warm worker prefill: requests=%llu slots=%llu thin_skips=%llu thin_slots=%llu group_skips=%llu group_skip_slots=%llu loads=%llu load_experts=%llu box_loads=%llu box_experts=%llu layer_loads=%llu layer_load_experts=%llu layer_capacity_skips=%llu box_evictions=%llu load_async=%llu cuda_first_promotions=%llu cuda_first_skips=%llu load_busy_skips=%llu load_thin_skips=%llu load_partial_rejects=%llu load_candidate_rows=%llu load_candidate_slots=%llu run_async=%llu cpu_fallback_slots=%llu adaptive_disables=%llu failures=%llu load=%.3f s load_join=%.3f s remote=%.3f s accum=%.3f s join=%.3f s wall=%.3f s\n",
                 (unsigned long long)g->warm_prefill_requests,
                 (unsigned long long)g->warm_prefill_slots,
                 (unsigned long long)g->warm_prefill_thin_skips,
@@ -17891,6 +17932,9 @@ static void metal_graph_free(ds4_gpu_graph *g) {
                 (unsigned long long)g->warm_prefill_load_experts,
                 (unsigned long long)g->warm_prefill_box_loads,
                 (unsigned long long)g->warm_prefill_box_experts,
+                (unsigned long long)g->warm_prefill_layer_loads,
+                (unsigned long long)g->warm_prefill_layer_load_experts,
+                (unsigned long long)g->warm_prefill_layer_load_capacity_skips,
                 (unsigned long long)g->warm_prefill_box_evictions,
                 (unsigned long long)g->warm_prefill_load_async_launches,
                 (unsigned long long)g->warm_prefill_cuda_first_promotions,
@@ -24368,7 +24412,7 @@ static int ds4_engine_warm_metal_ensure(ds4_engine *e, uint32_t n_tok) {
 }
 
 static uint32_t ds4_warm_metal_default_slab_cap(void) {
-    return 512;
+    return 1536;
 }
 
 static int ds4_engine_warm_metal_find_slot(const ds4_engine *e, uint32_t layer, uint32_t expert) {
@@ -24893,13 +24937,14 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
         const char *warm_port = getenv("DS4_WARM_WORKER_PORT");
         if (!warm_port || !warm_port[0]) warm_port = "9044";
         fprintf(stderr,
-                "ds4: warm worker tier enabled host=%s port=%s prefill_min_rows=%u prefill_min_slots=%u min_row_warm_slots=%u box_experts=%u\n",
+                "ds4: warm worker tier enabled host=%s port=%s prefill_min_rows=%u prefill_min_slots=%u min_row_warm_slots=%u box_experts=%u layer_cache_limit=%u\n",
                 warm_host,
                 warm_port,
                 DS4_WARM_PREFILL_MIN_ROWS,
                 DS4_WARM_PREFILL_MIN_SLOTS,
                 DS4_WARM_PREFILL_MIN_ROW_WARM_SLOTS,
-                DS4_WARM_PREFILL_BOX_EXPERTS);
+                DS4_WARM_PREFILL_BOX_EXPERTS,
+                DS4_WARM_PREFILL_LAYER_CACHE_LIMIT);
     }
     if (g->layerwise_staging_enabled) {
         fprintf(stderr,
