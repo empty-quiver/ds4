@@ -1272,10 +1272,6 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_q8(
         }
     }
 
-    device float *dst_gate_f32 =
-        (device float *)dst_gate + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
-    device float *dst_up_f32 =
-        (device float *)dst_up + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
     device float *dst_mid_f32 =
         (device float *)(dst_mid + ((uint64_t)i12 * args.nei0 + (uint64_t)idx) * act.mid_row_stride);
     device const float *route_w =
@@ -1296,13 +1292,13 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_q8(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            dst_gate_f32[out_row] = gate;
-            dst_up_f32[out_row] = up;
             const float silu = g / (1.0f + exp(-g));
             dst_mid_f32[out_row] = silu * u * route_weight;
         }
     }
 
+    (void)dst_gate;
+    (void)dst_up;
     (void)tiitg;
 }
 

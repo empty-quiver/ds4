@@ -13730,9 +13730,9 @@ int ds4_gpu_routed_moe_batch_q8_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
         const bool moe_stage_profile =
-            getenv("DS4_METAL_MOE_STAGE_PROFILE") != NULL && g_batch_cb != nil;
+            getenv("DS4_METAL_MOE_STAGE_PROFILE") != NULL;
         double moe_stage_t0 = moe_stage_profile ? ds4_gpu_now_ms() : 0.0;
-        if (moe_stage_profile) {
+        if (moe_stage_profile && g_batch_cb != nil) {
             if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
                 return 0;
             }
@@ -13742,7 +13742,9 @@ int ds4_gpu_routed_moe_batch_q8_tensor(
         }
 #define DS4_METAL_PROFILE_MOE_STAGE(name) do { \
             if (ok && moe_stage_profile) { \
-                if (ds4_gpu_end_commands() == 0) { \
+                const bool had_stage_batch = g_batch_cb != nil; \
+                if ((had_stage_batch && ds4_gpu_end_commands() == 0) || \
+                    (!had_stage_batch && ds4_gpu_finish_command_buffer(cb, owned, "routed profile stage") == 0)) { \
                     ok = 0; \
                 } else { \
                     const double now_ms = ds4_gpu_now_ms(); \
@@ -13750,7 +13752,7 @@ int ds4_gpu_routed_moe_batch_q8_tensor(
                             "ds4: Metal routed MoE stage tokens=%u pairs=%u %s=%.3f ms\n", \
                             n_tokens, pair_rows, (name), now_ms - moe_stage_t0); \
                     moe_stage_t0 = now_ms; \
-                    if (ds4_gpu_begin_commands() == 0) { \
+                    if (had_stage_batch && ds4_gpu_begin_commands() == 0) { \
                         ok = 0; \
                     } else { \
                         cb = ds4_gpu_command_buffer(&owned); \
@@ -13950,6 +13952,7 @@ int ds4_gpu_routed_moe_batch_q8_resident_bf16_tensor(
         const uint32_t gate_nr0 = ds4_gpu_routed_mv_nr0(gate_type);
         const uint32_t down_nr0 = ds4_gpu_routed_mv_nr0(down_type);
         if (gate_nr0 == 0 || down_nr0 == 0) return 0;
+        const NSUInteger resident_gate_nsg = 2;
 
         ds4_gpu_mul_mv_id_args gate_args =
             ds4_gpu_make_mul_mv_id_args_q8_src1(expert_in_dim, expert_mid_dim, storage_experts,
@@ -13965,9 +13968,9 @@ int ds4_gpu_routed_moe_batch_q8_resident_bf16_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
         const bool moe_stage_profile =
-            getenv("DS4_METAL_MOE_STAGE_PROFILE") != NULL && g_batch_cb != nil;
+            getenv("DS4_METAL_MOE_STAGE_PROFILE") != NULL;
         double moe_stage_t0 = moe_stage_profile ? ds4_gpu_now_ms() : 0.0;
-        if (moe_stage_profile) {
+        if (moe_stage_profile && g_batch_cb != nil) {
             if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
                 return 0;
             }
@@ -13977,7 +13980,9 @@ int ds4_gpu_routed_moe_batch_q8_resident_bf16_tensor(
         }
 #define DS4_METAL_PROFILE_MOE_STAGE(name) do { \
             if (ok && moe_stage_profile) { \
-                if (ds4_gpu_end_commands() == 0) { \
+                const bool had_stage_batch = g_batch_cb != nil; \
+                if ((had_stage_batch && ds4_gpu_end_commands() == 0) || \
+                    (!had_stage_batch && ds4_gpu_finish_command_buffer(cb, owned, "resident routed profile stage") == 0)) { \
                     ok = 0; \
                 } else { \
                     const double now_ms = ds4_gpu_now_ms(); \
@@ -13985,7 +13990,7 @@ int ds4_gpu_routed_moe_batch_q8_resident_bf16_tensor(
                             "ds4: Metal resident routed MoE stage tokens=%u pairs=%u %s=%.3f ms\n", \
                             n_tokens, pair_rows, (name), now_ms - moe_stage_t0); \
                     moe_stage_t0 = now_ms; \
-                    if (ds4_gpu_begin_commands() == 0) { \
+                    if (had_stage_batch && ds4_gpu_begin_commands() == 0) { \
                         ok = 0; \
                     } else { \
                         cb = ds4_gpu_command_buffer(&owned); \
@@ -14028,7 +14033,7 @@ int ds4_gpu_routed_moe_batch_q8_resident_bf16_tensor(
                                                        weightsbuf,
                                                        ds4_gpu_tensor_offset(weights),
                                                        gate_smem,
-                                                       2,
+                                                       resident_gate_nsg,
                                                        false);
         DS4_METAL_PROFILE_MOE_STAGE("gate_up");
         if (ok) {
