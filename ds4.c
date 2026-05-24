@@ -9399,6 +9399,7 @@ typedef struct {
     uint32_t n_selected;
     uint32_t n_threads;
     ds4_decode_spin_barrier barrier;
+    bool record_timing;
     double phase_t0;
     double gate_up_seconds;
     double midq_seconds;
@@ -9412,8 +9413,10 @@ static DS4_MAYBE_UNUSED void ds4_decode_selected_one_job_worker(void *vctx, uint
         const uint32_t lane = (uint32_t)lane_u64;
         if (lane >= job->n_threads) return;
 
-        if (lane == 0) job->phase_t0 = now_sec();
-        ds4_decode_spin_barrier_wait(&job->barrier);
+        if (job->record_timing) {
+            if (lane == 0) job->phase_t0 = now_sec();
+            ds4_decode_spin_barrier_wait(&job->barrier);
+        }
 
         uint64_t task0 = job->gate_tasks * lane / job->n_threads;
         uint64_t task1 = job->gate_tasks * (lane + 1u) / job->n_threads;
@@ -9422,11 +9425,13 @@ static DS4_MAYBE_UNUSED void ds4_decode_selected_one_job_worker(void *vctx, uint
         }
 
         ds4_decode_spin_barrier_wait(&job->barrier);
-        if (lane == 0) {
-            job->gate_up_seconds = now_sec() - job->phase_t0;
-            job->phase_t0 = now_sec();
+        if (job->record_timing) {
+            if (lane == 0) {
+                job->gate_up_seconds = now_sec() - job->phase_t0;
+                job->phase_t0 = now_sec();
+            }
+            ds4_decode_spin_barrier_wait(&job->barrier);
         }
-        ds4_decode_spin_barrier_wait(&job->barrier);
 
         for (uint32_t i = lane; i < job->n_selected; i += job->n_threads) {
             ds4_quantize_row_q8_K(job->gate_up.mid + (uint64_t)i * job->gate_up.out_dim,
@@ -9435,11 +9440,13 @@ static DS4_MAYBE_UNUSED void ds4_decode_selected_one_job_worker(void *vctx, uint
         }
 
         ds4_decode_spin_barrier_wait(&job->barrier);
-        if (lane == 0) {
-            job->midq_seconds = now_sec() - job->phase_t0;
-            job->phase_t0 = now_sec();
+        if (job->record_timing) {
+            if (lane == 0) {
+                job->midq_seconds = now_sec() - job->phase_t0;
+                job->phase_t0 = now_sec();
+            }
+            ds4_decode_spin_barrier_wait(&job->barrier);
         }
-        ds4_decode_spin_barrier_wait(&job->barrier);
 
         uint64_t row0 = job->down_rows * lane / job->n_threads;
         uint64_t row1 = job->down_rows * (lane + 1u) / job->n_threads;
@@ -9448,10 +9455,12 @@ static DS4_MAYBE_UNUSED void ds4_decode_selected_one_job_worker(void *vctx, uint
         }
 
         ds4_decode_spin_barrier_wait(&job->barrier);
-        if (lane == 0) {
-            job->down_seconds = now_sec() - job->phase_t0;
+        if (job->record_timing) {
+            if (lane == 0) {
+                job->down_seconds = now_sec() - job->phase_t0;
+            }
+            ds4_decode_spin_barrier_wait(&job->barrier);
         }
-        ds4_decode_spin_barrier_wait(&job->barrier);
     }
 }
 
@@ -9498,6 +9507,7 @@ static bool layer_routed_moe_selected_one_iq2_q2_scheduled(
     memset(&job, 0, sizeof(job));
     job.n_selected = n_selected;
     job.n_threads = g_pool.n_threads;
+    job.record_timing = gate_up_seconds || midq_seconds || down_seconds;
     job.midq_blocks = down_in_dim / QK_K;
     job.down_rows = down_out_dim;
     job.gate_tasks = ((uint64_t)n_selected + 1u) / 2u * expert_out_dim;
@@ -12513,6 +12523,24 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  */
 
 typedef struct {
+    block_q8_K *xq;
+    block_q8_K *midq;
+    float *mid;
+    float *out;
+    int32_t *selected;
+    float *weights;
+    int32_t *all_selected;
+    float *all_weights;
+    uint32_t *route_counts;
+    uint32_t *pair_ids;
+    ds4_gpu_event *upload_done;
+    bool upload_pending;
+    bool allocated;
+} ds4_cpu_moe_decode_slot;
+
+typedef struct metal_graph_cpu_moe_decode_handoff metal_graph_cpu_moe_decode_handoff;
+
+typedef struct {
     /* One-token decode tensors.  These stay allocated for the life of a
      * session; a generated token enters as an embedding in cur_hc and leaves as
      * logits after all 43 layers update their raw/compressed/indexer caches. */
@@ -12596,6 +12624,16 @@ typedef struct {
     ds4_gpu_tensor *router_selected;
     ds4_gpu_tensor *router_weights;
     ds4_gpu_tensor *hot_router_weights;
+    ds4_gpu_tensor *route_hot_selected;
+    ds4_gpu_tensor *route_hot_weights;
+    ds4_gpu_tensor *route_cold_selected;
+    ds4_gpu_tensor *route_cold_weights;
+    ds4_gpu_tensor *route_counts;
+    ds4_gpu_tensor *route_hot_mask;
+    ds4_gpu_tensor *route_expert_ptr_table;
+    ds4_gpu_tensor *route_hot_mask_layer[DS4_N_LAYER];
+    ds4_gpu_tensor *route_expert_ptr_table_layer[DS4_N_LAYER];
+    uint64_t route_table_generation[DS4_N_LAYER];
     ds4_gpu_tensor *routed_gate;
     ds4_gpu_tensor *routed_up;
     ds4_gpu_tensor *routed_mid;
@@ -12803,6 +12841,8 @@ typedef struct {
     uint64_t hybrid_decode_mixed_handoffs;
     uint64_t hybrid_decode_full_cpu_handoffs;
     uint64_t hybrid_decode_cpu_slots;
+    uint64_t hybrid_decode_worker_launches;
+    uint64_t hybrid_decode_device_route_splits;
     double layerwise_staging_copy_seconds;
     double layerwise_staging_sync_seconds;
     double hybrid_prefill_cpu_seconds;
@@ -12817,6 +12857,8 @@ typedef struct {
     double hybrid_decode_cpu_seconds;
     double hybrid_decode_upload_seconds;
     double hybrid_decode_add_seconds;
+    double hybrid_decode_worker_metadata_wait_seconds;
+    double hybrid_decode_worker_done_wait_seconds;
     uint64_t hot_expert_prefill_batches;
     uint64_t hot_expert_prefill_slots;
     uint64_t cold_expert_prefill_slots;
@@ -12829,6 +12871,15 @@ typedef struct {
     const ds4_model *gpu_model;
     const ds4_weights *gpu_weights;
     const ds4_model *cpu_model;
+    ds4_cpu_moe_decode_slot cpu_moe_decode_slot[2];
+    uint32_t cpu_moe_decode_slot_next;
+    pthread_t cpu_moe_decode_worker;
+    pthread_mutex_t cpu_moe_decode_worker_mutex;
+    pthread_cond_t cpu_moe_decode_worker_cond;
+    pthread_cond_t cpu_moe_decode_worker_done_cond;
+    metal_graph_cpu_moe_decode_handoff *cpu_moe_decode_worker_task;
+    bool cpu_moe_decode_worker_initialized;
+    bool cpu_moe_decode_worker_shutdown;
     uint32_t cpu_moe_tok_cap;
     float *cpu_moe_mid;
     block_q8_K *cpu_moe_xq;
@@ -12845,6 +12896,8 @@ typedef struct {
     uint64_t route_profile_prefill_tokens;
     uint64_t route_profile_decode_tokens;
 } ds4_gpu_graph;
+
+static void metal_graph_stop_cpu_moe_decode_worker(ds4_gpu_graph *g);
 
 enum {
     DS4_DYNAMIC_EXPERT_POLICY_APPEND = 0,
@@ -12993,7 +13046,102 @@ static void *metal_graph_realloc_cpu_moe_host(void *ptr, uint64_t bytes) {
     return new_ptr;
 }
 
+static void metal_graph_free_cpu_moe_decode_slots(ds4_gpu_graph *g) {
+    if (!g) return;
+    metal_graph_stop_cpu_moe_decode_worker(g);
+    for (uint32_t i = 0; i < 2; i++) {
+        ds4_cpu_moe_decode_slot *slot = &g->cpu_moe_decode_slot[i];
+        if (slot->upload_pending) {
+            (void)ds4_gpu_event_wait(slot->upload_done);
+            slot->upload_pending = false;
+        }
+        ds4_gpu_host_free(slot->xq);
+        ds4_gpu_host_free(slot->selected);
+        ds4_gpu_host_free(slot->weights);
+        ds4_gpu_host_free(slot->all_selected);
+        ds4_gpu_host_free(slot->all_weights);
+        ds4_gpu_host_free(slot->route_counts);
+        ds4_gpu_host_free(slot->out);
+        free(slot->mid);
+        free(slot->midq);
+        free(slot->pair_ids);
+        ds4_gpu_event_free(slot->upload_done);
+        memset(slot, 0, sizeof(*slot));
+    }
+    g->cpu_moe_decode_slot_next = 0;
+}
+
+static bool metal_graph_alloc_cpu_moe_decode_slot(ds4_cpu_moe_decode_slot *slot) {
+    if (!slot) return false;
+    if (slot->allocated) return true;
+
+    slot->xq = ds4_gpu_host_alloc((uint64_t)(DS4_N_EMBD / QK_K) * sizeof(*slot->xq));
+    slot->selected = ds4_gpu_host_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(*slot->selected));
+    slot->weights = ds4_gpu_host_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(*slot->weights));
+    slot->all_selected = ds4_gpu_host_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(*slot->all_selected));
+    slot->all_weights = ds4_gpu_host_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(*slot->all_weights));
+    slot->route_counts = ds4_gpu_host_alloc(2u * sizeof(*slot->route_counts));
+    slot->out = ds4_gpu_host_alloc((uint64_t)DS4_N_EMBD * sizeof(*slot->out));
+    slot->mid = xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(*slot->mid));
+    slot->midq = xmalloc((size_t)DS4_N_EXPERT_USED * (DS4_N_FF_EXP / QK_K) * sizeof(*slot->midq));
+    slot->pair_ids = xmalloc((size_t)DS4_N_EXPERT_USED * sizeof(*slot->pair_ids));
+    slot->upload_done = ds4_gpu_event_create();
+    if (!slot->xq || !slot->selected || !slot->weights ||
+        !slot->all_selected || !slot->all_weights || !slot->route_counts || !slot->out ||
+        !slot->mid || !slot->midq || !slot->pair_ids || !slot->upload_done) {
+        ds4_gpu_host_free(slot->xq);
+        ds4_gpu_host_free(slot->selected);
+        ds4_gpu_host_free(slot->weights);
+        ds4_gpu_host_free(slot->all_selected);
+        ds4_gpu_host_free(slot->all_weights);
+        ds4_gpu_host_free(slot->route_counts);
+        ds4_gpu_host_free(slot->out);
+        free(slot->mid);
+        free(slot->midq);
+        free(slot->pair_ids);
+        ds4_gpu_event_free(slot->upload_done);
+        memset(slot, 0, sizeof(*slot));
+        return false;
+    }
+    slot->allocated = true;
+    return true;
+}
+
+static bool metal_graph_ensure_cpu_moe_decode_slots(ds4_gpu_graph *g) {
+    if (!g) return false;
+    if (g->backend != DS4_BACKEND_CUDA) return false;
+    return metal_graph_alloc_cpu_moe_decode_slot(&g->cpu_moe_decode_slot[0]) &&
+           metal_graph_alloc_cpu_moe_decode_slot(&g->cpu_moe_decode_slot[1]);
+}
+
+static ds4_cpu_moe_decode_slot *metal_graph_acquire_cpu_moe_decode_slot(ds4_gpu_graph *g) {
+    if (!metal_graph_ensure_cpu_moe_decode_slots(g)) return NULL;
+    for (uint32_t attempt = 0; attempt < 2; attempt++) {
+        const uint32_t idx = (g->cpu_moe_decode_slot_next + attempt) & 1u;
+        ds4_cpu_moe_decode_slot *slot = &g->cpu_moe_decode_slot[idx];
+        if (!slot->upload_pending) {
+            g->cpu_moe_decode_slot_next = (idx + 1u) & 1u;
+            return slot;
+        }
+    }
+
+    const uint32_t idx = g->cpu_moe_decode_slot_next & 1u;
+    ds4_cpu_moe_decode_slot *slot = &g->cpu_moe_decode_slot[idx];
+    if (!ds4_gpu_event_wait(slot->upload_done)) return NULL;
+    slot->upload_pending = false;
+    g->cpu_moe_decode_slot_next = (idx + 1u) & 1u;
+    return slot;
+}
+
+static bool metal_graph_mark_cpu_moe_decode_slot_upload(ds4_cpu_moe_decode_slot *slot) {
+    if (!slot || !slot->upload_done) return false;
+    if (!ds4_gpu_event_record_compute(slot->upload_done)) return false;
+    slot->upload_pending = true;
+    return true;
+}
+
 static void metal_graph_free_cpu_moe_scratch(ds4_gpu_graph *g) {
+    metal_graph_free_cpu_moe_decode_slots(g);
     ds4_gpu_host_free(g->cpu_moe_out_host);
     ds4_gpu_host_free(g->cpu_moe_weight_host);
     ds4_gpu_host_free(g->cpu_moe_selected_host);
@@ -14998,6 +15146,114 @@ static bool metal_graph_layerwise_prefill_sync_uploads(ds4_gpu_graph *g) {
     return ok != 0;
 }
 
+static bool metal_graph_cuda_cpu_moe_enqueue_hot_decode(
+        ds4_gpu_graph          *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        ds4_gpu_tensor         *ffn_norm,
+        ds4_gpu_tensor         *routed_out,
+        const int32_t          *hot_sel,
+        const float            *hot_w,
+        uint32_t                n_hot,
+        uint32_t                n_cold) {
+    if (!g || !model || !layer || !ffn_norm || !routed_out ||
+        !hot_sel || !hot_w || n_hot == 0) {
+        return false;
+    }
+
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
+    const uint32_t expert_in_dim = (uint32_t)layer->ffn_gate_exps->dim[0];
+    const uint32_t expert_mid_dim = (uint32_t)layer->ffn_gate_exps->dim[1];
+    const uint32_t out_dim = (uint32_t)layer->ffn_down_exps->dim[1];
+
+    ds4_gpu_tensor *hot_out = n_cold != 0 ? g->routed_hot_out : routed_out;
+    if (!hot_out) return false;
+
+    const double hot_t0 = now_sec();
+    if (ds4_gpu_tensor_write(g->hot_router_weights, 0, hot_w,
+                             (uint64_t)n_hot * sizeof(float)) == 0) {
+        return false;
+    }
+    if (ds4_gpu_routed_moe_one_cached_experts_tensor(hot_out,
+                                                     g->routed_gate,
+                                                     g->routed_up,
+                                                     g->routed_mid,
+                                                     g->routed_down,
+                                                     model->map,
+                                                     model->size,
+                                                     layer->ffn_gate_exps->abs_offset,
+                                                     layer->ffn_up_exps->abs_offset,
+                                                     layer->ffn_down_exps->abs_offset,
+                                                     layer->ffn_gate_exps->type,
+                                                     layer->ffn_down_exps->type,
+                                                     gate_expert_bytes,
+                                                     gate_row_bytes,
+                                                     down_expert_bytes,
+                                                     down_row_bytes,
+                                                     expert_in_dim,
+                                                     expert_mid_dim,
+                                                     out_dim,
+                                                     hot_sel,
+                                                     g->hot_router_weights,
+                                                     n_hot,
+                                                     DS4_SWIGLU_CLAMP_EXP,
+                                                     ffn_norm) == 0) {
+        (void)ds4_gpu_end_commands();
+        return false;
+    }
+    g->hybrid_decode_hot_enqueue_seconds += now_sec() - hot_t0;
+    return true;
+}
+
+static bool metal_graph_cuda_cpu_moe_enqueue_hot_decode_device(
+        ds4_gpu_graph          *g,
+        const ds4_layer_weights *layer,
+        ds4_gpu_tensor         *ffn_norm,
+        ds4_gpu_tensor         *routed_out,
+        const ds4_gpu_tensor   *expert_ptr_table,
+        uint32_t                n_hot,
+        uint32_t                n_cold) {
+    if (!g || !layer || !ffn_norm || !routed_out || n_hot == 0) return false;
+    if (!g->route_hot_selected || !g->route_hot_weights || !expert_ptr_table) return false;
+
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint32_t expert_in_dim = (uint32_t)layer->ffn_gate_exps->dim[0];
+    const uint32_t expert_mid_dim = (uint32_t)layer->ffn_gate_exps->dim[1];
+    const uint32_t out_dim = (uint32_t)layer->ffn_down_exps->dim[1];
+
+    ds4_gpu_tensor *hot_out = n_cold != 0 ? g->routed_hot_out : routed_out;
+    if (!hot_out) return false;
+
+    const double hot_t0 = now_sec();
+    if (ds4_gpu_routed_moe_one_cached_experts_table_tensor(hot_out,
+                                                           g->routed_gate,
+                                                           g->routed_up,
+                                                           g->routed_mid,
+                                                           g->routed_down,
+                                                           layer->ffn_gate_exps->type,
+                                                           layer->ffn_down_exps->type,
+                                                           gate_row_bytes,
+                                                           down_row_bytes,
+                                                           expert_in_dim,
+                                                           expert_mid_dim,
+                                                           out_dim,
+                                                           g->route_hot_selected,
+                                                           g->route_hot_weights,
+                                                           expert_ptr_table,
+                                                           n_hot,
+                                                           DS4_SWIGLU_CLAMP_EXP,
+                                                           ffn_norm) == 0) {
+        (void)ds4_gpu_end_commands();
+        return false;
+    }
+    g->hybrid_decode_hot_enqueue_seconds += now_sec() - hot_t0;
+    return true;
+}
+
 static bool metal_graph_cuda_cpu_moe_hot_decode(
         ds4_gpu_graph          *g,
         const ds4_model        *model,
@@ -15007,7 +15263,8 @@ static bool metal_graph_cuda_cpu_moe_hot_decode(
         ds4_gpu_tensor         *routed_out,
         const block_q8_K       *xq_host,
         const int32_t          *sel,
-        const float            *w) {
+        const float            *w,
+        ds4_cpu_moe_decode_slot *slot) {
     if (!g || !model || !layer || !ffn_norm || !routed_out || !sel || !w) return false;
     if (g->backend != DS4_BACKEND_CUDA || !g->hot_experts_enabled || il >= DS4_N_LAYER) return false;
     if (!metal_graph_dynamic_expert_sync_uploads(g)) return false;
@@ -15047,7 +15304,7 @@ static bool metal_graph_cuda_cpu_moe_hot_decode(
     const uint32_t expert_mid_dim = (uint32_t)layer->ffn_gate_exps->dim[1];
     const uint32_t out_dim = (uint32_t)layer->ffn_down_exps->dim[1];
 
-    if (n_cold != 0 && !xq_host) return false;
+    if (n_cold != 0 && (!xq_host || !slot || !slot->out || !slot->mid || !slot->midq)) return false;
 
     const double hot_t0 = now_sec();
     ds4_gpu_tensor *hot_out = n_cold != 0 ? g->routed_hot_out : routed_out;
@@ -15096,16 +15353,16 @@ static bool metal_graph_cuda_cpu_moe_hot_decode(
                                                                    true);
         }
         const double cpu_t0 = now_sec();
-        layer_routed_moe_selected_one_n_prequant(g->cpu_moe_out_host,
+        layer_routed_moe_selected_one_n_prequant(slot->out,
                                                  g->cpu_model,
                                                  layer,
                                                  cold_sel,
                                                  cold_w,
                                                  n_cold,
                                                  DS4_SWIGLU_CLAMP_EXP,
-                                                 g->cpu_moe_mid,
+                                                 slot->mid,
                                                  (block_q8_K *)xq_host,
-                                                 g->cpu_moe_midq);
+                                                 slot->midq);
         g->hybrid_decode_cpu_seconds += now_sec() - cpu_t0;
         if (async_promoted != 0) {
             const double sync_t0 = now_sec();
@@ -15117,8 +15374,12 @@ static bool metal_graph_cuda_cpu_moe_hot_decode(
         }
 
         const double upload_t0 = now_sec();
-        if (ds4_gpu_tensor_write_async(g->cpu_moe_cold_out, 0, g->cpu_moe_out_host,
+        if (ds4_gpu_tensor_write_async(g->cpu_moe_cold_out, 0, slot->out,
                                        (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
+            (void)ds4_gpu_end_commands();
+            return false;
+        }
+        if (!metal_graph_mark_cpu_moe_decode_slot_upload(slot)) {
             (void)ds4_gpu_end_commands();
             return false;
         }
@@ -15408,11 +15669,378 @@ static bool metal_graph_cpu_moe_handoff_prefill_finish(
     return ds4_gpu_begin_commands() != 0;
 }
 
-typedef struct {
+struct metal_graph_cpu_moe_decode_handoff {
     bool active;
+    bool worker_started;
+    bool metadata_ready;
+    bool worker_done;
+    bool failed;
+    bool device_route_split;
+    ds4_cpu_moe_decode_slot *slot;
+    const ds4_gpu_tensor *route_expert_ptr_table;
+    const ds4_model *model;
+    const ds4_layer_weights *layer;
+    uint32_t il;
+    uint32_t n_hot;
+    uint32_t n_cold;
+    int32_t hot_sel[DS4_N_EXPERT_USED];
+    int32_t cold_sel[DS4_N_EXPERT_USED];
+    float hot_w[DS4_N_EXPERT_USED];
+    float cold_w[DS4_N_EXPERT_USED];
     double handoff_t0;
     double read_t0;
-} metal_graph_cpu_moe_decode_handoff;
+    double read_seconds;
+    double upload_sync_seconds;
+    double cpu_seconds;
+};
+
+static bool metal_graph_decode_hot_path_supported(const ds4_layer_weights *layer) {
+    return layer &&
+           layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+           layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+           layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+}
+
+static bool metal_graph_cuda_decode_layer_has_resident_hot(
+        ds4_gpu_graph          *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il) {
+    if (!g || !model || !layer || il >= DS4_N_LAYER) return false;
+    for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+        if (metal_graph_cuda_expert_gpu_resident(g, model, layer, il, expert)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool metal_graph_cuda_prepare_decode_route_table(
+        ds4_gpu_graph          *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        ds4_gpu_tensor        **hot_mask,
+        ds4_gpu_tensor        **expert_ptr_table) {
+    if (!g || !model || !layer || il >= DS4_N_LAYER ||
+        !hot_mask || !expert_ptr_table ||
+        !g->route_hot_mask_layer[il] ||
+        !g->route_expert_ptr_table_layer[il]) {
+        return false;
+    }
+    *hot_mask = g->route_hot_mask_layer[il];
+    *expert_ptr_table = g->route_expert_ptr_table_layer[il];
+    const uint64_t generation =
+        g->dynamic_expert_promotions +
+        g->dynamic_expert_evictions +
+        g->dynamic_expert_decode_tier_promotions +
+        g->dynamic_expert_decode_tier_evictions +
+        g->layerwise_staging_sticky_experts;
+    if (g->route_table_generation[il] == generation) {
+        return true;
+    }
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
+    if (ds4_gpu_prepare_decode_route_table(*hot_mask,
+                                           *expert_ptr_table,
+                                           model->map,
+                                           model->size,
+                                           layer->ffn_gate_exps->abs_offset,
+                                           layer->ffn_up_exps->abs_offset,
+                                           layer->ffn_down_exps->abs_offset,
+                                           gate_expert_bytes,
+                                           down_expert_bytes,
+                                           DS4_N_EXPERT) == 0) {
+        return false;
+    }
+    g->route_table_generation[il] = generation;
+    return true;
+}
+
+static void metal_graph_cpu_moe_decode_worker_signal(
+        ds4_gpu_graph *g,
+        metal_graph_cpu_moe_decode_handoff *handoff,
+        bool metadata_ready,
+        bool worker_done,
+        bool failed) {
+    pthread_mutex_lock(&g->cpu_moe_decode_worker_mutex);
+    if (metadata_ready) handoff->metadata_ready = true;
+    if (worker_done) handoff->worker_done = true;
+    if (failed) handoff->failed = true;
+    pthread_cond_broadcast(&g->cpu_moe_decode_worker_done_cond);
+    pthread_mutex_unlock(&g->cpu_moe_decode_worker_mutex);
+}
+
+static void metal_graph_cpu_moe_decode_worker_process(
+        ds4_gpu_graph *g,
+        metal_graph_cpu_moe_decode_handoff *handoff) {
+    bool ok = true;
+    ds4_cpu_moe_decode_slot *slot = handoff ? handoff->slot : NULL;
+    if (!g || !handoff || !slot || !slot->selected || !slot->weights || !slot->out ||
+        !slot->mid || !slot->midq ||
+        (handoff->device_route_split && (!slot->all_selected || !slot->all_weights ||
+                                         !slot->route_counts))) {
+        ok = false;
+    }
+
+    if (ok) {
+        ok = ds4_gpu_wait_transfer() != 0;
+        handoff->read_seconds = now_sec() - handoff->read_t0;
+    }
+    if (ok && !handoff->device_route_split) {
+        const double sync_t0 = now_sec();
+        ok = metal_graph_dynamic_expert_sync_uploads(g);
+        handoff->upload_sync_seconds = now_sec() - sync_t0;
+    }
+
+    if (ok && handoff->device_route_split) {
+        handoff->n_hot = slot->route_counts[0];
+        handoff->n_cold = slot->route_counts[1];
+        if (handoff->n_hot + handoff->n_cold != DS4_N_EXPERT_USED ||
+            handoff->n_hot > DS4_N_EXPERT_USED ||
+            handoff->n_cold > DS4_N_EXPERT_USED) {
+            ok = false;
+        }
+        const bool hot_supported =
+            metal_graph_decode_hot_path_supported(handoff->layer) &&
+            g->hot_experts_enabled &&
+            handoff->il < DS4_N_LAYER;
+        uint32_t host_hot = 0;
+        uint32_t host_cold = 0;
+        for (uint32_t i = 0; ok && i < DS4_N_EXPERT_USED; i++) {
+            const int32_t expert = slot->all_selected[i];
+            if (expert < 0 || expert >= DS4_N_EXPERT) {
+                ok = false;
+                break;
+            }
+            const uint32_t e = (uint32_t)expert;
+            if (hot_supported &&
+                g->hot_expert[handoff->il][e] &&
+                metal_graph_cuda_hot_expert_cached(handoff->model,
+                                                  handoff->layer,
+                                                  e)) {
+                const uint32_t j = host_hot++;
+                handoff->hot_sel[j] = expert;
+                handoff->hot_w[j] = slot->all_weights[i];
+            } else {
+                const uint32_t j = host_cold++;
+                handoff->cold_sel[j] = expert;
+                handoff->cold_w[j] = slot->all_weights[i];
+            }
+        }
+        if (ok && (host_hot != handoff->n_hot || host_cold != handoff->n_cold)) {
+            ok = false;
+        }
+    } else if (ok) {
+        const bool hot_supported =
+            metal_graph_decode_hot_path_supported(handoff->layer) &&
+            g->hot_experts_enabled &&
+            handoff->il < DS4_N_LAYER;
+        handoff->n_hot = 0;
+        handoff->n_cold = 0;
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            const int32_t expert = slot->selected[i];
+            if (expert < 0 || expert >= DS4_N_EXPERT) {
+                ok = false;
+                break;
+            }
+            const uint32_t e = (uint32_t)expert;
+            if (hot_supported &&
+                g->hot_expert[handoff->il][e] &&
+                metal_graph_cuda_hot_expert_cached(handoff->model,
+                                                  handoff->layer,
+                                                  e)) {
+                const uint32_t j = handoff->n_hot++;
+                handoff->hot_sel[j] = expert;
+                handoff->hot_w[j] = slot->weights[i];
+            } else {
+                const uint32_t j = handoff->n_cold++;
+                handoff->cold_sel[j] = expert;
+                handoff->cold_w[j] = slot->weights[i];
+            }
+        }
+    }
+
+    metal_graph_cpu_moe_decode_worker_signal(g, handoff, true, !ok, !ok);
+    if (!ok) return;
+
+    if (handoff->n_cold != 0) {
+        const double cpu_t0 = now_sec();
+        layer_routed_moe_selected_one_n_prequant(slot->out,
+                                                 g->cpu_model,
+                                                 handoff->layer,
+                                                 handoff->cold_sel,
+                                                 handoff->cold_w,
+                                                 handoff->n_cold,
+                                                 DS4_SWIGLU_CLAMP_EXP,
+                                                 slot->mid,
+                                                 slot->xq,
+                                                 slot->midq);
+        handoff->cpu_seconds = now_sec() - cpu_t0;
+    }
+
+    metal_graph_cpu_moe_decode_worker_signal(g, handoff, false, true, false);
+}
+
+static void *metal_graph_cpu_moe_decode_worker_main(void *arg) {
+    ds4_gpu_graph *g = arg;
+    ds4_pin_parallel_lane(0);
+
+    for (;;) {
+        pthread_mutex_lock(&g->cpu_moe_decode_worker_mutex);
+        while (!g->cpu_moe_decode_worker_task &&
+               !g->cpu_moe_decode_worker_shutdown) {
+            pthread_cond_wait(&g->cpu_moe_decode_worker_cond,
+                              &g->cpu_moe_decode_worker_mutex);
+        }
+        if (g->cpu_moe_decode_worker_shutdown &&
+            !g->cpu_moe_decode_worker_task) {
+            pthread_mutex_unlock(&g->cpu_moe_decode_worker_mutex);
+            return NULL;
+        }
+        metal_graph_cpu_moe_decode_handoff *handoff =
+            g->cpu_moe_decode_worker_task;
+        pthread_mutex_unlock(&g->cpu_moe_decode_worker_mutex);
+
+        metal_graph_cpu_moe_decode_worker_process(g, handoff);
+
+        pthread_mutex_lock(&g->cpu_moe_decode_worker_mutex);
+        if (g->cpu_moe_decode_worker_task == handoff) {
+            g->cpu_moe_decode_worker_task = NULL;
+        }
+        pthread_cond_broadcast(&g->cpu_moe_decode_worker_done_cond);
+        pthread_mutex_unlock(&g->cpu_moe_decode_worker_mutex);
+    }
+}
+
+static bool metal_graph_ensure_cpu_moe_decode_worker(ds4_gpu_graph *g) {
+    if (!g) return false;
+    if (g->cpu_moe_decode_worker_initialized) return true;
+
+    if (pthread_mutex_init(&g->cpu_moe_decode_worker_mutex, NULL) != 0) {
+        return false;
+    }
+    if (pthread_cond_init(&g->cpu_moe_decode_worker_cond, NULL) != 0) {
+        pthread_mutex_destroy(&g->cpu_moe_decode_worker_mutex);
+        return false;
+    }
+    if (pthread_cond_init(&g->cpu_moe_decode_worker_done_cond, NULL) != 0) {
+        pthread_cond_destroy(&g->cpu_moe_decode_worker_cond);
+        pthread_mutex_destroy(&g->cpu_moe_decode_worker_mutex);
+        return false;
+    }
+    g->cpu_moe_decode_worker_shutdown = false;
+    g->cpu_moe_decode_worker_task = NULL;
+    if (pthread_create(&g->cpu_moe_decode_worker,
+                       NULL,
+                       metal_graph_cpu_moe_decode_worker_main,
+                       g) != 0) {
+        pthread_cond_destroy(&g->cpu_moe_decode_worker_done_cond);
+        pthread_cond_destroy(&g->cpu_moe_decode_worker_cond);
+        pthread_mutex_destroy(&g->cpu_moe_decode_worker_mutex);
+        return false;
+    }
+    g->cpu_moe_decode_worker_initialized = true;
+    return true;
+}
+
+static void metal_graph_stop_cpu_moe_decode_worker(ds4_gpu_graph *g) {
+    if (!g || !g->cpu_moe_decode_worker_initialized) return;
+    pthread_mutex_lock(&g->cpu_moe_decode_worker_mutex);
+    g->cpu_moe_decode_worker_shutdown = true;
+    pthread_cond_signal(&g->cpu_moe_decode_worker_cond);
+    pthread_mutex_unlock(&g->cpu_moe_decode_worker_mutex);
+
+    pthread_join(g->cpu_moe_decode_worker, NULL);
+    pthread_cond_destroy(&g->cpu_moe_decode_worker_done_cond);
+    pthread_cond_destroy(&g->cpu_moe_decode_worker_cond);
+    pthread_mutex_destroy(&g->cpu_moe_decode_worker_mutex);
+    g->cpu_moe_decode_worker_initialized = false;
+    g->cpu_moe_decode_worker_shutdown = false;
+    g->cpu_moe_decode_worker_task = NULL;
+}
+
+static bool metal_graph_cpu_moe_handoff_decode_start_worker(
+        ds4_gpu_graph                   *g,
+        const ds4_model                 *model,
+        const ds4_layer_weights         *layer,
+        uint32_t                         il,
+        metal_graph_cpu_moe_decode_handoff *handoff) {
+    if (!g || !model || !layer || !handoff || !handoff->active) return false;
+    if (!metal_graph_ensure_cpu_moe_decode_worker(g)) return false;
+    handoff->model = model;
+    handoff->layer = layer;
+    handoff->il = il;
+    handoff->worker_started = true;
+    handoff->metadata_ready = false;
+    handoff->worker_done = false;
+    handoff->failed = false;
+
+    pthread_mutex_lock(&g->cpu_moe_decode_worker_mutex);
+    if (g->cpu_moe_decode_worker_task != NULL) {
+        pthread_mutex_unlock(&g->cpu_moe_decode_worker_mutex);
+        return false;
+    }
+    g->cpu_moe_decode_worker_task = handoff;
+    g->hybrid_decode_worker_launches++;
+    pthread_cond_signal(&g->cpu_moe_decode_worker_cond);
+    pthread_mutex_unlock(&g->cpu_moe_decode_worker_mutex);
+    return true;
+}
+
+static DS4_MAYBE_UNUSED bool metal_graph_cpu_moe_handoff_decode_wait_metadata(
+        ds4_gpu_graph                   *g,
+        metal_graph_cpu_moe_decode_handoff *handoff) {
+    if (!g || !handoff || !handoff->worker_started) return false;
+    const double wait_t0 = now_sec();
+    pthread_mutex_lock(&g->cpu_moe_decode_worker_mutex);
+    while (!handoff->metadata_ready) {
+        pthread_cond_wait(&g->cpu_moe_decode_worker_done_cond,
+                          &g->cpu_moe_decode_worker_mutex);
+    }
+    const bool ok = !handoff->failed;
+    pthread_mutex_unlock(&g->cpu_moe_decode_worker_mutex);
+    g->hybrid_decode_worker_metadata_wait_seconds += now_sec() - wait_t0;
+    g->hybrid_decode_read_seconds += handoff->read_seconds;
+    return ok;
+}
+
+static bool metal_graph_cpu_moe_handoff_decode_wait_done(
+        ds4_gpu_graph                   *g,
+        metal_graph_cpu_moe_decode_handoff *handoff) {
+    if (!g || !handoff || !handoff->worker_started) return false;
+    const double wait_t0 = now_sec();
+    pthread_mutex_lock(&g->cpu_moe_decode_worker_mutex);
+    while (!handoff->worker_done) {
+        pthread_cond_wait(&g->cpu_moe_decode_worker_done_cond,
+                          &g->cpu_moe_decode_worker_mutex);
+    }
+    while (g->cpu_moe_decode_worker_task == handoff) {
+        pthread_cond_wait(&g->cpu_moe_decode_worker_done_cond,
+                          &g->cpu_moe_decode_worker_mutex);
+    }
+    const bool ok = !handoff->failed;
+    pthread_mutex_unlock(&g->cpu_moe_decode_worker_mutex);
+    g->hybrid_decode_worker_done_wait_seconds += now_sec() - wait_t0;
+    g->hybrid_decode_read_seconds += handoff->read_seconds;
+    g->hybrid_decode_cpu_seconds += handoff->cpu_seconds;
+    handoff->active = false;
+    return ok;
+}
+
+static void metal_graph_cpu_moe_handoff_decode_cancel(
+        ds4_gpu_graph                   *g,
+        metal_graph_cpu_moe_decode_handoff *handoff) {
+    if (!g || !handoff || !handoff->active) return;
+    if (handoff->worker_started) {
+        (void)metal_graph_cpu_moe_handoff_decode_wait_done(g, handoff);
+    } else {
+        (void)ds4_gpu_wait_transfer();
+        handoff->active = false;
+    }
+}
 
 static bool metal_graph_cpu_moe_handoff_decode_begin_norm(
         ds4_gpu_graph                   *g,
@@ -15422,7 +16050,8 @@ static bool metal_graph_cpu_moe_handoff_decode_begin_norm(
     if (!g || !model || !ffn_norm || !handoff) return false;
     memset(handoff, 0, sizeof(*handoff));
     if (g->backend != DS4_BACKEND_CUDA) return false;
-    if (!metal_graph_ensure_cpu_moe_scratch(g, 1)) return false;
+    ds4_cpu_moe_decode_slot *slot = metal_graph_acquire_cpu_moe_decode_slot(g);
+    if (!slot) return false;
 
     handoff->handoff_t0 = now_sec();
     const bool need_explicit_sync =
@@ -15436,8 +16065,7 @@ static bool metal_graph_cpu_moe_handoff_decode_begin_norm(
     if (g->layerwise_staged_active) {
         metal_graph_layerwise_prefill_release_staged(g, model);
     }
-    if (!g->cpu_moe_xq || !g->cpu_moe_selected_host ||
-        !g->cpu_moe_weight_host || !g->cpu_moe_out_host ||
+    if (!slot->xq || !slot->selected || !slot->weights || !slot->out ||
         !g->ffn_norm_xq) {
         return false;
     }
@@ -15451,27 +16079,100 @@ static bool metal_graph_cpu_moe_handoff_decode_begin_norm(
     handoff->read_t0 = now_sec();
     if (ds4_gpu_begin_transfer_from_compute() == 0 ||
         ds4_gpu_tensor_read_async(g->ffn_norm_xq, 0,
-                                  g->cpu_moe_xq,
+                                  slot->xq,
                                   (uint64_t)(DS4_N_EMBD / QK_K) * sizeof(block_q8_K)) == 0) {
         return false;
     }
+    handoff->slot = slot;
     handoff->active = true;
     return true;
 }
 
 static bool metal_graph_cpu_moe_handoff_decode_read_router(
         ds4_gpu_graph                   *g,
+        const ds4_model                 *model,
+        const ds4_layer_weights         *layer,
+        uint32_t                         il,
         ds4_gpu_tensor                  *router_selected,
         ds4_gpu_tensor                  *router_weights,
         metal_graph_cpu_moe_decode_handoff *handoff) {
-    if (!g || !router_selected || !router_weights || !handoff || !handoff->active) return false;
-    if (!g->cpu_moe_selected_host || !g->cpu_moe_weight_host) return false;
+    if (!g || !model || !layer || !router_selected || !router_weights ||
+        !handoff || !handoff->active) return false;
+    ds4_cpu_moe_decode_slot *slot = handoff->slot;
+    if (!slot || !slot->selected || !slot->weights) return false;
+    handoff->model = model;
+    handoff->layer = layer;
+    handoff->il = il;
+    handoff->device_route_split = false;
+    handoff->route_expert_ptr_table = NULL;
+    handoff->n_hot = 0;
+    handoff->n_cold = 0;
+
+    const bool can_device_split =
+        g->backend == DS4_BACKEND_CUDA &&
+        g->hot_experts_enabled &&
+        il < DS4_N_LAYER &&
+        metal_graph_decode_hot_path_supported(layer) &&
+        slot->all_selected && slot->all_weights && slot->route_counts &&
+        g->route_hot_selected && g->route_hot_weights &&
+        g->route_cold_selected && g->route_cold_weights &&
+        g->route_counts && g->route_hot_mask && g->route_expert_ptr_table &&
+        metal_graph_cuda_decode_layer_has_resident_hot(g, model, layer, il);
+    if (can_device_split) {
+        bool route_ok = metal_graph_dynamic_expert_sync_uploads(g);
+        ds4_gpu_tensor *route_hot_mask = NULL;
+        ds4_gpu_tensor *route_expert_ptr_table = NULL;
+        if (route_ok) {
+            route_ok = metal_graph_cuda_prepare_decode_route_table(g,
+                                                                   model,
+                                                                   layer,
+                                                                   il,
+                                                                   &route_hot_mask,
+                                                                   &route_expert_ptr_table);
+        }
+        if (route_ok) {
+            route_ok =
+                ds4_gpu_decode_route_split_tensor(g->route_hot_selected,
+                                                  g->route_hot_weights,
+                                                  g->route_cold_selected,
+                                                  g->route_cold_weights,
+                                                  g->route_counts,
+                                                  router_selected,
+                                                  router_weights,
+                                                  route_hot_mask,
+                                                  DS4_N_EXPERT_USED) != 0;
+        }
+        if (route_ok) {
+            handoff->device_route_split = true;
+            handoff->route_expert_ptr_table = route_expert_ptr_table;
+            bool read_ok =
+                ds4_gpu_begin_transfer_from_compute() != 0 &&
+                ds4_gpu_tensor_read_async(g->route_counts, 0,
+                                          slot->route_counts,
+                                          2u * sizeof(uint32_t)) != 0 &&
+                ds4_gpu_tensor_read_async(router_selected, 0,
+                                          slot->all_selected,
+                                          DS4_N_EXPERT_USED * sizeof(int32_t)) != 0 &&
+                ds4_gpu_tensor_read_async(router_weights, 0,
+                                          slot->all_weights,
+                                          DS4_N_EXPERT_USED * sizeof(float)) != 0;
+            if (read_ok) {
+                g->hybrid_decode_device_route_splits++;
+                return true;
+            }
+            return false;
+        }
+        handoff->device_route_split = false;
+        handoff->n_hot = 0;
+        handoff->n_cold = 0;
+    }
+
     if (ds4_gpu_begin_transfer_from_compute() == 0 ||
         ds4_gpu_tensor_read_async(router_selected, 0,
-                                  g->cpu_moe_selected_host,
+                                  slot->selected,
                                   DS4_N_EXPERT_USED * sizeof(int32_t)) == 0 ||
         ds4_gpu_tensor_read_async(router_weights, 0,
-                                  g->cpu_moe_weight_host,
+                                  slot->weights,
                                   DS4_N_EXPERT_USED * sizeof(float)) == 0) {
         return false;
     }
@@ -15487,56 +16188,87 @@ static bool metal_graph_cpu_moe_handoff_decode_finish(
         ds4_gpu_tensor                  *routed_out,
         metal_graph_cpu_moe_decode_handoff *handoff) {
     if (!g || !model || !layer || !ffn_norm || !routed_out || !handoff || !handoff->active) return false;
-    if (ds4_gpu_wait_transfer() == 0) return false;
-    handoff->active = false;
-    g->hybrid_decode_read_seconds += now_sec() - handoff->read_t0;
+    if (!handoff->worker_started) return false;
 
-    const block_q8_K *xq = g->cpu_moe_xq;
-    const int32_t *sel = g->cpu_moe_selected_host;
-    const float *w = g->cpu_moe_weight_host;
-    float *out = g->cpu_moe_out_host;
-    if (!xq || !sel || !w || !out) return false;
+    ds4_cpu_moe_decode_slot *slot = handoff->slot;
+    if (!slot) return false;
+    if (!slot->xq || !slot->out || !slot->mid || !slot->midq || !slot->pair_ids) return false;
 
+    if (!metal_graph_cpu_moe_handoff_decode_wait_metadata(g, handoff)) {
+        metal_graph_cpu_moe_handoff_decode_cancel(g, handoff);
+        return false;
+    }
+
+    const bool device_route_split = handoff->device_route_split;
+    int32_t *sel = device_route_split ? slot->all_selected : slot->selected;
+    float *w = device_route_split ? slot->all_weights : slot->weights;
+    if (!sel || !w) return false;
+
+    uint32_t async_promoted = 0;
     double maintenance_t0 = now_sec();
-    metal_graph_record_route_profile(g, il, sel, 1, true);
-    const bool dynamic_observe_eager =
-        g->dynamic_expert_eager ||
-        g->dynamic_expert_decode_eager;
-    if (dynamic_observe_eager) {
-        metal_graph_dynamic_expert_observe(g, il, sel, 1, true);
-    }
-    g->hybrid_decode_maintenance_seconds += now_sec() - maintenance_t0;
-
-    if (metal_graph_cuda_cpu_moe_hot_decode(g, model, layer, il, ffn_norm,
-                                            routed_out, xq, sel, w)) {
-        maintenance_t0 = now_sec();
-        if (g->dynamic_expert_decode_evict) {
-            metal_graph_dynamic_expert_maintenance(g, model, layer, il, sel, 1, true);
+    {
+        metal_graph_record_route_profile(g, il, sel, 1, true);
+        const bool dynamic_observe_eager =
+            g->dynamic_expert_eager ||
+            g->dynamic_expert_decode_eager;
+        if (dynamic_observe_eager) {
+            metal_graph_dynamic_expert_observe(g, il, sel, 1, true);
         }
-        metal_graph_dynamic_expert_after_layer(g, model, il, sel, 1, true);
+        if (handoff->n_cold != 0) {
+            async_promoted =
+                metal_graph_dynamic_expert_prefetch_future_route_set_async(
+                    g, model, g->gpu_weights, il, 1);
+            async_promoted +=
+                metal_graph_dynamic_expert_prefetch_selected_async(g, model, layer, il,
+                                                                   sel, DS4_N_EXPERT_USED,
+                                                                   true);
+        }
         g->hybrid_decode_maintenance_seconds += now_sec() - maintenance_t0;
-        g->hybrid_decode_total_seconds += now_sec() - handoff->handoff_t0;
-        return ds4_gpu_begin_commands() != 0;
     }
 
-    uint32_t async_promoted =
-        metal_graph_dynamic_expert_prefetch_future_route_set_async(
-            g, model, g->gpu_weights, il, 1);
-    async_promoted +=
-        metal_graph_dynamic_expert_prefetch_selected_async(g, model, layer, il,
-                                                           sel, DS4_N_EXPERT_USED,
-                                                           true);
-    const double cpu_t0 = now_sec();
-    cpu_routed_moe_batch_handoff_prequant(g->cpu_model, layer, il,
-                                          sel, w, out,
-                                          1, DS4_SWIGLU_CLAMP_EXP,
-                                          g->cpu_moe_mid,
-                                          g->cpu_moe_xq,
-                                          g->cpu_moe_midq,
-                                          g->cpu_moe_pair_ids);
-    g->hybrid_decode_full_cpu_handoffs++;
-    g->hybrid_decode_cpu_slots += DS4_N_EXPERT_USED;
-    g->hybrid_decode_cpu_seconds += now_sec() - cpu_t0;
+    if (handoff->n_hot != 0) {
+        const bool hot_ok = device_route_split
+            ? metal_graph_cuda_cpu_moe_enqueue_hot_decode_device(g,
+                                                                 layer,
+                                                                 ffn_norm,
+                                                                 routed_out,
+                                                                 handoff->route_expert_ptr_table,
+                                                                 handoff->n_hot,
+                                                                 handoff->n_cold)
+            : metal_graph_cuda_cpu_moe_enqueue_hot_decode(g,
+                                                          model,
+                                                          layer,
+                                                          ffn_norm,
+                                                          routed_out,
+                                                          handoff->hot_sel,
+                                                          handoff->hot_w,
+                                                          handoff->n_hot,
+                                                          handoff->n_cold);
+        if (!hot_ok) {
+            metal_graph_cpu_moe_handoff_decode_cancel(g, handoff);
+            return false;
+        }
+    }
+
+    if (!metal_graph_cpu_moe_handoff_decode_wait_done(g, handoff)) {
+        return false;
+    }
+
+    if (handoff->n_hot != 0) {
+        g->hot_expert_decode_layers++;
+        g->hot_expert_decode_slots += handoff->n_hot;
+        g->cold_expert_decode_slots += handoff->n_cold;
+        g->hybrid_decode_hot_handoffs++;
+        if (handoff->n_cold == 0) {
+            g->hybrid_decode_all_hot_handoffs++;
+        } else {
+            g->hybrid_decode_mixed_handoffs++;
+        }
+    } else {
+        g->hybrid_decode_full_cpu_handoffs++;
+    }
+    g->hybrid_decode_cpu_slots += handoff->n_cold;
+
     if (async_promoted != 0) {
         const double sync_t0 = now_sec();
         if (!metal_graph_dynamic_expert_sync_uploads(g)) {
@@ -15545,12 +16277,29 @@ static bool metal_graph_cpu_moe_handoff_decode_finish(
         g->hybrid_decode_maintenance_seconds += now_sec() - sync_t0;
     }
 
-    const double upload_t0 = now_sec();
-    if (ds4_gpu_tensor_write_async(routed_out, 0, out,
-                                   (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
-        return false;
+    if (handoff->n_cold != 0) {
+        ds4_gpu_tensor *cold_out =
+            handoff->n_hot != 0 ? g->cpu_moe_cold_out : routed_out;
+        if (!cold_out) return false;
+
+        const double upload_t0 = now_sec();
+        if (ds4_gpu_tensor_write_async(cold_out, 0, slot->out,
+                                       (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
+            return false;
+        }
+        if (!metal_graph_mark_cpu_moe_decode_slot_upload(slot)) {
+            return false;
+        }
+        g->hybrid_decode_upload_seconds += now_sec() - upload_t0;
+
+        if (handoff->n_hot != 0) {
+            const double add_t0 = now_sec();
+            if (ds4_gpu_add_tensor(routed_out, g->routed_hot_out, cold_out, DS4_N_EMBD) == 0) {
+                return false;
+            }
+            g->hybrid_decode_add_seconds += now_sec() - add_t0;
+        }
     }
-    g->hybrid_decode_upload_seconds += now_sec() - upload_t0;
 
     maintenance_t0 = now_sec();
     if (g->dynamic_expert_decode_evict) {
@@ -15671,7 +16420,7 @@ static bool metal_graph_cpu_moe_handoff(
 
     if (decode && n_tokens == 1 &&
         metal_graph_cuda_cpu_moe_hot_decode(g, model, layer, il, ffn_norm,
-                                            routed_out, xq_host, sel, w)) {
+                                            routed_out, xq_host, sel, w, NULL)) {
         const double after_t0 = cuda_decode ? now_sec() : 0.0;
         metal_graph_dynamic_expert_after_layer(g, model, il, sel,
                                                n_tokens, decode);
@@ -15861,8 +16610,10 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     }
     if (g && g->hybrid_decode_handoffs != 0) {
         fprintf(stderr,
-                "ds4: CUDA hybrid decode timing: handoffs=%llu hot_paths=%llu all_hot=%llu mixed=%llu full_cpu=%llu cpu_slots=%llu total=%.3f s sync=%.3f s read=%.3f s maintenance=%.3f s hot_enqueue=%.3f s cpu=%.3f s upload=%.3f s add=%.3f s\n",
+                "ds4: CUDA hybrid decode timing: handoffs=%llu worker_launches=%llu device_route_splits=%llu hot_paths=%llu all_hot=%llu mixed=%llu full_cpu=%llu cpu_slots=%llu total=%.3f s sync=%.3f s read=%.3f s metadata_wait=%.3f s worker_done_wait=%.3f s maintenance=%.3f s hot_enqueue=%.3f s cpu=%.3f s upload=%.3f s add=%.3f s\n",
                 (unsigned long long)g->hybrid_decode_handoffs,
+                (unsigned long long)g->hybrid_decode_worker_launches,
+                (unsigned long long)g->hybrid_decode_device_route_splits,
                 (unsigned long long)g->hybrid_decode_hot_handoffs,
                 (unsigned long long)g->hybrid_decode_all_hot_handoffs,
                 (unsigned long long)g->hybrid_decode_mixed_handoffs,
@@ -15871,6 +16622,8 @@ static void metal_graph_free(ds4_gpu_graph *g) {
                 g->hybrid_decode_total_seconds,
                 g->hybrid_decode_sync_seconds,
                 g->hybrid_decode_read_seconds,
+                g->hybrid_decode_worker_metadata_wait_seconds,
+                g->hybrid_decode_worker_done_wait_seconds,
                 g->hybrid_decode_maintenance_seconds,
                 g->hybrid_decode_hot_enqueue_seconds,
                 g->hybrid_decode_cpu_seconds,
@@ -16002,6 +16755,17 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->routed_mid);
     ds4_gpu_tensor_free(g->routed_up);
     ds4_gpu_tensor_free(g->routed_gate);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->route_expert_ptr_table_layer[il]);
+        ds4_gpu_tensor_free(g->route_hot_mask_layer[il]);
+    }
+    ds4_gpu_tensor_free(g->route_expert_ptr_table);
+    ds4_gpu_tensor_free(g->route_hot_mask);
+    ds4_gpu_tensor_free(g->route_counts);
+    ds4_gpu_tensor_free(g->route_cold_weights);
+    ds4_gpu_tensor_free(g->route_cold_selected);
+    ds4_gpu_tensor_free(g->route_hot_weights);
+    ds4_gpu_tensor_free(g->route_hot_selected);
     ds4_gpu_tensor_free(g->hot_router_weights);
     ds4_gpu_tensor_free(g->router_weights);
     ds4_gpu_tensor_free(g->router_selected);
@@ -16493,6 +17257,20 @@ static bool metal_graph_alloc_raw_cap(
     g->router_selected = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int));
     g->router_weights = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
     g->hot_router_weights = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
+    g->route_hot_selected = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int32_t));
+    g->route_hot_weights = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
+    g->route_cold_selected = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int32_t));
+    g->route_cold_weights = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
+    g->route_counts = ds4_gpu_tensor_alloc(2u * sizeof(uint32_t));
+    g->route_hot_mask = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(uint8_t));
+    g->route_expert_ptr_table =
+        ds4_gpu_tensor_alloc((uint64_t)3u * DS4_N_EXPERT * sizeof(void *));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->route_hot_mask_layer[il] = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(uint8_t));
+        g->route_expert_ptr_table_layer[il] =
+            ds4_gpu_tensor_alloc((uint64_t)3u * DS4_N_EXPERT * sizeof(void *));
+        g->route_table_generation[il] = UINT64_MAX;
+    }
     g->routed_gate = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_up = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_mid = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
@@ -16597,8 +17375,13 @@ static bool metal_graph_alloc_raw_cap(
                                g->spec_prefix1_index_state_score[il] != NULL));
         }
     }
+    bool route_cache_ok = true;
+    for (uint32_t il = 0; route_cache_ok && il < DS4_N_LAYER; il++) {
+        route_cache_ok = g->route_hot_mask_layer[il] != NULL &&
+                         g->route_expert_ptr_table_layer[il] != NULL;
+    }
 
-    const bool ok = state_init_ok && layer_cache_ok &&
+    const bool ok = state_init_ok && layer_cache_ok && route_cache_ok &&
                     g->cur_hc && g->flat_hc && g->hc_mix && g->hc_split &&
                     g->hc_pre && g->hc_post && g->hc_comb &&
                     g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
@@ -16612,6 +17395,10 @@ static bool metal_graph_alloc_raw_cap(
                     g->shared_out &&
                     g->router_logits && g->router_probs && g->router_selected &&
                     g->router_weights && g->hot_router_weights &&
+                    g->route_hot_selected && g->route_hot_weights &&
+                    g->route_cold_selected && g->route_cold_weights &&
+                    g->route_counts && g->route_hot_mask &&
+                    g->route_expert_ptr_table &&
                     g->routed_gate && g->routed_up && g->routed_mid &&
                     g->routed_down && g->routed_out && g->routed_hot_out &&
                     g->ffn_norm_xq && g->cpu_moe_cold_out &&
@@ -17516,16 +18303,25 @@ static bool metal_graph_encode_decode_layer(
     }
     if (ok && cuda_cpu_moe_overlap) {
         ok = metal_graph_cpu_moe_handoff_decode_read_router(g,
+                                                            model,
+                                                            layer,
+                                                            il,
                                                             g->router_selected,
                                                             g->router_weights,
                                                             &cpu_moe_handoff);
+        if (ok) {
+            ok = metal_graph_cpu_moe_handoff_decode_start_worker(g,
+                                                                 model,
+                                                                 layer,
+                                                                 il,
+                                                                 &cpu_moe_handoff);
+        }
     }
     if (ok && cuda_cpu_moe_overlap) {
         ok = metal_graph_decode_shared_ffn_out(g, model, layer, shared_dim);
     }
     if (!ok && cpu_moe_handoff.active) {
-        (void)ds4_gpu_wait_transfer();
-        cpu_moe_handoff.active = false;
+        metal_graph_cpu_moe_handoff_decode_cancel(g, &cpu_moe_handoff);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_overlap");
     if (ok && !force_metal_moe && g->cpu_moe_layer[il]) {

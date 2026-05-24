@@ -3930,6 +3930,28 @@ void ds4_gpu_host_free(void *ptr) {
     free(ptr);
 }
 
+struct ds4_gpu_event {
+    int recorded;
+};
+
+ds4_gpu_event *ds4_gpu_event_create(void) {
+    return calloc(1, sizeof(ds4_gpu_event));
+}
+
+void ds4_gpu_event_free(ds4_gpu_event *event) {
+    free(event);
+}
+
+int ds4_gpu_event_record_compute(ds4_gpu_event *event) {
+    if (event) event->recorded = 1;
+    return 1;
+}
+
+int ds4_gpu_event_wait(ds4_gpu_event *event) {
+    if (event) event->recorded = 0;
+    return 1;
+}
+
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || (!data && bytes != 0)) return 0;
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
@@ -13262,6 +13284,52 @@ int ds4_gpu_routed_moe_one_tensor(
     return 1;
 }
 
+int ds4_gpu_prepare_decode_route_table(
+        ds4_gpu_tensor       *hot_mask,
+        ds4_gpu_tensor       *expert_ptr_table,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                down_expert_bytes,
+        uint32_t                n_expert) {
+    (void)hot_mask;
+    (void)expert_ptr_table;
+    (void)model_map;
+    (void)model_size;
+    (void)gate_offset;
+    (void)up_offset;
+    (void)down_offset;
+    (void)gate_expert_bytes;
+    (void)down_expert_bytes;
+    (void)n_expert;
+    return 0;
+}
+
+int ds4_gpu_decode_route_split_tensor(
+        ds4_gpu_tensor       *hot_selected,
+        ds4_gpu_tensor       *hot_weights,
+        ds4_gpu_tensor       *cold_selected,
+        ds4_gpu_tensor       *cold_weights,
+        ds4_gpu_tensor       *counts,
+        const ds4_gpu_tensor *router_selected,
+        const ds4_gpu_tensor *router_weights,
+        const ds4_gpu_tensor *hot_mask,
+        uint32_t                n_selected) {
+    (void)hot_selected;
+    (void)hot_weights;
+    (void)cold_selected;
+    (void)cold_weights;
+    (void)counts;
+    (void)router_selected;
+    (void)router_weights;
+    (void)hot_mask;
+    (void)n_selected;
+    return 0;
+}
+
 int ds4_gpu_routed_moe_one_cached_experts_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -13308,6 +13376,46 @@ int ds4_gpu_routed_moe_one_cached_experts_tensor(
     (void)out_dim;
     (void)selected_host;
     (void)weights;
+    (void)n_expert;
+    (void)clamp;
+    (void)x;
+    return 0;
+}
+
+int ds4_gpu_routed_moe_one_cached_experts_table_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *down,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *expert_ptr_table,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x) {
+    (void)out;
+    (void)gate;
+    (void)up;
+    (void)mid;
+    (void)down;
+    (void)gate_type;
+    (void)down_type;
+    (void)gate_row_bytes;
+    (void)down_row_bytes;
+    (void)expert_in_dim;
+    (void)expert_mid_dim;
+    (void)out_dim;
+    (void)selected;
+    (void)weights;
+    (void)expert_ptr_table;
     (void)n_expert;
     (void)clamp;
     (void)x;

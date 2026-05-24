@@ -14,6 +14,7 @@
  * buffers stay device-owned across the whole prefill/decode command sequence.
  */
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
+typedef struct ds4_gpu_event ds4_gpu_event;
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
@@ -27,6 +28,10 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 void *ds4_gpu_host_alloc(uint64_t bytes);
 void ds4_gpu_host_free(void *ptr);
+ds4_gpu_event *ds4_gpu_event_create(void);
+void ds4_gpu_event_free(ds4_gpu_event *event);
+int ds4_gpu_event_record_compute(ds4_gpu_event *event);
+int ds4_gpu_event_wait(ds4_gpu_event *event);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int ds4_gpu_begin_transfer_from_compute(void);
@@ -642,6 +647,29 @@ int ds4_gpu_router_select_batch_tensor(
         const ds4_gpu_tensor *tokens,
         uint32_t                n_tokens);
 
+int ds4_gpu_prepare_decode_route_table(
+        ds4_gpu_tensor       *hot_mask,
+        ds4_gpu_tensor       *expert_ptr_table,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                down_expert_bytes,
+        uint32_t                n_expert);
+
+int ds4_gpu_decode_route_split_tensor(
+        ds4_gpu_tensor       *hot_selected,
+        ds4_gpu_tensor       *hot_weights,
+        ds4_gpu_tensor       *cold_selected,
+        ds4_gpu_tensor       *cold_weights,
+        ds4_gpu_tensor       *counts,
+        const ds4_gpu_tensor *router_selected,
+        const ds4_gpu_tensor *router_weights,
+        const ds4_gpu_tensor *hot_mask,
+        uint32_t                n_selected);
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -690,6 +718,26 @@ int ds4_gpu_routed_moe_one_cached_experts_tensor(
         uint32_t                out_dim,
         const int32_t          *selected_host,
         const ds4_gpu_tensor *weights,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_routed_moe_one_cached_experts_table_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *down,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *expert_ptr_table,
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x);

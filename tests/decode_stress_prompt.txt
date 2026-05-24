@@ -1,0 +1,3 @@
+Write a continuous technical field report about optimizing a heterogeneous CPU/GPU inference runtime.
+
+Keep going until you have written many paragraphs. Focus on concrete observations, tradeoffs, measurements, and next experiments. Do not summarize early, do not end with a conclusion, and do not use bullet points.

@@ -1997,6 +1997,45 @@ extern "C" void ds4_gpu_host_free(void *ptr) {
     if (ptr) (void)cudaFreeHost(ptr);
 }
 
+struct ds4_gpu_event {
+    cudaEvent_t event;
+    int recorded;
+};
+
+extern "C" ds4_gpu_event *ds4_gpu_event_create(void) {
+    ds4_gpu_event *ev = (ds4_gpu_event *)calloc(1, sizeof(*ev));
+    if (!ev) return NULL;
+    cudaError_t err = cudaEventCreateWithFlags(&ev->event, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA event creation failed: %s\n", cudaGetErrorString(err));
+        free(ev);
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    return ev;
+}
+
+extern "C" void ds4_gpu_event_free(ds4_gpu_event *ev) {
+    if (!ev) return;
+    if (ev->event) (void)cudaEventDestroy(ev->event);
+    free(ev);
+}
+
+extern "C" int ds4_gpu_event_record_compute(ds4_gpu_event *ev) {
+    if (!ev || !ev->event) return 0;
+    cudaError_t err = cudaEventRecord(ev->event, 0);
+    if (!cuda_ok(err, "record compute event")) return 0;
+    ev->recorded = 1;
+    return 1;
+}
+
+extern "C" int ds4_gpu_event_wait(ds4_gpu_event *ev) {
+    if (!ev || !ev->event || !ev->recorded) return 1;
+    const int ok = cuda_ok(cudaEventSynchronize(ev->event), "wait compute event");
+    if (ok) ev->recorded = 0;
+    return ok;
+}
+
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
@@ -8463,6 +8502,142 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
     return cuda_ok(cudaGetLastError(), "router_select launch");
 }
 
+__global__ static void decode_route_split_kernel(
+        int32_t *hot_selected,
+        float *hot_weights,
+        int32_t *cold_selected,
+        float *cold_weights,
+        uint32_t *counts,
+        const int32_t *router_selected,
+        const float *router_weights,
+        const uint8_t *hot_mask,
+        uint32_t n_selected) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    uint32_t n_hot = 0;
+    uint32_t n_cold = 0;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        const int32_t expert_i = router_selected[i];
+        const float w = router_weights[i];
+        if (expert_i >= 0 && expert_i < 256 && hot_mask[(uint32_t)expert_i]) {
+            hot_selected[n_hot] = expert_i;
+            hot_weights[n_hot] = w;
+            n_hot++;
+        } else {
+            cold_selected[n_cold] = expert_i;
+            cold_weights[n_cold] = w;
+            n_cold++;
+        }
+    }
+    counts[0] = n_hot;
+    counts[1] = n_cold;
+}
+
+__global__ static void gather_cached_expert_ptrs_kernel(
+        const char **out,
+        const int32_t *selected,
+        const char *const *expert_ptr_table,
+        uint32_t n_expert) {
+    uint32_t i = threadIdx.x;
+    if (i >= n_expert) return;
+    const int32_t expert_i = selected[i];
+    const uint32_t expert = (expert_i >= 0 && expert_i < 256) ? (uint32_t)expert_i : 0u;
+    out[i] = expert_ptr_table[expert];
+    out[6u + i] = expert_ptr_table[256u + expert];
+    out[12u + i] = expert_ptr_table[512u + expert];
+}
+
+extern "C" int ds4_gpu_prepare_decode_route_table(
+        ds4_gpu_tensor *hot_mask,
+        ds4_gpu_tensor *expert_ptr_table,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        uint32_t n_expert) {
+    if (!hot_mask || !expert_ptr_table || !model_map || n_expert == 0 || n_expert > 256u ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        hot_mask->bytes < 256u * sizeof(uint8_t) ||
+        expert_ptr_table->bytes < (uint64_t)3u * 256u * sizeof(const char *) ||
+        gate_offset > model_size || up_offset > model_size || down_offset > model_size) {
+        return 0;
+    }
+
+    uint8_t host_mask[256];
+    const char *host_ptrs[3u * 256u];
+    memset(host_mask, 0, sizeof(host_mask));
+    memset(host_ptrs, 0, sizeof(host_ptrs));
+    for (uint32_t expert = 0; expert < n_expert; expert++) {
+        const uint64_t gate_expert_offset = gate_offset + (uint64_t)expert * gate_expert_bytes;
+        const uint64_t up_expert_offset = up_offset + (uint64_t)expert * gate_expert_bytes;
+        const uint64_t down_expert_offset = down_offset + (uint64_t)expert * down_expert_bytes;
+        if (gate_expert_offset > model_size || gate_expert_bytes > model_size - gate_expert_offset ||
+            up_expert_offset > model_size || gate_expert_bytes > model_size - up_expert_offset ||
+            down_expert_offset > model_size || down_expert_bytes > model_size - down_expert_offset) {
+            return 0;
+        }
+        const char *gate_w = cuda_model_range_lookup_device_cached(model_map,
+                                                                   gate_expert_offset,
+                                                                   gate_expert_bytes);
+        const char *up_w = cuda_model_range_lookup_device_cached(model_map,
+                                                                 up_expert_offset,
+                                                                 gate_expert_bytes);
+        const char *down_w = cuda_model_range_lookup_device_cached(model_map,
+                                                                   down_expert_offset,
+                                                                   down_expert_bytes);
+        if (gate_w && up_w && down_w) {
+            host_mask[expert] = 1u;
+            host_ptrs[expert] = gate_w;
+            host_ptrs[256u + expert] = up_w;
+            host_ptrs[512u + expert] = down_w;
+        }
+    }
+
+    const uint64_t mask_bytes = 256u * sizeof(host_mask[0]);
+    const uint64_t ptr_bytes = (uint64_t)3u * 256u * sizeof(host_ptrs[0]);
+    return cuda_ok(cudaMemcpy(hot_mask->ptr, host_mask, (size_t)mask_bytes, cudaMemcpyHostToDevice),
+                   "decode route hot mask upload") &&
+           cuda_ok(cudaMemcpy(expert_ptr_table->ptr, host_ptrs, (size_t)ptr_bytes, cudaMemcpyHostToDevice),
+                   "decode route pointer table upload");
+}
+
+extern "C" int ds4_gpu_decode_route_split_tensor(
+        ds4_gpu_tensor *hot_selected,
+        ds4_gpu_tensor *hot_weights,
+        ds4_gpu_tensor *cold_selected,
+        ds4_gpu_tensor *cold_weights,
+        ds4_gpu_tensor *counts,
+        const ds4_gpu_tensor *router_selected,
+        const ds4_gpu_tensor *router_weights,
+        const ds4_gpu_tensor *hot_mask,
+        uint32_t n_selected) {
+    if (!hot_selected || !hot_weights || !cold_selected || !cold_weights ||
+        !counts || !router_selected || !router_weights || !hot_mask ||
+        n_selected == 0 || n_selected > 6u ||
+        hot_selected->bytes < (uint64_t)n_selected * sizeof(int32_t) ||
+        hot_weights->bytes < (uint64_t)n_selected * sizeof(float) ||
+        cold_selected->bytes < (uint64_t)n_selected * sizeof(int32_t) ||
+        cold_weights->bytes < (uint64_t)n_selected * sizeof(float) ||
+        counts->bytes < 2u * sizeof(uint32_t) ||
+        router_selected->bytes < (uint64_t)n_selected * sizeof(int32_t) ||
+        router_weights->bytes < (uint64_t)n_selected * sizeof(float) ||
+        hot_mask->bytes < 256u * sizeof(uint8_t)) {
+        return 0;
+    }
+    decode_route_split_kernel<<<1, 1>>>((int32_t *)hot_selected->ptr,
+                                        (float *)hot_weights->ptr,
+                                        (int32_t *)cold_selected->ptr,
+                                        (float *)cold_weights->ptr,
+                                        (uint32_t *)counts->ptr,
+                                        (const int32_t *)router_selected->ptr,
+                                        (const float *)router_weights->ptr,
+                                        (const uint8_t *)hot_mask->ptr,
+                                        n_selected);
+    return cuda_ok(cudaGetLastError(), "decode route split launch");
+}
+
 __device__ static float dev_f16_to_f32(uint16_t v) {
     return __half2float(*reinterpret_cast<const __half *>(&v));
 }
@@ -11458,6 +11633,107 @@ extern "C" int ds4_gpu_routed_moe_one_cached_experts_tensor(
         moe_sum_kernel<<<(out_dim + 255u) / 256u, 256>>>(
             (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, 1);
         ok = cuda_ok(cudaGetLastError(), "cached routed_moe sum launch");
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_routed_moe_one_cached_experts_table_tensor(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        uint32_t gate_type,
+        uint32_t down_type,
+        uint64_t gate_row_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *expert_ptr_table,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x) {
+    if (!out || !gate || !up || !mid || !down || !selected || !weights ||
+        !expert_ptr_table || !x ||
+        n_expert == 0 || n_expert > 6u ||
+        gate_type != 16u || down_type != 10u ||
+        expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
+        x->bytes < (uint64_t)expert_in_dim * sizeof(float) ||
+        selected->bytes < (uint64_t)n_expert * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_expert * sizeof(float) ||
+        expert_ptr_table->bytes < (uint64_t)3u * 256u * sizeof(const char *) ||
+        gate->bytes < (uint64_t)n_expert * expert_mid_dim * sizeof(float) ||
+        up->bytes < (uint64_t)n_expert * expert_mid_dim * sizeof(float) ||
+        mid->bytes < (uint64_t)n_expert * expert_mid_dim * sizeof(float) ||
+        down->bytes < (uint64_t)n_expert * out_dim * sizeof(float) ||
+        out->bytes < (uint64_t)out_dim * sizeof(float)) {
+        return 0;
+    }
+
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    const uint64_t xq_bytes = (uint64_t)xq_blocks * sizeof(cuda_block_q8_K);
+    const uint64_t midq_bytes = (uint64_t)n_expert * midq_blocks * sizeof(cuda_block_q8_K);
+    if (down->bytes < xq_bytes || gate->bytes < midq_bytes) return 0;
+
+    const uint64_t ptr_bytes = 18ull * sizeof(const char *);
+    const char **dev_ptrs = (const char **)cuda_tmp_alloc(ptr_bytes, "decode route cached expert ptrs");
+    if (!dev_ptrs) return 0;
+
+    gather_cached_expert_ptrs_kernel<<<1, 32>>>(
+        dev_ptrs,
+        (const int32_t *)selected->ptr,
+        (const char *const *)expert_ptr_table->ptr,
+        n_expert);
+    int ok = cuda_ok(cudaGetLastError(), "decode route expert pointer gather launch");
+
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
+    cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
+    if (ok) {
+        q8_K_quantize_kernel<<<xq_blocks, 256>>>(xq, (const float *)x->ptr, expert_in_dim, 1);
+        ok = cuda_ok(cudaGetLastError(), "decode route cached routed_moe x quantize launch");
+    }
+    if (ok) {
+        dim3 qgrid((expert_mid_dim + 127u) / 128u, n_expert, 1);
+        moe_gate_up_mid_decode_ptrs_qwarp32_kernel<<<qgrid, 256>>>(
+            (float *)gate->ptr,
+            (float *)up->ptr,
+            (float *)mid->ptr,
+            dev_ptrs,
+            dev_ptrs + 6u,
+            xq,
+            (const float *)weights->ptr,
+            gate_row_bytes,
+            xq_blocks,
+            expert_mid_dim,
+            n_expert,
+            clamp);
+        ok = cuda_ok(cudaGetLastError(), "decode route cached routed_moe gate/up launch");
+    }
+    if (ok) {
+        dim3 midq_grid(midq_blocks, n_expert, 1);
+        q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_expert);
+        ok = cuda_ok(cudaGetLastError(), "decode route cached routed_moe mid quantize launch");
+    }
+    if (ok) {
+        dim3 dgrid((out_dim + 127u) / 128u, n_expert, 1);
+        moe_down_ptrs_qwarp32_kernel<<<dgrid, 256>>>(
+            (float *)down->ptr,
+            dev_ptrs + 12u,
+            midq,
+            down_row_bytes,
+            midq_blocks,
+            out_dim,
+            n_expert);
+        ok = cuda_ok(cudaGetLastError(), "decode route cached routed_moe down launch");
+    }
+    if (ok) {
+        moe_sum_kernel<<<(out_dim + 255u) / 256u, 256>>>(
+            (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, 1);
+        ok = cuda_ok(cudaGetLastError(), "decode route cached routed_moe sum launch");
     }
     return ok;
 }
