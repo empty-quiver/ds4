@@ -22794,6 +22794,18 @@ struct ds4_engine {
     bool cpu_moe_layer[DS4_N_LAYER];
     bool hot_experts_enabled;
     bool hot_expert[DS4_N_LAYER][DS4_N_EXPERT];
+#ifndef DS4_NO_GPU
+    bool warm_metal_ready;
+    uint32_t warm_metal_cap_tokens;
+    ds4_gpu_tensor *warm_metal_x;
+    ds4_gpu_tensor *warm_metal_selected;
+    ds4_gpu_tensor *warm_metal_weights;
+    ds4_gpu_tensor *warm_metal_out;
+    ds4_gpu_tensor *warm_metal_gate;
+    ds4_gpu_tensor *warm_metal_up;
+    ds4_gpu_tensor *warm_metal_mid;
+    ds4_gpu_tensor *warm_metal_experts;
+#endif
 };
 
 static uint64_t ds4_warm_tensor_expert_bytes(const ds4_tensor *t) {
@@ -22896,6 +22908,186 @@ int ds4_engine_warm_run_layer_f32(
     free(mid);
     return 0;
 }
+
+#ifndef DS4_NO_GPU
+static void ds4_engine_warm_metal_free(ds4_engine *e) {
+    if (!e) return;
+    ds4_gpu_tensor_free(e->warm_metal_x);
+    ds4_gpu_tensor_free(e->warm_metal_selected);
+    ds4_gpu_tensor_free(e->warm_metal_weights);
+    ds4_gpu_tensor_free(e->warm_metal_out);
+    ds4_gpu_tensor_free(e->warm_metal_gate);
+    ds4_gpu_tensor_free(e->warm_metal_up);
+    ds4_gpu_tensor_free(e->warm_metal_mid);
+    ds4_gpu_tensor_free(e->warm_metal_experts);
+    e->warm_metal_x = NULL;
+    e->warm_metal_selected = NULL;
+    e->warm_metal_weights = NULL;
+    e->warm_metal_out = NULL;
+    e->warm_metal_gate = NULL;
+    e->warm_metal_up = NULL;
+    e->warm_metal_mid = NULL;
+    e->warm_metal_experts = NULL;
+    e->warm_metal_cap_tokens = 0;
+}
+
+static int ds4_engine_warm_metal_ensure(ds4_engine *e, uint32_t n_tok) {
+    if (!e || n_tok == 0) return -1;
+
+    if (!e->warm_metal_ready) {
+        /* The warm worker wraps an 80+ GiB GGUF mapping but touches only routed
+         * expert pages requested by RUN_LAYER. Avoid full-model residency hints
+         * on small unified-memory Macs. */
+        setenv("DS4_METAL_NO_RESIDENCY", "1", 0);
+        ds4_gpu_set_quality(e->quality);
+        if (!ds4_gpu_set_model_map_range(e->model.map,
+                                          e->model.size,
+                                          e->model.tensor_data_pos,
+                                          e->model.size - e->model.tensor_data_pos)) {
+            return -1;
+        }
+        e->warm_metal_ready = true;
+    }
+
+    if (e->warm_metal_cap_tokens >= n_tok) return 0;
+
+    ds4_engine_warm_metal_free(e);
+
+    const uint64_t slots = (uint64_t)n_tok * DS4_N_EXPERT_USED;
+    const uint64_t x_bytes = (uint64_t)n_tok * DS4_N_EMBD * sizeof(float);
+    const uint64_t selected_bytes = slots * sizeof(int32_t);
+    const uint64_t weight_bytes = slots * sizeof(float);
+    const uint64_t mid_bytes = slots * DS4_N_FF_EXP * sizeof(float);
+    const uint64_t experts_bytes = slots * DS4_N_EMBD * sizeof(float);
+
+    e->warm_metal_x = ds4_gpu_tensor_alloc(x_bytes);
+    e->warm_metal_selected = ds4_gpu_tensor_alloc(selected_bytes);
+    e->warm_metal_weights = ds4_gpu_tensor_alloc(weight_bytes);
+    e->warm_metal_out = ds4_gpu_tensor_alloc(x_bytes);
+    e->warm_metal_gate = ds4_gpu_tensor_alloc(mid_bytes);
+    e->warm_metal_up = ds4_gpu_tensor_alloc(mid_bytes);
+    e->warm_metal_mid = ds4_gpu_tensor_alloc(mid_bytes);
+    e->warm_metal_experts = ds4_gpu_tensor_alloc(experts_bytes);
+
+    if (!e->warm_metal_x ||
+        !e->warm_metal_selected ||
+        !e->warm_metal_weights ||
+        !e->warm_metal_out ||
+        !e->warm_metal_gate ||
+        !e->warm_metal_up ||
+        !e->warm_metal_mid ||
+        !e->warm_metal_experts) {
+        ds4_engine_warm_metal_free(e);
+        return -1;
+    }
+
+    e->warm_metal_cap_tokens = n_tok;
+    return 0;
+}
+
+int ds4_engine_warm_run_layer_metal_f32(
+        ds4_engine    *e,
+        uint32_t       layer,
+        const float   *x,
+        uint32_t       n_tok,
+        const int32_t *selected,
+        const float   *weights,
+        uint32_t       n_selected,
+        float         *out) {
+    if (!e || !x || !selected || !weights || !out) return -1;
+    if (layer >= DS4_N_LAYER || n_selected == 0 || n_selected > DS4_N_EXPERT_USED) return -1;
+    if (n_tok == 0) return 0;
+
+    const ds4_layer_weights *l = &e->weights.layer[layer];
+    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return -1;
+    if (l->ffn_gate_exps->type != l->ffn_up_exps->type) return -1;
+
+    const uint64_t expert_in = l->ffn_gate_exps->dim[0];
+    const uint64_t expert_mid = l->ffn_gate_exps->dim[1];
+    const uint64_t down_in = l->ffn_down_exps->dim[0];
+    const uint64_t out_dim = l->ffn_down_exps->dim[1];
+    if (expert_in != DS4_N_EMBD || expert_mid != DS4_N_FF_EXP ||
+        down_in != DS4_N_FF_EXP || out_dim != DS4_N_EMBD) {
+        return -1;
+    }
+    if (expert_in > UINT32_MAX || expert_mid > UINT32_MAX || out_dim > UINT32_MAX) return -1;
+
+    const uint64_t gate_expert_bytes = ds4_warm_tensor_expert_bytes(l->ffn_gate_exps);
+    const uint64_t up_expert_bytes = ds4_warm_tensor_expert_bytes(l->ffn_up_exps);
+    const uint64_t down_expert_bytes = ds4_warm_tensor_expert_bytes(l->ffn_down_exps);
+    if (gate_expert_bytes == 0 || up_expert_bytes == 0 || down_expert_bytes == 0) return -1;
+    if (gate_expert_bytes != up_expert_bytes) return -1;
+
+    if (ds4_engine_warm_metal_ensure(e, n_tok) != 0) return -1;
+
+    const uint64_t slots = (uint64_t)n_tok * n_selected;
+    const uint64_t x_bytes = (uint64_t)n_tok * DS4_N_EMBD * sizeof(float);
+    const uint64_t selected_bytes = slots * sizeof(int32_t);
+    const uint64_t weight_bytes = slots * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)n_tok * DS4_N_EMBD * sizeof(float);
+
+    if (ds4_gpu_tensor_write(e->warm_metal_x, 0, x, x_bytes) == 0 ||
+        ds4_gpu_tensor_write(e->warm_metal_selected, 0, selected, selected_bytes) == 0 ||
+        ds4_gpu_tensor_write(e->warm_metal_weights, 0, weights, weight_bytes) == 0) {
+        return -1;
+    }
+
+    bool mid_is_f16 = false;
+    if (!ds4_gpu_routed_moe_batch_tensor(
+            e->warm_metal_out,
+            e->warm_metal_gate,
+            e->warm_metal_up,
+            e->warm_metal_mid,
+            e->warm_metal_experts,
+            e->model.map,
+            e->model.size,
+            l->ffn_gate_exps->abs_offset,
+            l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset,
+            l->ffn_gate_exps->type,
+            l->ffn_down_exps->type,
+            gate_expert_bytes,
+            routed_expert_row_bytes(l->ffn_gate_exps),
+            down_expert_bytes,
+            routed_expert_row_bytes(l->ffn_down_exps),
+            (uint32_t)expert_in,
+            (uint32_t)expert_mid,
+            (uint32_t)out_dim,
+            e->warm_metal_selected,
+            e->warm_metal_weights,
+            n_selected,
+            DS4_SWIGLU_CLAMP_EXP,
+            e->warm_metal_x,
+            n_tok,
+            &mid_is_f16)) {
+        return -1;
+    }
+    (void)mid_is_f16;
+
+    if (ds4_gpu_tensor_read(e->warm_metal_out, 0, out, out_bytes) == 0) return -1;
+    return 0;
+}
+#else
+int ds4_engine_warm_run_layer_metal_f32(
+        ds4_engine    *e,
+        uint32_t       layer,
+        const float   *x,
+        uint32_t       n_tok,
+        const int32_t *selected,
+        const float   *weights,
+        uint32_t       n_selected,
+        float         *out) {
+    (void)e;
+    (void)layer;
+    (void)x;
+    (void)n_tok;
+    (void)selected;
+    (void)weights;
+    (void)n_selected;
+    (void)out;
+    return -1;
+}
+#endif
 
 #ifndef DS4_NO_GPU
 static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine *e) {
@@ -26628,6 +26820,7 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->cpu_model_ready) model_close(&e->cpu_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
+    ds4_engine_warm_metal_free(e);
     ds4_gpu_cleanup();
 #endif
     ds4_release_instance_lock();

@@ -20,6 +20,7 @@ typedef struct {
     const char *model_path;
     const char *host;
     const char *port;
+    const char *backend;
     int threads;
     bool once;
     bool require_resident;
@@ -31,6 +32,7 @@ typedef struct {
     bool resident[43][256];
     uint32_t resident_count;
     bool require_resident;
+    bool use_metal;
     ds4_warm_stats_response stats;
 } worker_state;
 
@@ -41,6 +43,7 @@ static void usage(FILE *fp) {
             "Options:\n"
             "  --host ADDR              Listen address (default: 0.0.0.0).\n"
             "  --port PORT              Listen port (default: 9044).\n"
+            "  --backend cpu|metal      Expert execution backend (default: cpu).\n"
             "  --threads N              CPU reference backend threads.\n"
             "  --require-resident       Reject RUN_LAYER for experts not loaded first.\n"
             "  --once                   Handle one client, then exit.\n"
@@ -59,6 +62,7 @@ static worker_config parse_args(int argc, char **argv) {
     worker_config c = {
         .host = "0.0.0.0",
         .port = "9044",
+        .backend = "cpu",
         .threads = 0,
     };
 
@@ -70,6 +74,12 @@ static worker_config parse_args(int argc, char **argv) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
             c.port = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--backend")) {
+            c.backend = need_arg(&i, argc, argv, arg);
+            if (strcmp(c.backend, "cpu") && strcmp(c.backend, "metal")) {
+                fprintf(stderr, "--backend must be cpu or metal\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--threads")) {
             c.threads = atoi(need_arg(&i, argc, argv, arg));
             if (c.threads < 0) c.threads = 0;
@@ -269,15 +279,25 @@ static int handle_run_layer(worker_state *st, int fd, const ds4_warm_frame_heade
     memset(resp, 0, sizeof(*resp));
 
     const double t0 = now_sec();
-    const int rc = ds4_engine_warm_run_layer_f32(
-            st->engine,
-            req->layer,
-            x,
-            req->n_tok,
-            selected,
-            weights,
-            req->n_selected,
-            out);
+    const int rc = st->use_metal
+        ? ds4_engine_warm_run_layer_metal_f32(
+                st->engine,
+                req->layer,
+                x,
+                req->n_tok,
+                selected,
+                weights,
+                req->n_selected,
+                out)
+        : ds4_engine_warm_run_layer_f32(
+                st->engine,
+                req->layer,
+                x,
+                req->n_tok,
+                selected,
+                weights,
+                req->n_selected,
+                out);
     st->stats.compute_seconds += now_sec() - t0;
 
     if (rc != 0) {
@@ -386,6 +406,7 @@ int main(int argc, char **argv) {
     worker_state st;
     memset(&st, 0, sizeof(st));
     st.require_resident = cfg.require_resident;
+    st.use_metal = !strcmp(cfg.backend, "metal");
     if (ds4_engine_open(&st.engine, &opt) != 0) return 1;
     if (ds4_engine_warm_model_info(st.engine, &st.model) != 0) {
         fprintf(stderr, "ds4-warm-worker: failed to read warm model info\n");
@@ -395,7 +416,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr,
             "ds4-warm-worker: model loaded layers=%u experts=%u top=%u embd=%u "
-            "gate_type=%u up_type=%u down_type=%u fingerprint=%016" PRIx64 "\n",
+            "gate_type=%u up_type=%u down_type=%u backend=%s fingerprint=%016" PRIx64 "\n",
             st.model.n_layer,
             st.model.n_expert,
             st.model.n_expert_used,
@@ -403,6 +424,7 @@ int main(int argc, char **argv) {
             st.model.gate_type,
             st.model.up_type,
             st.model.down_type,
+            cfg.backend,
             st.model.model_fingerprint);
 
     const int lfd = listen_socket(cfg.host, cfg.port);

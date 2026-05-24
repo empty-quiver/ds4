@@ -109,5 +109,14 @@ int ds4_engine_warm_run_layer_f32(
         const float   *weights,
         uint32_t       n_selected,
         float         *out);
+int ds4_engine_warm_run_layer_metal_f32(
+        ds4_engine    *e,
+        uint32_t       layer,
+        const float   *x,
+        uint32_t       n_tok,
+        const int32_t *selected,
+        const float   *weights,
+        uint32_t       n_selected,
+        float         *out);
 
 #endif

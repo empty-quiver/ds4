@@ -66,8 +66,8 @@ ds4-bench: ds4_bench.o $(CORE_OBJS)
 ds4-eval: ds4_eval.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_eval.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-warm-worker: ds4_warm_worker.o $(CPU_CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_warm_worker.o $(CPU_CORE_OBJS) $(LDLIBS)
+ds4-warm-worker: ds4_warm_worker.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_warm_worker.o $(CORE_OBJS) $(METAL_LDLIBS)
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_warm_worker.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
