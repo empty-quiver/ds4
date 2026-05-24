@@ -22,7 +22,7 @@ METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_metal.o
+CORE_OBJS = ds4.o ds4_metal.o ds4_warm_client.o
 CPU_CORE_OBJS = ds4_cpu.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
@@ -37,7 +37,7 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 ifeq ($(USE_BLIS),1)
 CUDA_LDLIBS += $(BLIS_LDLIBS)
 endif
-CORE_OBJS = ds4.o ds4_cuda.o
+CORE_OBJS = ds4.o ds4_cuda.o ds4_warm_client.o
 CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 endif

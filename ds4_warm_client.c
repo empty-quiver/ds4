@@ -42,6 +42,13 @@ static void *warm_malloc(size_t n) {
     return p;
 }
 
+static float warm_bf16_to_f32(uint16_t v) {
+    uint32_t bits = (uint32_t)v << 16;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
 const char *ds4_warm_client_error(ds4_warm_client *c) {
     if (!c || !c->error[0]) return "";
     return c->error;
@@ -343,10 +350,10 @@ int ds4_warm_client_evict_experts(
     return expert_list(c, DS4_WARM_OP_EVICT_EXPERTS, ids, count, out);
 }
 
-int ds4_warm_client_run_routed_experts_f32(
+int ds4_warm_client_run_routed_experts_q8_bf16(
         ds4_warm_client       *c,
         uint32_t               layer,
-        const float           *x,
+        const void            *xq,
         uint32_t               n_tok,
         const int32_t         *selected,
         const float           *weights,
@@ -354,11 +361,15 @@ int ds4_warm_client_run_routed_experts_f32(
         float                 *out,
         uint32_t               out_dim,
         ds4_warm_client_timing *timing) {
-    if (!c || !x || !selected || !weights || !out || n_tok == 0) return -1;
+    if (!c || !xq || !selected || !weights || !out || n_tok == 0) return -1;
     const uint64_t slots = (uint64_t)n_tok * n_selected;
     const uint64_t selected_bytes = slots * sizeof(int32_t);
     const uint64_t weight_bytes = slots * sizeof(float);
-    const uint64_t x_bytes = (uint64_t)n_tok * out_dim * sizeof(float);
+    uint64_t x_bytes = 0;
+    if (ds4_warm_q8_k_bytes(n_tok, out_dim, &x_bytes) != 0) {
+        warm_set_error(c, "bad Q8_K input shape");
+        return -1;
+    }
     const uint64_t payload_len_u64 = sizeof(ds4_warm_run_routed_experts_header) +
                                      selected_bytes + weight_bytes + x_bytes;
     if (payload_len_u64 > UINT32_MAX) {
@@ -375,14 +386,14 @@ int ds4_warm_client_run_routed_experts_f32(
         .layer = layer,
         .n_tok = n_tok,
         .n_selected = n_selected,
-        .input_format = DS4_WARM_INPUT_F32,
-        .output_format = DS4_WARM_OUTPUT_F32,
+        .input_format = DS4_WARM_INPUT_Q8_K,
+        .output_format = DS4_WARM_OUTPUT_BF16,
     };
     uint8_t *p = payload;
     memcpy(p, &req, sizeof(req)); p += sizeof(req);
     memcpy(p, selected, (size_t)selected_bytes); p += selected_bytes;
     memcpy(p, weights, (size_t)weight_bytes); p += weight_bytes;
-    memcpy(p, x, (size_t)x_bytes);
+    memcpy(p, xq, (size_t)x_bytes);
 
     void *resp_payload = NULL;
     uint32_t resp_len = 0;
@@ -403,14 +414,18 @@ int ds4_warm_client_run_routed_experts_f32(
         snprintf(c->error, sizeof(c->error), "RUN_ROUTED_EXPERTS status=%u", resp.status);
         return -1;
     }
-    const uint64_t out_bytes = (uint64_t)resp.n_tok * resp.output_dim * sizeof(float);
+    const uint64_t out_elems = (uint64_t)resp.n_tok * resp.output_dim;
+    const uint64_t out_bytes = out_elems * sizeof(uint16_t);
     if (resp.n_tok != n_tok || resp.output_dim != out_dim ||
+        out_elems > UINT64_MAX / sizeof(float) ||
         sizeof(resp) + out_bytes != resp_len) {
         free(resp_payload);
         warm_set_error(c, "RUN_ROUTED_EXPERTS response shape mismatch");
         return -1;
     }
-    memcpy(out, (const uint8_t *)resp_payload + sizeof(resp), (size_t)out_bytes);
+    const uint8_t *out_payload = (const uint8_t *)resp_payload + sizeof(resp);
+    const uint16_t *bf16 = (const uint16_t *)out_payload;
+    for (uint64_t i = 0; i < out_elems; i++) out[i] = warm_bf16_to_f32(bf16[i]);
     free(resp_payload);
     if (timing) *timing = local_timing;
     return 0;

@@ -34,6 +34,12 @@ typedef struct {
     bool require_resident;
     bool use_metal;
     ds4_warm_stats_response stats;
+    uint8_t *payload_buf;
+    size_t payload_cap;
+    float *out_f32_buf;
+    size_t out_f32_cap;
+    uint16_t *out_bf16_buf;
+    size_t out_bf16_cap;
 } worker_state;
 
 static void usage(FILE *fp) {
@@ -113,13 +119,39 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
-static void *xmalloc_worker(size_t n) {
-    void *p = malloc(n ? n : 1);
+static void *xrealloc_worker(void *ptr, size_t n) {
+    void *p = realloc(ptr, n ? n : 1);
     if (!p) {
-        fprintf(stderr, "ds4-warm-worker: out of memory allocating %zu bytes\n", n);
+        fprintf(stderr, "ds4-warm-worker: out of memory reallocating %zu bytes\n", n);
         exit(1);
     }
     return p;
+}
+
+static void ensure_worker_bytes(uint8_t **buf, size_t *cap, size_t need) {
+    if (*cap >= need) return;
+    *buf = xrealloc_worker(*buf, need);
+    *cap = need;
+}
+
+static void ensure_worker_f32(float **buf, size_t *cap, size_t elems) {
+    if (*cap >= elems) return;
+    *buf = xrealloc_worker(*buf, elems * sizeof((*buf)[0]));
+    *cap = elems;
+}
+
+static void ensure_worker_bf16(uint16_t **buf, size_t *cap, size_t elems) {
+    if (*cap >= elems) return;
+    *buf = xrealloc_worker(*buf, elems * sizeof((*buf)[0]));
+    *cap = elems;
+}
+
+static uint16_t warm_f32_to_bf16(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    const uint32_t lsb = (bits >> 16) & 1u;
+    const uint32_t rounding_bias = 0x7fffu + lsb;
+    return (uint16_t)((bits + rounding_bias) >> 16);
 }
 
 static int read_exact(int fd, void *buf, size_t n) {
@@ -161,6 +193,28 @@ static int send_frame(int fd, uint16_t opcode, uint32_t sequence, const void *pa
     };
     if (write_exact(fd, &h, sizeof(h)) != 0) return -1;
     if (payload_len != 0 && write_exact(fd, payload, payload_len) != 0) return -1;
+    return 0;
+}
+
+static int send_frame2(
+        int         fd,
+        uint16_t    opcode,
+        uint32_t    sequence,
+        const void *payload0,
+        uint32_t    payload0_len,
+        const void *payload1,
+        uint32_t    payload1_len) {
+    if (payload0_len > UINT32_MAX - payload1_len) return -1;
+    ds4_warm_frame_header h = {
+        .magic = DS4_WARM_MAGIC,
+        .version = DS4_WARM_PROTOCOL_VERSION,
+        .opcode = opcode,
+        .sequence = sequence,
+        .payload_len = payload0_len + payload1_len,
+    };
+    if (write_exact(fd, &h, sizeof(h)) != 0) return -1;
+    if (payload0_len != 0 && write_exact(fd, payload0, payload0_len) != 0) return -1;
+    if (payload1_len != 0 && write_exact(fd, payload1, payload1_len) != 0) return -1;
     return 0;
 }
 
@@ -223,7 +277,23 @@ static int handle_expert_list(worker_state *st, int fd, const ds4_warm_frame_hea
 
     const ds4_warm_expert_id *ids = (const ds4_warm_expert_id *)(payload + sizeof(*req));
     const bool resident = h->opcode == DS4_WARM_OP_LOAD_EXPERTS;
-    const uint32_t accepted = mark_experts(st, ids, req->count, resident);
+    uint32_t accepted = 0;
+    if (st->use_metal) {
+        for (uint32_t i = 0; i < req->count; i++) {
+            uint32_t one_accepted = 0;
+            uint32_t metal_resident = 0;
+            const int rc = resident
+                ? ds4_engine_warm_load_experts_metal(st->engine, &ids[i], 1,
+                                                     &one_accepted, &metal_resident)
+                : ds4_engine_warm_evict_experts_metal(st->engine, &ids[i], 1,
+                                                      &one_accepted, &metal_resident);
+            if (rc == 0 && one_accepted == 1) {
+                accepted += mark_experts(st, &ids[i], 1, resident);
+            }
+        }
+    } else {
+        accepted = mark_experts(st, ids, req->count, resident);
+    }
     ds4_warm_expert_list_response resp = {
         .status = DS4_WARM_STATUS_OK,
         .accepted = accepted,
@@ -245,15 +315,18 @@ static int handle_run_routed_experts(worker_state *st, int fd, const ds4_warm_fr
     if (req->layer >= st->model.n_layer ||
         req->n_tok == 0 ||
         req->n_selected > st->model.n_expert_used ||
-        req->input_format != DS4_WARM_INPUT_F32 ||
-        req->output_format != DS4_WARM_OUTPUT_F32) {
+        req->input_format != DS4_WARM_INPUT_Q8_K ||
+        req->output_format != DS4_WARM_OUTPUT_BF16) {
         return send_status_run_routed_experts(fd, h->sequence, DS4_WARM_STATUS_UNSUPPORTED);
     }
 
     const uint64_t slots = (uint64_t)req->n_tok * req->n_selected;
     const uint64_t selected_bytes = slots * sizeof(int32_t);
     const uint64_t weight_bytes = slots * sizeof(float);
-    const uint64_t x_bytes = (uint64_t)req->n_tok * st->model.n_embd * sizeof(float);
+    uint64_t x_bytes = 0;
+    if (ds4_warm_q8_k_bytes(req->n_tok, st->model.n_embd, &x_bytes) != 0) {
+        return send_status_run_routed_experts(fd, h->sequence, DS4_WARM_STATUS_BAD_REQUEST);
+    }
     const uint64_t need = sizeof(*req) + selected_bytes + weight_bytes + x_bytes;
     if (need != h->payload_len || need > SIZE_MAX) {
         return send_status_run_routed_experts(fd, h->sequence, DS4_WARM_STATUS_BAD_REQUEST);
@@ -261,64 +334,76 @@ static int handle_run_routed_experts(worker_state *st, int fd, const ds4_warm_fr
 
     const int32_t *selected = (const int32_t *)(payload + sizeof(*req));
     const float *weights = (const float *)(payload + sizeof(*req) + selected_bytes);
-    const float *x = (const float *)(payload + sizeof(*req) + selected_bytes + weight_bytes);
+    const void *x_payload = payload + sizeof(*req) + selected_bytes + weight_bytes;
 
-    if (st->require_resident && !all_selected_resident(st, selected, req->n_tok, req->n_selected, req->layer)) {
+    if ((st->require_resident || st->use_metal) &&
+        !all_selected_resident(st, selected, req->n_tok, req->n_selected, req->layer)) {
         st->stats.resident_misses += slots;
         return send_status_run_routed_experts(fd, h->sequence, DS4_WARM_STATUS_NOT_RESIDENT);
     }
 
-    const uint64_t out_bytes_u64 = (uint64_t)req->n_tok * st->model.n_embd * sizeof(float);
-    if (out_bytes_u64 > UINT32_MAX || out_bytes_u64 > SIZE_MAX - sizeof(ds4_warm_run_routed_experts_response)) {
+    const uint64_t out_elems = (uint64_t)req->n_tok * st->model.n_embd;
+    const uint64_t out_f32_bytes_u64 = out_elems * sizeof(float);
+    const uint64_t out_wire_bytes_u64 = out_elems * sizeof(uint16_t);
+    if (out_elems > UINT64_MAX / sizeof(float) ||
+        out_wire_bytes_u64 > UINT32_MAX ||
+        out_wire_bytes_u64 > SIZE_MAX - sizeof(ds4_warm_run_routed_experts_response) ||
+        out_f32_bytes_u64 > SIZE_MAX) {
         return send_status_run_routed_experts(fd, h->sequence, DS4_WARM_STATUS_BAD_REQUEST);
     }
 
-    const size_t out_bytes = (size_t)out_bytes_u64;
-    const size_t resp_payload_len = sizeof(ds4_warm_run_routed_experts_response) + out_bytes;
-    uint8_t *resp_payload = xmalloc_worker(resp_payload_len);
-    ds4_warm_run_routed_experts_response *resp = (ds4_warm_run_routed_experts_response *)resp_payload;
-    float *out = (float *)(resp_payload + sizeof(*resp));
-    memset(resp, 0, sizeof(*resp));
+    const size_t out_wire_bytes = (size_t)out_wire_bytes_u64;
+    ensure_worker_bf16(&st->out_bf16_buf, &st->out_bf16_cap, (size_t)out_elems);
+    if (!st->use_metal) {
+        ensure_worker_f32(&st->out_f32_buf, &st->out_f32_cap, (size_t)out_elems);
+    }
+    ds4_warm_run_routed_experts_response resp;
+    memset(&resp, 0, sizeof(resp));
 
     const double t0 = now_sec();
-    const int rc = st->use_metal
-        ? ds4_engine_warm_run_routed_experts_metal_f32(
+    int rc = -1;
+    if (st->use_metal) {
+        rc = ds4_engine_warm_run_routed_experts_metal_q8_bf16(
                 st->engine,
                 req->layer,
-                x,
+                x_payload,
                 req->n_tok,
                 selected,
                 weights,
                 req->n_selected,
-                out)
-        : ds4_engine_warm_run_routed_experts_f32(
+                st->out_bf16_buf);
+    } else {
+        rc = ds4_engine_warm_run_routed_experts_q8_f32(
                 st->engine,
                 req->layer,
-                x,
+                x_payload,
                 req->n_tok,
                 selected,
                 weights,
                 req->n_selected,
-                out);
+                st->out_f32_buf);
+    }
     st->stats.compute_seconds += now_sec() - t0;
 
     if (rc != 0) {
-        free(resp_payload);
         return send_status_run_routed_experts(fd, h->sequence, DS4_WARM_STATUS_RUNTIME_ERROR);
     }
 
-    resp->status = DS4_WARM_STATUS_OK;
-    resp->n_tok = req->n_tok;
-    resp->output_dim = st->model.n_embd;
+    resp.status = DS4_WARM_STATUS_OK;
+    resp.n_tok = req->n_tok;
+    resp.output_dim = st->model.n_embd;
+    if (!st->use_metal) {
+        for (uint64_t i = 0; i < out_elems; i++) st->out_bf16_buf[i] = warm_f32_to_bf16(st->out_f32_buf[i]);
+    }
 
     st->stats.run_routed_expert_requests++;
     st->stats.tokens += req->n_tok;
     st->stats.selected_slots += slots;
     st->stats.resident_hits += slots;
 
-    const int wr = send_frame(fd, h->opcode, h->sequence, resp_payload, (uint32_t)resp_payload_len);
-    free(resp_payload);
-    return wr;
+    return send_frame2(fd, h->opcode, h->sequence,
+                       &resp, (uint32_t)sizeof(resp),
+                       st->out_bf16_buf, (uint32_t)out_wire_bytes);
 }
 
 static int handle_frame(worker_state *st, int fd, const ds4_warm_frame_header *h, const uint8_t *payload) {
@@ -353,15 +438,14 @@ static void serve_client(worker_state *st, int fd) {
 
         uint8_t *payload = NULL;
         if (h.payload_len != 0) {
-            payload = xmalloc_worker(h.payload_len);
+            ensure_worker_bytes(&st->payload_buf, &st->payload_cap, h.payload_len);
+            payload = st->payload_buf;
             if (read_exact(fd, payload, h.payload_len) != 1) {
-                free(payload);
                 break;
             }
         }
 
         const int rc = handle_frame(st, fd, &h, payload);
-        free(payload);
         if (rc != 0) break;
     }
 }
@@ -453,5 +537,8 @@ int main(int argc, char **argv) {
 
     close(lfd);
     ds4_engine_close(st.engine);
+    free(st.payload_buf);
+    free(st.out_f32_buf);
+    free(st.out_bf16_buf);
     return 0;
 }

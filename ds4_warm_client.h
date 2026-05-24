@@ -37,10 +37,10 @@ int ds4_warm_client_evict_experts(
         uint32_t                  count,
         ds4_warm_expert_list_response *out);
 
-int ds4_warm_client_run_routed_experts_f32(
+int ds4_warm_client_run_routed_experts_q8_bf16(
         ds4_warm_client       *c,
         uint32_t               layer,
-        const float           *x,
+        const void            *xq,
         uint32_t               n_tok,
         const int32_t         *selected,
         const float           *weights,

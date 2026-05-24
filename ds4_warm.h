@@ -6,10 +6,13 @@
 #include "ds4.h"
 
 #define DS4_WARM_MAGIC 0x57345344u /* DS4W, little-endian on the wire. */
-#define DS4_WARM_PROTOCOL_VERSION 1u
+#define DS4_WARM_PROTOCOL_VERSION 2u
 
-#define DS4_WARM_INPUT_F32 1u
-#define DS4_WARM_OUTPUT_F32 1u
+#define DS4_WARM_INPUT_Q8_K 1u
+#define DS4_WARM_OUTPUT_BF16 1u
+
+#define DS4_WARM_Q8_K_BLOCK_ELEMS 256u
+#define DS4_WARM_Q8_K_BLOCK_BYTES 292u
 
 typedef enum {
     DS4_WARM_OP_HELLO = 1,
@@ -79,7 +82,7 @@ typedef struct {
  * router computation, shared experts, residuals, KV/cache work, and logits
  * remain owned by the Vector runtime. The worker receives activations plus
  * selected expert IDs/route weights, computes the routed expert contribution,
- * and returns an n_tok x n_embd F32 tensor to be summed by the caller.
+ * and returns an n_tok x n_embd BF16 tensor to be summed by the caller.
  */
 typedef struct {
     uint32_t layer;
@@ -108,23 +111,38 @@ typedef struct {
 } ds4_warm_stats_response;
 
 int ds4_engine_warm_model_info(ds4_engine *e, ds4_warm_model_info *out);
-int ds4_engine_warm_run_routed_experts_f32(
+int ds4_engine_warm_run_routed_experts_q8_f32(
         ds4_engine    *e,
         uint32_t       layer,
-        const float   *x,
+        const void    *xq,
         uint32_t       n_tok,
         const int32_t *selected,
         const float   *weights,
         uint32_t       n_selected,
         float         *out);
-int ds4_engine_warm_run_routed_experts_metal_f32(
+int ds4_engine_warm_run_routed_experts_metal_q8_bf16(
         ds4_engine    *e,
         uint32_t       layer,
-        const float   *x,
+        const void    *xq,
         uint32_t       n_tok,
         const int32_t *selected,
         const float   *weights,
         uint32_t       n_selected,
-        float         *out);
+        uint16_t      *out_bf16);
+int ds4_engine_warm_load_experts_metal(
+        ds4_engine                *e,
+        const ds4_warm_expert_id  *ids,
+        uint32_t                   count,
+        uint32_t                  *accepted,
+        uint32_t                  *resident);
+int ds4_engine_warm_evict_experts_metal(
+        ds4_engine                *e,
+        const ds4_warm_expert_id  *ids,
+        uint32_t                   count,
+        uint32_t                  *accepted,
+        uint32_t                  *resident);
+
+int ds4_warm_q8_k_bytes(uint32_t n_rows, uint32_t row_dim, uint64_t *out_bytes);
+int ds4_warm_quantize_f32_to_q8_k(const float *x, void *out_q8, uint32_t n_rows, uint32_t row_dim);
 
 #endif

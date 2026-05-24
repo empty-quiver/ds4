@@ -342,7 +342,13 @@ int main(int argc, char **argv) {
         const uint32_t n_tok = cfg.tok_counts[ti];
         const uint64_t slots = (uint64_t)n_tok * cfg.n_selected;
         const uint64_t out_elems = (uint64_t)n_tok * local_info.n_embd;
+        uint64_t xq_bytes = 0;
+        if (ds4_warm_q8_k_bytes(n_tok, local_info.n_embd, &xq_bytes) != 0) {
+            fprintf(stderr, "bad Q8_K benchmark shape\n");
+            return 2;
+        }
         float *x = xmalloc_bench(out_elems * sizeof(x[0]));
+        void *xq = xmalloc_bench((size_t)xq_bytes);
         int32_t *selected = xmalloc_bench(slots * sizeof(selected[0]));
         float *weights = xmalloc_bench(slots * sizeof(weights[0]));
         float *local_out = xmalloc_bench(out_elems * sizeof(local_out[0]));
@@ -351,6 +357,10 @@ int main(int argc, char **argv) {
         double *remote_times = xmalloc_bench((size_t)cfg.iters * sizeof(remote_times[0]));
 
         fill_inputs(x, n_tok, local_info.n_embd, 1234u + n_tok);
+        if (ds4_warm_quantize_f32_to_q8_k(x, xq, n_tok, local_info.n_embd) != 0) {
+            fprintf(stderr, "failed to quantize Q8_K benchmark input\n");
+            return 1;
+        }
         fill_routes(selected, weights, n_tok, cfg.n_selected, local_info.n_expert, cfg.layer);
 
         ds4_warm_expert_id ids[256];
@@ -366,7 +376,7 @@ int main(int argc, char **argv) {
 
         if (!cfg.remote_only) {
             for (int i = 0; i < cfg.warmup; i++) {
-                if (ds4_engine_warm_run_routed_experts_f32(engine, cfg.layer, x, n_tok, selected,
+                if (ds4_engine_warm_run_routed_experts_q8_f32(engine, cfg.layer, xq, n_tok, selected,
                                                   weights, cfg.n_selected, local_out) != 0) {
                     fprintf(stderr, "local routed expert helper failed\n");
                     return 1;
@@ -374,7 +384,7 @@ int main(int argc, char **argv) {
             }
             for (int i = 0; i < cfg.iters; i++) {
                 const double t0 = now_sec();
-                if (ds4_engine_warm_run_routed_experts_f32(engine, cfg.layer, x, n_tok, selected,
+                if (ds4_engine_warm_run_routed_experts_q8_f32(engine, cfg.layer, xq, n_tok, selected,
                                                   weights, cfg.n_selected, local_out) != 0) {
                     fprintf(stderr, "local routed expert helper failed\n");
                     return 1;
@@ -391,7 +401,7 @@ int main(int argc, char **argv) {
         if (client) {
             ds4_warm_client_timing timing;
             for (int i = 0; i < cfg.warmup; i++) {
-                if (ds4_warm_client_run_routed_experts_f32(client, cfg.layer, x, n_tok, selected,
+                if (ds4_warm_client_run_routed_experts_q8_bf16(client, cfg.layer, xq, n_tok, selected,
                                                   weights, cfg.n_selected, remote_out,
                                                   local_info.n_embd, &timing) != 0) {
                     fprintf(stderr, "remote RUN_ROUTED_EXPERTS failed: %s\n", ds4_warm_client_error(client));
@@ -399,7 +409,7 @@ int main(int argc, char **argv) {
                 }
             }
             for (int i = 0; i < cfg.iters; i++) {
-                if (ds4_warm_client_run_routed_experts_f32(client, cfg.layer, x, n_tok, selected,
+                if (ds4_warm_client_run_routed_experts_q8_bf16(client, cfg.layer, xq, n_tok, selected,
                                                   weights, cfg.n_selected, remote_out,
                                                   local_info.n_embd, &timing) != 0) {
                     fprintf(stderr, "remote RUN_ROUTED_EXPERTS failed: %s\n", ds4_warm_client_error(client));
@@ -443,6 +453,7 @@ int main(int argc, char **argv) {
         free(local_out);
         free(weights);
         free(selected);
+        free(xq);
         free(x);
     }
 
