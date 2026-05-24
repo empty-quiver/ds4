@@ -40,12 +40,14 @@ static void usage(FILE *fp) {
     fprintf(fp,
             "usage: ds4-warm-worker --model FILE [options]\n"
             "\n"
+            "Runs selected routed MoE experts for a layer; it does not execute whole transformer layers.\n"
+            "\n"
             "Options:\n"
             "  --host ADDR              Listen address (default: 0.0.0.0).\n"
             "  --port PORT              Listen port (default: 9044).\n"
             "  --backend cpu|metal      Expert execution backend (default: cpu).\n"
             "  --threads N              CPU reference backend threads.\n"
-            "  --require-resident       Reject RUN_LAYER for experts not loaded first.\n"
+            "  --require-resident       Reject RUN_ROUTED_EXPERTS for experts not loaded first.\n"
             "  --once                   Handle one client, then exit.\n"
             "  -h, --help               Show this help.\n");
 }
@@ -162,13 +164,13 @@ static int send_frame(int fd, uint16_t opcode, uint32_t sequence, const void *pa
     return 0;
 }
 
-static int send_status_run(int fd, uint32_t sequence, uint32_t status) {
-    ds4_warm_run_layer_response resp = {
+static int send_status_run_routed_experts(int fd, uint32_t sequence, uint32_t status) {
+    ds4_warm_run_routed_experts_response resp = {
         .status = status,
         .n_tok = 0,
         .output_dim = 0,
     };
-    return send_frame(fd, DS4_WARM_OP_RUN_LAYER, sequence, &resp, sizeof(resp));
+    return send_frame(fd, DS4_WARM_OP_RUN_ROUTED_EXPERTS, sequence, &resp, sizeof(resp));
 }
 
 static uint32_t mark_experts(worker_state *st, const ds4_warm_expert_id *ids, uint32_t count, bool resident) {
@@ -234,18 +236,18 @@ static int handle_stats(worker_state *st, int fd, const ds4_warm_frame_header *h
     return send_frame(fd, h->opcode, h->sequence, &st->stats, sizeof(st->stats));
 }
 
-static int handle_run_layer(worker_state *st, int fd, const ds4_warm_frame_header *h, const uint8_t *payload) {
-    if (h->payload_len < sizeof(ds4_warm_run_layer_header)) {
-        return send_status_run(fd, h->sequence, DS4_WARM_STATUS_BAD_REQUEST);
+static int handle_run_routed_experts(worker_state *st, int fd, const ds4_warm_frame_header *h, const uint8_t *payload) {
+    if (h->payload_len < sizeof(ds4_warm_run_routed_experts_header)) {
+        return send_status_run_routed_experts(fd, h->sequence, DS4_WARM_STATUS_BAD_REQUEST);
     }
 
-    const ds4_warm_run_layer_header *req = (const ds4_warm_run_layer_header *)payload;
+    const ds4_warm_run_routed_experts_header *req = (const ds4_warm_run_routed_experts_header *)payload;
     if (req->layer >= st->model.n_layer ||
         req->n_tok == 0 ||
         req->n_selected > st->model.n_expert_used ||
         req->input_format != DS4_WARM_INPUT_F32 ||
         req->output_format != DS4_WARM_OUTPUT_F32) {
-        return send_status_run(fd, h->sequence, DS4_WARM_STATUS_UNSUPPORTED);
+        return send_status_run_routed_experts(fd, h->sequence, DS4_WARM_STATUS_UNSUPPORTED);
     }
 
     const uint64_t slots = (uint64_t)req->n_tok * req->n_selected;
@@ -254,7 +256,7 @@ static int handle_run_layer(worker_state *st, int fd, const ds4_warm_frame_heade
     const uint64_t x_bytes = (uint64_t)req->n_tok * st->model.n_embd * sizeof(float);
     const uint64_t need = sizeof(*req) + selected_bytes + weight_bytes + x_bytes;
     if (need != h->payload_len || need > SIZE_MAX) {
-        return send_status_run(fd, h->sequence, DS4_WARM_STATUS_BAD_REQUEST);
+        return send_status_run_routed_experts(fd, h->sequence, DS4_WARM_STATUS_BAD_REQUEST);
     }
 
     const int32_t *selected = (const int32_t *)(payload + sizeof(*req));
@@ -263,24 +265,24 @@ static int handle_run_layer(worker_state *st, int fd, const ds4_warm_frame_heade
 
     if (st->require_resident && !all_selected_resident(st, selected, req->n_tok, req->n_selected, req->layer)) {
         st->stats.resident_misses += slots;
-        return send_status_run(fd, h->sequence, DS4_WARM_STATUS_NOT_RESIDENT);
+        return send_status_run_routed_experts(fd, h->sequence, DS4_WARM_STATUS_NOT_RESIDENT);
     }
 
     const uint64_t out_bytes_u64 = (uint64_t)req->n_tok * st->model.n_embd * sizeof(float);
-    if (out_bytes_u64 > UINT32_MAX || out_bytes_u64 > SIZE_MAX - sizeof(ds4_warm_run_layer_response)) {
-        return send_status_run(fd, h->sequence, DS4_WARM_STATUS_BAD_REQUEST);
+    if (out_bytes_u64 > UINT32_MAX || out_bytes_u64 > SIZE_MAX - sizeof(ds4_warm_run_routed_experts_response)) {
+        return send_status_run_routed_experts(fd, h->sequence, DS4_WARM_STATUS_BAD_REQUEST);
     }
 
     const size_t out_bytes = (size_t)out_bytes_u64;
-    const size_t resp_payload_len = sizeof(ds4_warm_run_layer_response) + out_bytes;
+    const size_t resp_payload_len = sizeof(ds4_warm_run_routed_experts_response) + out_bytes;
     uint8_t *resp_payload = xmalloc_worker(resp_payload_len);
-    ds4_warm_run_layer_response *resp = (ds4_warm_run_layer_response *)resp_payload;
+    ds4_warm_run_routed_experts_response *resp = (ds4_warm_run_routed_experts_response *)resp_payload;
     float *out = (float *)(resp_payload + sizeof(*resp));
     memset(resp, 0, sizeof(*resp));
 
     const double t0 = now_sec();
     const int rc = st->use_metal
-        ? ds4_engine_warm_run_layer_metal_f32(
+        ? ds4_engine_warm_run_routed_experts_metal_f32(
                 st->engine,
                 req->layer,
                 x,
@@ -289,7 +291,7 @@ static int handle_run_layer(worker_state *st, int fd, const ds4_warm_frame_heade
                 weights,
                 req->n_selected,
                 out)
-        : ds4_engine_warm_run_layer_f32(
+        : ds4_engine_warm_run_routed_experts_f32(
                 st->engine,
                 req->layer,
                 x,
@@ -302,14 +304,14 @@ static int handle_run_layer(worker_state *st, int fd, const ds4_warm_frame_heade
 
     if (rc != 0) {
         free(resp_payload);
-        return send_status_run(fd, h->sequence, DS4_WARM_STATUS_RUNTIME_ERROR);
+        return send_status_run_routed_experts(fd, h->sequence, DS4_WARM_STATUS_RUNTIME_ERROR);
     }
 
     resp->status = DS4_WARM_STATUS_OK;
     resp->n_tok = req->n_tok;
     resp->output_dim = st->model.n_embd;
 
-    st->stats.run_layer_requests++;
+    st->stats.run_routed_expert_requests++;
     st->stats.tokens += req->n_tok;
     st->stats.selected_slots += slots;
     st->stats.resident_hits += slots;
@@ -327,8 +329,8 @@ static int handle_frame(worker_state *st, int fd, const ds4_warm_frame_header *h
     case DS4_WARM_OP_LOAD_EXPERTS:
     case DS4_WARM_OP_EVICT_EXPERTS:
         return handle_expert_list(st, fd, h, payload);
-    case DS4_WARM_OP_RUN_LAYER:
-        return handle_run_layer(st, fd, h, payload);
+    case DS4_WARM_OP_RUN_ROUTED_EXPERTS:
+        return handle_run_routed_experts(st, fd, h, payload);
     case DS4_WARM_OP_STATS:
         return handle_stats(st, fd, h);
     default: {

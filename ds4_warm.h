@@ -15,7 +15,7 @@ typedef enum {
     DS4_WARM_OP_HELLO = 1,
     DS4_WARM_OP_LOAD_EXPERTS = 2,
     DS4_WARM_OP_EVICT_EXPERTS = 3,
-    DS4_WARM_OP_RUN_LAYER = 4,
+    DS4_WARM_OP_RUN_ROUTED_EXPERTS = 4,
     DS4_WARM_OP_STATS = 5,
 } ds4_warm_opcode;
 
@@ -73,6 +73,14 @@ typedef struct {
     uint32_t reserved;
 } ds4_warm_expert_list_response;
 
+/* Run only the selected routed MoE experts for one transformer layer.
+ *
+ * This request does not execute the whole layer: attention, layer norms,
+ * router computation, shared experts, residuals, KV/cache work, and logits
+ * remain owned by the Vector runtime. The worker receives activations plus
+ * selected expert IDs/route weights, computes the routed expert contribution,
+ * and returns an n_tok x n_embd F32 tensor to be summed by the caller.
+ */
 typedef struct {
     uint32_t layer;
     uint32_t n_tok;
@@ -80,18 +88,18 @@ typedef struct {
     uint32_t input_format;
     uint32_t output_format;
     uint32_t flags;
-} ds4_warm_run_layer_header;
+} ds4_warm_run_routed_experts_header;
 
 typedef struct {
     uint32_t status;
     uint32_t n_tok;
     uint32_t output_dim;
     uint32_t reserved;
-} ds4_warm_run_layer_response;
+} ds4_warm_run_routed_experts_response;
 
 typedef struct {
     uint64_t requests;
-    uint64_t run_layer_requests;
+    uint64_t run_routed_expert_requests;
     uint64_t tokens;
     uint64_t selected_slots;
     uint64_t resident_hits;
@@ -100,7 +108,7 @@ typedef struct {
 } ds4_warm_stats_response;
 
 int ds4_engine_warm_model_info(ds4_engine *e, ds4_warm_model_info *out);
-int ds4_engine_warm_run_layer_f32(
+int ds4_engine_warm_run_routed_experts_f32(
         ds4_engine    *e,
         uint32_t       layer,
         const float   *x,
@@ -109,7 +117,7 @@ int ds4_engine_warm_run_layer_f32(
         const float   *weights,
         uint32_t       n_selected,
         float         *out);
-int ds4_engine_warm_run_layer_metal_f32(
+int ds4_engine_warm_run_routed_experts_metal_f32(
         ds4_engine    *e,
         uint32_t       layer,
         const float   *x,

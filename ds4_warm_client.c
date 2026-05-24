@@ -343,7 +343,7 @@ int ds4_warm_client_evict_experts(
     return expert_list(c, DS4_WARM_OP_EVICT_EXPERTS, ids, count, out);
 }
 
-int ds4_warm_client_run_layer_f32(
+int ds4_warm_client_run_routed_experts_f32(
         ds4_warm_client       *c,
         uint32_t               layer,
         const float           *x,
@@ -359,10 +359,10 @@ int ds4_warm_client_run_layer_f32(
     const uint64_t selected_bytes = slots * sizeof(int32_t);
     const uint64_t weight_bytes = slots * sizeof(float);
     const uint64_t x_bytes = (uint64_t)n_tok * out_dim * sizeof(float);
-    const uint64_t payload_len_u64 = sizeof(ds4_warm_run_layer_header) +
+    const uint64_t payload_len_u64 = sizeof(ds4_warm_run_routed_experts_header) +
                                      selected_bytes + weight_bytes + x_bytes;
     if (payload_len_u64 > UINT32_MAX) {
-        warm_set_error(c, "RUN_LAYER payload too large");
+        warm_set_error(c, "RUN_ROUTED_EXPERTS payload too large");
         return -1;
     }
 
@@ -371,7 +371,7 @@ int ds4_warm_client_run_layer_f32(
         warm_set_error(c, "out of memory");
         return -1;
     }
-    ds4_warm_run_layer_header req = {
+    ds4_warm_run_routed_experts_header req = {
         .layer = layer,
         .n_tok = n_tok,
         .n_selected = n_selected,
@@ -387,27 +387,27 @@ int ds4_warm_client_run_layer_f32(
     void *resp_payload = NULL;
     uint32_t resp_len = 0;
     ds4_warm_client_timing local_timing;
-    const int rc = transact(c, DS4_WARM_OP_RUN_LAYER, payload, (uint32_t)payload_len_u64,
+    const int rc = transact(c, DS4_WARM_OP_RUN_ROUTED_EXPERTS, payload, (uint32_t)payload_len_u64,
                             &resp_payload, &resp_len, &local_timing);
     free(payload);
     if (rc != 0) return -1;
-    if (resp_len < sizeof(ds4_warm_run_layer_response)) {
+    if (resp_len < sizeof(ds4_warm_run_routed_experts_response)) {
         free(resp_payload);
-        warm_set_error(c, "bad RUN_LAYER response length");
+        warm_set_error(c, "bad RUN_ROUTED_EXPERTS response length");
         return -1;
     }
-    ds4_warm_run_layer_response resp;
+    ds4_warm_run_routed_experts_response resp;
     memcpy(&resp, resp_payload, sizeof(resp));
     if (resp.status != DS4_WARM_STATUS_OK) {
         free(resp_payload);
-        snprintf(c->error, sizeof(c->error), "RUN_LAYER status=%u", resp.status);
+        snprintf(c->error, sizeof(c->error), "RUN_ROUTED_EXPERTS status=%u", resp.status);
         return -1;
     }
     const uint64_t out_bytes = (uint64_t)resp.n_tok * resp.output_dim * sizeof(float);
     if (resp.n_tok != n_tok || resp.output_dim != out_dim ||
         sizeof(resp) + out_bytes != resp_len) {
         free(resp_payload);
-        warm_set_error(c, "RUN_LAYER response shape mismatch");
+        warm_set_error(c, "RUN_ROUTED_EXPERTS response shape mismatch");
         return -1;
     }
     memcpy(out, (const uint8_t *)resp_payload + sizeof(resp), (size_t)out_bytes);

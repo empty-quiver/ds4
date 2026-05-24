@@ -37,6 +37,9 @@ static void usage(FILE *fp) {
     fprintf(fp,
             "usage: tests/warm_worker_microbench --model FILE [options]\n"
             "\n"
+            "Benchmarks one routed-expert request for a single layer; n_tok is the\n"
+            "number of token activations in that expert request, not a layer count.\n"
+            "\n"
             "Options:\n"
             "  --host HOST          Warm worker host (default: 127.0.0.1).\n"
             "  --port PORT          Warm worker port (default: 9044).\n"
@@ -363,17 +366,17 @@ int main(int argc, char **argv) {
 
         if (!cfg.remote_only) {
             for (int i = 0; i < cfg.warmup; i++) {
-                if (ds4_engine_warm_run_layer_f32(engine, cfg.layer, x, n_tok, selected,
+                if (ds4_engine_warm_run_routed_experts_f32(engine, cfg.layer, x, n_tok, selected,
                                                   weights, cfg.n_selected, local_out) != 0) {
-                    fprintf(stderr, "local warm helper failed\n");
+                    fprintf(stderr, "local routed expert helper failed\n");
                     return 1;
                 }
             }
             for (int i = 0; i < cfg.iters; i++) {
                 const double t0 = now_sec();
-                if (ds4_engine_warm_run_layer_f32(engine, cfg.layer, x, n_tok, selected,
+                if (ds4_engine_warm_run_routed_experts_f32(engine, cfg.layer, x, n_tok, selected,
                                                   weights, cfg.n_selected, local_out) != 0) {
-                    fprintf(stderr, "local warm helper failed\n");
+                    fprintf(stderr, "local routed expert helper failed\n");
                     return 1;
                 }
                 local_times[i] = now_sec() - t0;
@@ -388,18 +391,18 @@ int main(int argc, char **argv) {
         if (client) {
             ds4_warm_client_timing timing;
             for (int i = 0; i < cfg.warmup; i++) {
-                if (ds4_warm_client_run_layer_f32(client, cfg.layer, x, n_tok, selected,
+                if (ds4_warm_client_run_routed_experts_f32(client, cfg.layer, x, n_tok, selected,
                                                   weights, cfg.n_selected, remote_out,
                                                   local_info.n_embd, &timing) != 0) {
-                    fprintf(stderr, "remote RUN_LAYER failed: %s\n", ds4_warm_client_error(client));
+                    fprintf(stderr, "remote RUN_ROUTED_EXPERTS failed: %s\n", ds4_warm_client_error(client));
                     return 1;
                 }
             }
             for (int i = 0; i < cfg.iters; i++) {
-                if (ds4_warm_client_run_layer_f32(client, cfg.layer, x, n_tok, selected,
+                if (ds4_warm_client_run_routed_experts_f32(client, cfg.layer, x, n_tok, selected,
                                                   weights, cfg.n_selected, remote_out,
                                                   local_info.n_embd, &timing) != 0) {
-                    fprintf(stderr, "remote RUN_LAYER failed: %s\n", ds4_warm_client_error(client));
+                    fprintf(stderr, "remote RUN_ROUTED_EXPERTS failed: %s\n", ds4_warm_client_error(client));
                     return 1;
                 }
                 remote_times[i] = timing.elapsed_seconds;
@@ -448,12 +451,12 @@ int main(int argc, char **argv) {
         if (ds4_warm_client_stats(client, &stats) == 0) {
             fprintf(stderr,
                     "warm_worker_stats requests=%" PRIu64
-                    " run_layer=%" PRIu64
+                    " run_routed_experts=%" PRIu64
                     " tokens=%" PRIu64
                     " selected_slots=%" PRIu64
                     " compute_s=%.6f\n",
                     stats.requests,
-                    stats.run_layer_requests,
+                    stats.run_routed_expert_requests,
                     stats.tokens,
                     stats.selected_slots,
                     stats.compute_seconds);

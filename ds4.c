@@ -22863,7 +22863,7 @@ int ds4_engine_warm_model_info(ds4_engine *e, ds4_warm_model_info *out) {
     return 0;
 }
 
-int ds4_engine_warm_run_layer_f32(
+int ds4_engine_warm_run_routed_experts_f32(
         ds4_engine    *e,
         uint32_t       layer,
         const float   *x,
@@ -22936,8 +22936,8 @@ static int ds4_engine_warm_metal_ensure(ds4_engine *e, uint32_t n_tok) {
 
     if (!e->warm_metal_ready) {
         /* The warm worker wraps an 80+ GiB GGUF mapping but touches only routed
-         * expert pages requested by RUN_LAYER. Avoid full-model residency hints
-         * on small unified-memory Macs. */
+         * expert pages requested by RUN_ROUTED_EXPERTS. Avoid full-model
+         * residency hints on small unified-memory Macs. */
         setenv("DS4_METAL_NO_RESIDENCY", "1", 0);
         ds4_gpu_set_quality(e->quality);
         if (!ds4_gpu_set_model_map_range(e->model.map,
@@ -22985,7 +22985,7 @@ static int ds4_engine_warm_metal_ensure(ds4_engine *e, uint32_t n_tok) {
     return 0;
 }
 
-int ds4_engine_warm_run_layer_metal_f32(
+int ds4_engine_warm_run_routed_experts_metal_f32(
         ds4_engine    *e,
         uint32_t       layer,
         const float   *x,
@@ -23068,7 +23068,7 @@ int ds4_engine_warm_run_layer_metal_f32(
     return 0;
 }
 #else
-int ds4_engine_warm_run_layer_metal_f32(
+int ds4_engine_warm_run_routed_experts_metal_f32(
         ds4_engine    *e,
         uint32_t       layer,
         const float   *x,

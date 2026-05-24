@@ -37,7 +37,7 @@ int ds4_warm_client_evict_experts(
         uint32_t                  count,
         ds4_warm_expert_list_response *out);
 
-int ds4_warm_client_run_layer_f32(
+int ds4_warm_client_run_routed_experts_f32(
         ds4_warm_client       *c,
         uint32_t               layer,
         const float           *x,
