@@ -24180,6 +24180,8 @@ struct ds4_engine {
     uint32_t warm_metal_slab_cap;
     uint32_t warm_metal_slab_count;
     uint32_t warm_metal_slab_resident;
+    int32_t warm_metal_slot_for[DS4_N_LAYER][DS4_N_EXPERT];
+    bool warm_metal_slot_map_ready;
     uint64_t warm_metal_gate_expert_bytes;
     uint64_t warm_metal_up_expert_bytes;
     uint64_t warm_metal_down_expert_bytes;
@@ -24345,6 +24347,8 @@ static void ds4_engine_warm_metal_slab_free(ds4_engine *e) {
     e->warm_metal_slab_cap = 0;
     e->warm_metal_slab_count = 0;
     e->warm_metal_slab_resident = 0;
+    memset(e->warm_metal_slot_for, 0xff, sizeof(e->warm_metal_slot_for));
+    e->warm_metal_slot_map_ready = false;
     e->warm_metal_selected_remap_cap = 0;
     e->warm_metal_gate_expert_bytes = 0;
     e->warm_metal_up_expert_bytes = 0;
@@ -24417,6 +24421,17 @@ static uint32_t ds4_warm_metal_default_slab_cap(void) {
 
 static int ds4_engine_warm_metal_find_slot(const ds4_engine *e, uint32_t layer, uint32_t expert) {
     if (!e || !e->warm_metal_slots) return -1;
+    if (layer >= DS4_N_LAYER || expert >= DS4_N_EXPERT) return -1;
+    if (e->warm_metal_slot_map_ready) {
+        const int32_t slot = e->warm_metal_slot_for[layer][expert];
+        if (slot >= 0 && (uint32_t)slot < e->warm_metal_slab_count &&
+            e->warm_metal_slots[slot].occupied &&
+            e->warm_metal_slots[slot].layer == layer &&
+            e->warm_metal_slots[slot].expert == expert) {
+            return slot;
+        }
+        return -1;
+    }
     for (uint32_t i = 0; i < e->warm_metal_slab_count; i++) {
         if (e->warm_metal_slots[i].occupied &&
             e->warm_metal_slots[i].layer == layer &&
@@ -24475,6 +24490,8 @@ static int ds4_engine_warm_metal_slab_ensure(ds4_engine *e) {
     }
 
     e->warm_metal_slab_cap = cap;
+    memset(e->warm_metal_slot_for, 0xff, sizeof(e->warm_metal_slot_for));
+    e->warm_metal_slot_map_ready = true;
     e->warm_metal_gate_expert_bytes = gate_bytes;
     e->warm_metal_up_expert_bytes = up_bytes;
     e->warm_metal_down_expert_bytes = down_bytes;
@@ -24513,6 +24530,110 @@ static int ds4_engine_warm_metal_prepare_selected_remap(
     return 0;
 }
 
+static bool ds4_warm_metal_ids_are_full_ordered_layer(
+        const ds4_warm_expert_id *ids,
+        uint32_t                  count,
+        uint32_t                 *layer_out) {
+    if (!ids || count != DS4_N_EXPERT) return false;
+    const uint32_t layer = ids[0].layer;
+    if (layer >= DS4_N_LAYER) return false;
+    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+        if (ids[i].layer != layer || ids[i].expert != i) return false;
+    }
+    if (layer_out) *layer_out = layer;
+    return true;
+}
+
+static int ds4_engine_warm_metal_find_free_run(ds4_engine *e, uint32_t run) {
+    if (!e || !e->warm_metal_slots || run == 0 || run > e->warm_metal_slab_cap) return -1;
+    for (uint32_t start = 0; start + run <= e->warm_metal_slab_cap; start++) {
+        bool free_run = true;
+        for (uint32_t i = 0; i < run; i++) {
+            const uint32_t slot = start + i;
+            if (slot < e->warm_metal_slab_count && e->warm_metal_slots[slot].occupied) {
+                free_run = false;
+                start = slot;
+                break;
+            }
+        }
+        if (free_run) {
+            if (e->warm_metal_slab_count < start + run) e->warm_metal_slab_count = start + run;
+            return (int)start;
+        }
+    }
+    return -1;
+}
+
+static uint32_t ds4_engine_warm_metal_free_slots(const ds4_engine *e) {
+    if (!e || !e->warm_metal_slots) return 0;
+    uint32_t free_slots = 0;
+    for (uint32_t i = 0; i < e->warm_metal_slab_count; i++) {
+        if (!e->warm_metal_slots[i].occupied) free_slots++;
+    }
+    if (e->warm_metal_slab_count < e->warm_metal_slab_cap) {
+        free_slots += e->warm_metal_slab_cap - e->warm_metal_slab_count;
+    }
+    return free_slots;
+}
+
+static int ds4_engine_warm_load_full_layer_metal(
+        ds4_engine *e,
+        uint32_t    layer,
+        uint32_t   *accepted) {
+    if (accepted) *accepted = 0;
+    if (!e || layer >= DS4_N_LAYER) return -1;
+
+    bool any_resident = false;
+    bool all_resident = true;
+    for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+        const bool resident = ds4_engine_warm_metal_find_slot(e, layer, expert) >= 0;
+        any_resident |= resident;
+        all_resident &= resident;
+    }
+    if (all_resident) {
+        if (accepted) *accepted = DS4_N_EXPERT;
+        return 0;
+    }
+    if (any_resident) return 1;
+
+    const ds4_layer_weights *l = &e->weights.layer[layer];
+    const uint64_t gate_bytes = ds4_warm_tensor_expert_bytes(l->ffn_gate_exps);
+    const uint64_t up_bytes = ds4_warm_tensor_expert_bytes(l->ffn_up_exps);
+    const uint64_t down_bytes = ds4_warm_tensor_expert_bytes(l->ffn_down_exps);
+    if (gate_bytes != e->warm_metal_gate_expert_bytes ||
+        up_bytes != e->warm_metal_up_expert_bytes ||
+        down_bytes != e->warm_metal_down_expert_bytes) {
+        return 1;
+    }
+
+    const int start = ds4_engine_warm_metal_find_free_run(e, DS4_N_EXPERT);
+    if (start < 0) return 1;
+
+    const uint8_t *gate_src = e->model.map + l->ffn_gate_exps->abs_offset;
+    const uint8_t *up_src = e->model.map + l->ffn_up_exps->abs_offset;
+    const uint8_t *down_src = e->model.map + l->ffn_down_exps->abs_offset;
+    const uint64_t gate_total = gate_bytes * (uint64_t)DS4_N_EXPERT;
+    const uint64_t up_total = up_bytes * (uint64_t)DS4_N_EXPERT;
+    const uint64_t down_total = down_bytes * (uint64_t)DS4_N_EXPERT;
+
+    if (ds4_gpu_tensor_write(e->warm_metal_gate_slab, (uint64_t)start * gate_bytes, gate_src, gate_total) == 0 ||
+        ds4_gpu_tensor_write(e->warm_metal_up_slab, (uint64_t)start * up_bytes, up_src, up_total) == 0 ||
+        ds4_gpu_tensor_write(e->warm_metal_down_slab, (uint64_t)start * down_bytes, down_src, down_total) == 0) {
+        return 1;
+    }
+
+    for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+        const uint32_t slot = (uint32_t)start + expert;
+        e->warm_metal_slots[slot].layer = layer;
+        e->warm_metal_slots[slot].expert = expert;
+        e->warm_metal_slots[slot].occupied = 1;
+        e->warm_metal_slot_for[layer][expert] = (int32_t)slot;
+    }
+    e->warm_metal_slab_resident += DS4_N_EXPERT;
+    if (accepted) *accepted = DS4_N_EXPERT;
+    return 0;
+}
+
 int ds4_engine_warm_load_experts_metal(
         ds4_engine                *e,
         const ds4_warm_expert_id  *ids,
@@ -24523,6 +24644,26 @@ int ds4_engine_warm_load_experts_metal(
     if (resident) *resident = 0;
     if (!e || (count != 0 && !ids)) return -1;
     if (ds4_engine_warm_metal_slab_ensure(e) != 0) return -1;
+
+    uint32_t full_layer = 0;
+    uint32_t full_layer_accepted = 0;
+    if (ds4_warm_metal_ids_are_full_ordered_layer(ids, count, &full_layer)) {
+        const int full_rc = ds4_engine_warm_load_full_layer_metal(e, full_layer, &full_layer_accepted);
+        if (full_rc < 0) return -1;
+        if (full_rc == 0) {
+            if (accepted) *accepted = full_layer_accepted;
+            if (resident) *resident = e->warm_metal_slab_resident;
+            return 0;
+        }
+        uint32_t missing = 0;
+        for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+            if (ds4_engine_warm_metal_find_slot(e, full_layer, expert) < 0) missing++;
+        }
+        if (ds4_engine_warm_metal_free_slots(e) < missing) {
+            if (resident) *resident = e->warm_metal_slab_resident;
+            return 0;
+        }
+    }
 
     uint32_t ok = 0;
     for (uint32_t i = 0; i < count; i++) {
@@ -24557,6 +24698,9 @@ int ds4_engine_warm_load_experts_metal(
         e->warm_metal_slots[slot].layer = layer;
         e->warm_metal_slots[slot].expert = expert;
         e->warm_metal_slots[slot].occupied = 1;
+        if (e->warm_metal_slot_map_ready) {
+            e->warm_metal_slot_for[layer][expert] = slot;
+        }
         e->warm_metal_slab_resident++;
         ok++;
     }
@@ -24580,6 +24724,11 @@ int ds4_engine_warm_evict_experts_metal(
         const int slot = ds4_engine_warm_metal_find_slot(e, ids[i].layer, ids[i].expert);
         if (slot < 0) continue;
         e->warm_metal_slots[slot].occupied = 0;
+        if (e->warm_metal_slot_map_ready &&
+            ids[i].layer < DS4_N_LAYER &&
+            ids[i].expert < DS4_N_EXPERT) {
+            e->warm_metal_slot_for[ids[i].layer][ids[i].expert] = -1;
+        }
         if (e->warm_metal_slab_resident != 0) e->warm_metal_slab_resident--;
         ok++;
     }

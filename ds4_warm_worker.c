@@ -243,6 +243,19 @@ static uint32_t mark_experts(worker_state *st, const ds4_warm_expert_id *ids, ui
     return accepted;
 }
 
+static bool ids_are_full_ordered_layer(
+        const worker_state       *st,
+        const ds4_warm_expert_id *ids,
+        uint32_t                  count) {
+    if (!st || !ids || count != st->model.n_expert || count == 0) return false;
+    const uint32_t layer = ids[0].layer;
+    if (layer >= st->model.n_layer) return false;
+    for (uint32_t i = 0; i < count; i++) {
+        if (ids[i].layer != layer || ids[i].expert != i) return false;
+    }
+    return true;
+}
+
 static bool all_selected_resident(worker_state *st, const int32_t *selected, uint32_t n_tok, uint32_t n_selected, uint32_t layer) {
     for (uint32_t t = 0; t < n_tok; t++) {
         for (uint32_t i = 0; i < n_selected; i++) {
@@ -279,16 +292,26 @@ static int handle_expert_list(worker_state *st, int fd, const ds4_warm_frame_hea
     const bool resident = h->opcode == DS4_WARM_OP_LOAD_EXPERTS;
     uint32_t accepted = 0;
     if (st->use_metal) {
-        for (uint32_t i = 0; i < req->count; i++) {
-            uint32_t one_accepted = 0;
+        if (resident && ids_are_full_ordered_layer(st, ids, req->count)) {
+            uint32_t metal_accepted = 0;
             uint32_t metal_resident = 0;
-            const int rc = resident
-                ? ds4_engine_warm_load_experts_metal(st->engine, &ids[i], 1,
-                                                     &one_accepted, &metal_resident)
-                : ds4_engine_warm_evict_experts_metal(st->engine, &ids[i], 1,
-                                                      &one_accepted, &metal_resident);
-            if (rc == 0 && one_accepted == 1) {
-                accepted += mark_experts(st, &ids[i], 1, resident);
+            const int rc = ds4_engine_warm_load_experts_metal(st->engine, ids, req->count,
+                                                              &metal_accepted, &metal_resident);
+            if (rc == 0 && metal_accepted == req->count) {
+                accepted = mark_experts(st, ids, req->count, true);
+            }
+        } else {
+            for (uint32_t i = 0; i < req->count; i++) {
+                uint32_t one_accepted = 0;
+                uint32_t metal_resident = 0;
+                const int rc = resident
+                    ? ds4_engine_warm_load_experts_metal(st->engine, &ids[i], 1,
+                                                         &one_accepted, &metal_resident)
+                    : ds4_engine_warm_evict_experts_metal(st->engine, &ids[i], 1,
+                                                          &one_accepted, &metal_resident);
+                if (rc == 0 && one_accepted == 1) {
+                    accepted += mark_experts(st, &ids[i], 1, resident);
+                }
             }
         }
     } else {

@@ -25,6 +25,7 @@ typedef struct {
     uint32_t n_tok_counts;
     bool local_only;
     bool remote_only;
+    bool preload_full_layer;
 } bench_config;
 
 typedef struct {
@@ -50,6 +51,7 @@ static void usage(FILE *fp) {
             "  --tok-counts LIST    Comma list, e.g. 1,2,4,8,16,64.\n"
             "  --iters N            Timed iterations (default: 5).\n"
             "  --warmup N           Warmup iterations (default: 1).\n"
+            "  --preload-full-layer LOAD_EXPERTS with every expert in layer order.\n"
             "  --local-only         Skip remote calls.\n"
             "  --remote-only        Skip local baseline.\n"
             "  -h, --help           Show this help.\n");
@@ -144,6 +146,8 @@ static bench_config parse_args(int argc, char **argv) {
             c.iters = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--warmup")) {
             c.warmup = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--preload-full-layer")) {
+            c.preload_full_layer = true;
         } else if (!strcmp(arg, "--local-only")) {
             c.local_only = true;
         } else if (!strcmp(arg, "--remote-only")) {
@@ -336,7 +340,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    printf("n_tok,slots,unique_experts,local_avg_ms,local_min_ms,local_max_ms,remote_avg_ms,remote_min_ms,remote_max_ms,remote_req_bytes,remote_resp_bytes,max_abs_diff,local_checksum,remote_checksum\n");
+    printf("n_tok,slots,unique_experts,remote_load_ms,local_avg_ms,local_min_ms,local_max_ms,remote_avg_ms,remote_min_ms,remote_max_ms,remote_req_bytes,remote_resp_bytes,max_abs_diff,local_checksum,remote_checksum\n");
 
     for (uint32_t ti = 0; ti < cfg.n_tok_counts; ti++) {
         const uint32_t n_tok = cfg.tok_counts[ti];
@@ -364,14 +368,24 @@ int main(int argc, char **argv) {
         fill_routes(selected, weights, n_tok, cfg.n_selected, local_info.n_expert, cfg.layer);
 
         ds4_warm_expert_id ids[256];
-        const uint32_t unique = build_unique_experts(ids, selected, n_tok, cfg.n_selected,
-                                                     cfg.layer, local_info.n_expert);
+        uint32_t unique = 0;
+        if (cfg.preload_full_layer) {
+            for (uint32_t expert = 0; expert < local_info.n_expert; expert++) {
+                ids[unique++] = (ds4_warm_expert_id){ .layer = cfg.layer, .expert = expert };
+            }
+        } else {
+            unique = build_unique_experts(ids, selected, n_tok, cfg.n_selected,
+                                          cfg.layer, local_info.n_expert);
+        }
+        double remote_load_s = 0.0;
         if (client) {
             ds4_warm_expert_list_response load_resp;
+            const double t0 = now_sec();
             if (ds4_warm_client_load_experts(client, ids, unique, &load_resp) != 0) {
                 fprintf(stderr, "LOAD_EXPERTS failed: %s\n", ds4_warm_client_error(client));
                 return 1;
             }
+            remote_load_s = now_sec() - t0;
         }
 
         if (!cfg.remote_only) {
@@ -430,10 +444,11 @@ int main(int argc, char **argv) {
         const double remote_sum = checksum(remote_out, out_elems);
         const double diff = (!cfg.remote_only && client) ? max_abs_diff(local_out, remote_out, out_elems) : 0.0;
 
-        printf("%u,%" PRIu64 ",%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%" PRIu64 ",%" PRIu64 ",%.9g,%.9g,%.9g\n",
+        printf("%u,%" PRIu64 ",%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%" PRIu64 ",%" PRIu64 ",%.9g,%.9g,%.9g\n",
                n_tok,
                slots,
                unique,
+               remote_load_s * 1000.0,
                local.avg_s * 1000.0,
                local.min_s * 1000.0,
                local.max_s * 1000.0,
