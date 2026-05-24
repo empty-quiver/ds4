@@ -1233,6 +1233,10 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_q8(
         device const block_q8_K *yb = y + ibl;
         device const int8_t *yq = yb->qs + 32 * ib;
         const float y_scale = yb->d;
+        float yl[32];
+        for (short i = 0; i < 32; ++i) {
+            yl[i] = (float)yq[i] * y_scale;
+        }
 
         device const block_iq2_xxs *xgr = xg + ibl;
         device const block_iq2_xxs *xur = xu + ibl;
@@ -1257,7 +1261,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_q8(
                 const uint8_t signg = ssigns[(aux32g >> 7 * l) & 127];
                 const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
                 for (short j = 0; j < 8; ++j) {
-                    const float v = (float)yq[8 * l + j] * y_scale;
+                    const float v = yl[8 * l + j];
                     sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
                     su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
                 }
