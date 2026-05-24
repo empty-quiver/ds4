@@ -832,6 +832,7 @@ int ds4_gpu_routed_moe_batch_q8_resident_bf16_tensor(
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
         ds4_gpu_tensor       *midq,
+        ds4_gpu_tensor       *x_f16,
         ds4_gpu_tensor       *experts,
         const ds4_gpu_tensor *gate_weights,
         const ds4_gpu_tensor *up_weights,

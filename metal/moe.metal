@@ -204,6 +204,25 @@ kernel void kernel_dsv4_q8_K_quantize_f32(
     }
 }
 
+kernel void kernel_dsv4_q8_K_dequantize_f16(
+        constant ds4_metal_q8_k_quantize_args &args,
+        device const char *src,
+        device char *dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]]) {
+    const uint tid = tiitg;
+    const uint block = tgpig.x;
+    const uint row = tgpig.y;
+    if (row >= args.rows || block * QK_K >= args.width || tid >= QK_K) return;
+
+    device const block_q8_K *src_block =
+        (device const block_q8_K *)(src + (uint64_t)row * args.src_row_stride) + block;
+    device half *dst_row =
+        (device half *)(dst + (uint64_t)row * args.dst_row_stride) + block * QK_K;
+
+    dst_row[tid] = half(src_block->d * (float)src_block->qs[tid]);
+}
+
 // Routed-MoE activation for the selected experts:
 // clamp(gate), clamp(up), silu(gate) * up * route_weight.  Normal inference
 // does not consume gate/up after this point, so the fast path avoids writing the
