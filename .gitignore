@@ -10,6 +10,7 @@
 /tests/cpu_moe_down_microbench
 /tests/cpu_moe_down_owner_microbench
 /tests/cpu_moe_gateup_microbench
+/tests/warm_worker_microbench
 /ds4flash.gguf
 /TODO.md
 /gguf/

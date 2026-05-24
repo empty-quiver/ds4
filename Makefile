@@ -42,7 +42,7 @@ CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression gateup-microbench down-microbench down-owner-microbench decode-microbench
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression gateup-microbench down-microbench down-owner-microbench decode-microbench warm-worker-microbench
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-warm-worker
@@ -148,6 +148,9 @@ ds4_eval.o: ds4_eval.c ds4.h
 ds4_warm_worker.o: ds4_warm_worker.c ds4.h ds4_warm.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_warm_worker.c
 
+ds4_warm_client.o: ds4_warm_client.c ds4_warm_client.h ds4_warm.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_warm_client.c
+
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
@@ -208,6 +211,12 @@ tests/cpu_moe_decode_microbench: tests/cpu_moe_decode_microbench.c ds4.c ds4.h
 decode-microbench: tests/cpu_moe_decode_microbench
 	./tests/cpu_moe_decode_microbench
 
+tests/warm_worker_microbench: tests/warm_worker_microbench.c ds4_warm_client.o $(CPU_CORE_OBJS) ds4.h ds4_warm.h ds4_warm_client.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/warm_worker_microbench.c ds4_warm_client.o $(CPU_CORE_OBJS) $(LDLIBS)
+
+warm-worker-microbench: tests/warm_worker_microbench
+	@echo "built ./tests/warm_worker_microbench; run it with --model FILE --host HOST --port PORT"
+
 ds4_test: ds4_test.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -219,4 +228,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-warm-worker ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cpu_moe_gateup_microbench tests/cpu_moe_down_microbench tests/cpu_moe_down_owner_microbench tests/cpu_moe_decode_microbench
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-warm-worker ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cpu_moe_gateup_microbench tests/cpu_moe_down_microbench tests/cpu_moe_down_owner_microbench tests/cpu_moe_decode_microbench tests/warm_worker_microbench
