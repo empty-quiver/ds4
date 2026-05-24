@@ -134,6 +134,15 @@ struct ds4_metal_q8_k_quantize_args {
     uint64_t dst_row_stride;
 };
 
+struct ds4_metal_moe_sum_bf16_args {
+    uint32_t width;
+    uint32_t rows;
+    uint32_t n_expert;
+    uint64_t expert_token_stride;
+    uint64_t expert_slot_stride;
+    uint64_t out_row_stride;
+};
+
 static inline ushort ds4_metal_f32_to_bf16(float f) {
     uint bits = as_type<uint>(f);
     const uint lsb = (bits >> 16) & 1u;
@@ -221,6 +230,27 @@ kernel void kernel_dsv4_q8_K_dequantize_f16(
         (device half *)(dst + (uint64_t)row * args.dst_row_stride) + block * QK_K;
 
     dst_row[tid] = half(src_block->d * (float)src_block->qs[tid]);
+}
+
+kernel void kernel_dsv4_moe_sum_experts_bf16(
+        constant ds4_metal_moe_sum_bf16_args &args,
+        device const char *experts,
+        device char *dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]]) {
+    const uint col = tgpig.x * 256u + tiitg;
+    const uint row = tgpig.y;
+    if (row >= args.rows || col >= args.width) return;
+
+    float sum = 0.0f;
+    device const char *row_base =
+        experts + (uint64_t)row * args.expert_token_stride + (uint64_t)col * sizeof(float);
+    for (uint slot = 0; slot < args.n_expert; slot++) {
+        sum += *((device const float *)(row_base + (uint64_t)slot * args.expert_slot_stride));
+    }
+
+    device ushort *dst_row = (device ushort *)(dst + (uint64_t)row * args.out_row_stride);
+    dst_row[col] = ds4_metal_f32_to_bf16(sum);
 }
 
 // Routed-MoE activation for the selected experts:
