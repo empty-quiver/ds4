@@ -2281,6 +2281,8 @@ static int ds4_gpu_encode_mul_mm_id_mapped(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> mm_pipeline,
         const ds4_gpu_mul_mm_id_args *mm_args,
+        uint32_t                    dispatch_rows,
+        uint32_t                    route_tile_rows,
         id<MTLBuffer>               src0,
         NSUInteger                  src0_off,
         id<MTLBuffer>               src1,
@@ -12062,6 +12064,17 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
     }
 }
 
+static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_thin16_pipeline(uint32_t type) {
+    switch (type) {
+    case DS4_METAL_TENSOR_IQ2_XXS:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f16_thin16", false);
+    case DS4_METAL_TENSOR_Q2_K:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16_thin16", false);
+    default:
+        return nil;
+    }
+}
+
 static int ds4_gpu_encode_mul_mv_id(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
@@ -12311,6 +12324,8 @@ static int ds4_gpu_encode_mul_mm_id(
            ds4_gpu_encode_mul_mm_id_mapped(cb,
                                              mm_pipeline,
                                              mm_args,
+                                             (uint32_t)mm_args->ne21,
+                                             32u,
                                              src0,
                                              src0_off,
                                              src1,
@@ -12358,6 +12373,8 @@ static int ds4_gpu_encode_mul_mm_id_mapped(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> mm_pipeline,
         const ds4_gpu_mul_mm_id_args *mm_args,
+        uint32_t                    dispatch_rows,
+        uint32_t                    route_tile_rows,
         id<MTLBuffer>               src0,
         NSUInteger                  src0_off,
         id<MTLBuffer>               src1,
@@ -12370,6 +12387,10 @@ static int ds4_gpu_encode_mul_mm_id_mapped(
         mm_args->ne20 <= 0 || mm_args->ne21 <= 0 || mm_args->ne02 <= 0) {
         return 0;
     }
+    if (dispatch_rows == 0 || dispatch_rows > (uint32_t)mm_args->ne21) {
+        dispatch_rows = (uint32_t)mm_args->ne21;
+    }
+    if (route_tile_rows == 0) route_tile_rows = 32u;
 
     const NSUInteger tpe_bytes = (NSUInteger)mm_args->ne02 * sizeof(int32_t);
     const NSUInteger hids_bytes = (NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne21 * sizeof(int32_t);
@@ -12387,7 +12408,7 @@ static int ds4_gpu_encode_mul_mm_id_mapped(
     [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:4];
     [enc setBuffer:dst offset:dst_off atIndex:5];
     [enc setThreadgroupMemoryLength:8192u atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)mm_args->ne21 + 31u) / 32u,
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)dispatch_rows + route_tile_rows - 1u) / route_tile_rows,
                                           ((NSUInteger)mm_args->ne0 + 63u) / 64u,
                                           (NSUInteger)mm_args->ne02)
          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -13983,6 +14004,7 @@ int ds4_gpu_routed_moe_batch_q8_resident_bf16_tensor(
         float                   clamp,
         const ds4_gpu_tensor *xq,
         uint32_t                n_tokens,
+        uint32_t                max_routes_per_expert,
         uint32_t                storage_experts) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out_bf16 || !gate || !up || !mid || !midq || !gate_weights || !up_weights ||
@@ -14034,6 +14056,12 @@ int ds4_gpu_routed_moe_batch_q8_resident_bf16_tensor(
             x_f16 != NULL &&
             ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
         const bool use_mm_down = use_mm_id;
+        const bool use_thin_mm_id =
+            use_mm_id &&
+            max_routes_per_expert != 0 &&
+            max_routes_per_expert <= 16u;
+        uint32_t mm_dispatch_rows = use_thin_mm_id ? max_routes_per_expert : n_tokens;
+        const uint32_t mm_route_tile_rows = use_thin_mm_id ? 16u : 32u;
         if (!xqbuf || !gatebuf || !upbuf || !midbuf || !midqbuf || !outbuf ||
             !selectedbuf || !weightsbuf || !gate_wbuf || !up_wbuf || !down_wbuf ||
             ds4_gpu_tensor_bytes(xq) < xq_bytes ||
@@ -14088,8 +14116,12 @@ int ds4_gpu_routed_moe_batch_q8_resident_bf16_tensor(
                                                         n_expert, n_expert, n_tokens,
                                                         sizeof(uint16_t));
             map_pipeline = ds4_gpu_get_pipeline(ds4_gpu_mul_mm_id_map0_name(n_expert));
-            gate_mm_pipeline = ds4_gpu_routed_mm_f16_rhs_pipeline(gate_type);
-            down_mm_pipeline = ds4_gpu_routed_mm_f16_rhs_pipeline(down_type);
+            gate_mm_pipeline = use_thin_mm_id ?
+                ds4_gpu_routed_mm_f16_rhs_thin16_pipeline(gate_type) :
+                ds4_gpu_routed_mm_f16_rhs_pipeline(gate_type);
+            down_mm_pipeline = use_thin_mm_id ?
+                ds4_gpu_routed_mm_f16_rhs_thin16_pipeline(down_type) :
+                ds4_gpu_routed_mm_f16_rhs_pipeline(down_type);
             if (!map_pipeline || !gate_mm_pipeline || !down_mm_pipeline) return 0;
         }
 
@@ -14158,6 +14190,8 @@ int ds4_gpu_routed_moe_batch_q8_resident_bf16_tensor(
                 ok = ds4_gpu_encode_mul_mm_id_mapped(cb,
                                                        gate_mm_pipeline,
                                                        &gate_mm_args,
+                                                       mm_dispatch_rows,
+                                                       mm_route_tile_rows,
                                                        gate_wbuf,
                                                        ds4_gpu_tensor_offset(gate_weights),
                                                        x_f16buf,
@@ -14170,6 +14204,8 @@ int ds4_gpu_routed_moe_batch_q8_resident_bf16_tensor(
                 ok = ds4_gpu_encode_mul_mm_id_mapped(cb,
                                                        gate_mm_pipeline,
                                                        &gate_mm_args,
+                                                       mm_dispatch_rows,
+                                                       mm_route_tile_rows,
                                                        up_wbuf,
                                                        ds4_gpu_tensor_offset(up_weights),
                                                        x_f16buf,
@@ -14228,6 +14264,8 @@ int ds4_gpu_routed_moe_batch_q8_resident_bf16_tensor(
             ok = ds4_gpu_encode_mul_mm_id_mapped(cb,
                                                    down_mm_pipeline,
                                                    &down_mm_args,
+                                                   mm_dispatch_rows,
+                                                   mm_route_tile_rows,
                                                    down_wbuf,
                                                    ds4_gpu_tensor_offset(down_weights),
                                                    midbuf,
@@ -14497,6 +14535,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                 ok = ds4_gpu_encode_mul_mm_id_mapped(cb,
                                                    gate_mm_pipeline,
                                                    &gate_mm_args,
+                                                   (uint32_t)gate_mm_args.ne21,
+                                                   32u,
                                                    gate_buf,
                                                    (NSUInteger)gate_inner,
                                                    xbuf,
@@ -14509,6 +14549,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                 ok = ds4_gpu_encode_mul_mm_id_mapped(cb,
                                                    gate_mm_pipeline,
                                                    &gate_mm_args,
+                                                   (uint32_t)gate_mm_args.ne21,
+                                                   32u,
                                                    up_buf,
                                                    (NSUInteger)up_inner,
                                                    xbuf,
@@ -14689,6 +14731,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                 ok = ds4_gpu_encode_mul_mm_id_mapped(cb,
                                                        down_mm_pipeline,
                                                        &down_mm_args,
+                                                       (uint32_t)down_mm_args.ne21,
+                                                       32u,
                                                        down_buf,
                                                        (NSUInteger)down_inner,
                                                        midbuf,

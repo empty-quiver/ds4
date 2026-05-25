@@ -24848,6 +24848,17 @@ int ds4_engine_warm_run_routed_experts_metal_q8_bf16(
     }
 
     int rc = -1;
+    uint32_t max_routes_per_expert = 0;
+    if (storage_experts <= DS4_N_EXPERT) {
+        uint32_t route_counts[DS4_N_EXPERT] = { 0 };
+        for (uint64_t i = 0; i < slots; i++) {
+            const int32_t expert = selected_remap[i];
+            if (expert < 0 || (uint32_t)expert >= storage_experts) goto done;
+            const uint32_t count = ++route_counts[(uint32_t)expert];
+            if (count > max_routes_per_expert) max_routes_per_expert = count;
+        }
+    }
+
     if (ds4_gpu_tensor_write(e->warm_metal_xq, 0, xq, xq_bytes) == 0 ||
         ds4_gpu_tensor_write(e->warm_metal_selected, 0, selected_remap, selected_bytes) == 0 ||
         ds4_gpu_tensor_write(e->warm_metal_weights, 0, weights, weight_bytes) == 0) {
@@ -24880,6 +24891,7 @@ int ds4_engine_warm_run_routed_experts_metal_q8_bf16(
             DS4_SWIGLU_CLAMP_EXP,
             e->warm_metal_xq,
             n_tok,
+            max_routes_per_expert,
             storage_experts)) {
         goto done;
     }

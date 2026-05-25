@@ -852,6 +852,7 @@ int ds4_gpu_routed_moe_batch_q8_resident_bf16_tensor(
         float                   clamp,
         const ds4_gpu_tensor *xq,
         uint32_t                n_tokens,
+        uint32_t                max_routes_per_expert,
         uint32_t                storage_experts);
 
 /* =========================================================================
